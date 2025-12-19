@@ -1,0 +1,29 @@
+[package]
+name = "enginefs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+librqbit = "8.1.1" # Core BitTorrent engine
+tokio = { version = "1.42.0", features = [
+    "rt-multi-thread",
+    "macros",
+    "fs",
+    "io-util",
+    "sync",
+    "process",
+] }
+serde = { version = "1.0.216", features = ["derive"] }
+serde_bencode = "0.2"
+serde_json = "1.0.133"
+thiserror = "2.0"
+tracing = "0.1"
+async-trait = "0.1"
+bytes = "1.9"
+futures = "0.3"
+url = "2.5"
+hex = "0.4"
+regex = "1.11"
+anyhow = "1.0"
+moka = { version = "0.12.11", features = ["future"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
