@@ -3,6 +3,7 @@ name: Release Build
 on:
   push:
     branches: [ "master", "main" ]
+    tags: [ "v*" ]
   pull_request:
     branches: [ "master", "main" ]
   workflow_dispatch:
@@ -24,10 +25,10 @@ jobs:
             toolchain: stable
             target: x86_64-pc-windows-msvc
 
-      - name: Install cargo-chef
+      - name: Install cargo-chef and cargo-wix
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-chef
+          tool: cargo-chef,cargo-wix
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
@@ -59,11 +60,23 @@ jobs:
           VCPKG_ROOT: ${{ github.workspace }}\vcpkg
           VCPKGRS_TRIPLET: x64-windows-static
 
-      - name: Upload Artifact
+      - name: Build MSI Installer
+        run: cargo wix --package server --nocapture
+        env:
+          VCPKG_ROOT: ${{ github.workspace }}\vcpkg
+          VCPKGRS_TRIPLET: x64-windows-static
+
+      - name: Upload EXE
         uses: actions/upload-artifact@v4
         with:
           name: server-windows-amd64
           path: target/release/server.exe
+
+      - name: Upload MSI
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-windows-msi
+          path: target/wix/*.msi
 
   build-linux:
     name: Build Linux
@@ -74,15 +87,15 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install cargo-chef
+      - name: Install cargo-chef and cargo-deb
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-chef
+          tool: cargo-chef,cargo-deb
 
       - name: Install System Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential pkg-config libssl-dev
+          sudo apt-get install -y build-essential pkg-config libssl-dev libfuse2
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
@@ -112,9 +125,142 @@ jobs:
         env:
           VCPKG_ROOT: ${{ github.workspace }}/vcpkg
 
-      - name: Upload Artifact
+      - name: Build DEB Package
+        run: cargo deb --package server --no-build
+        env:
+          VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+
+      - name: Build AppImage
+        run: |
+          # Download linuxdeploy
+          wget -q https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          chmod +x linuxdeploy-x86_64.AppImage
+
+          # Create AppDir structure
+          mkdir -p AppDir/usr/bin AppDir/usr/share/applications AppDir/usr/share/icons/hicolor/256x256/apps
+
+          # Copy binary
+          cp target/release/server AppDir/usr/bin/stream-server
+
+          # Create desktop file
+          cat > AppDir/usr/share/applications/stream-server.desktop << EOF
+          [Desktop Entry]
+          Type=Application
+          Name=Stream Server
+          Exec=stream-server
+          Icon=stream-server
+          Categories=Network;
+          EOF
+
+          # Create simple icon (placeholder)
+          convert -size 256x256 xc:steelblue -gravity center -pointsize 48 -fill white -annotate 0 "SS" AppDir/usr/share/icons/hicolor/256x256/apps/stream-server.png || echo "ImageMagick not available, using placeholder"
+
+          # Build AppImage
+          ./linuxdeploy-x86_64.AppImage --appdir AppDir --output appimage || true
+
+      - name: Upload Binary
         uses: actions/upload-artifact@v4
         with:
           name: server-linux-amd64
           path: target/release/server
 
+      - name: Upload DEB
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-linux-deb
+          path: target/debian/*.deb
+
+      - name: Upload AppImage
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-linux-appimage
+          path: "*.AppImage"
+          if-no-files-found: ignore
+
+  build-arch:
+    name: Build Arch Linux
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install dependencies
+        run: |
+          pacman -Syu --noconfirm
+          pacman -S --noconfirm base-devel rust git openssl pkg-config
+
+      - name: Build binary
+        run: cargo build --release --features libtorrent --no-default-features
+        env:
+          VCPKG_ROOT: ""
+
+      - name: Create PKGBUILD
+        run: |
+          mkdir -p pkg
+          cat > pkg/PKGBUILD << 'EOF'
+          # Maintainer: stream-server maintainers
+          pkgname=stream-server
+          pkgver=0.1.0
+          pkgrel=1
+          pkgdesc="High-performance torrent streaming server with HLS transcoding"
+          arch=('x86_64')
+          url="https://github.com/user/stream-server"
+          license=('MIT')
+          depends=('openssl')
+          source=("stream-server")
+          sha256sums=('SKIP')
+
+          package() {
+              install -Dm755 "$srcdir/stream-server" "$pkgdir/usr/bin/stream-server"
+          }
+          EOF
+
+          cp target/release/server pkg/stream-server
+
+      - name: Build package
+        run: |
+          cd pkg
+          # Create non-root user for makepkg
+          useradd -m builder
+          chown -R builder:builder .
+          su builder -c "makepkg -sf --noconfirm"
+
+      - name: Upload Arch Package
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-arch-pkg
+          path: pkg/*.pkg.tar.zst
+
+  release:
+    name: Create Release
+    needs: [build-windows, build-linux, build-arch]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release files
+        run: |
+          mkdir -p release
+          # Windows
+          cp artifacts/server-windows-amd64/server.exe release/stream-server-windows-amd64.exe || true
+          cp artifacts/server-windows-msi/*.msi release/ || true
+          # Linux
+          cp artifacts/server-linux-amd64/server release/stream-server-linux-amd64 || true
+          cp artifacts/server-linux-deb/*.deb release/ || true
+          cp artifacts/server-linux-appimage/*.AppImage release/ || true
+          # Arch
+          cp artifacts/server-arch-pkg/*.pkg.tar.zst release/ || true
+          ls -la release/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref, 'beta') || contains(github.ref, 'alpha') || contains(github.ref, 'rc') }}

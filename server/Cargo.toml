@@ -32,3 +32,20 @@ lz-str = "0.2.1"
 tempfile = "3.23.0"
 mimalloc = { version = "0.1.48", default-features = false }
 rayon = "1.11.0"
+
+[package.metadata.deb]
+maintainer = "stream-server maintainers"
+copyright = "2025"
+license-file = ["../LICENSE", "0"]
+extended-description = "High-performance torrent streaming server with HLS transcoding support"
+section = "net"
+priority = "optional"
+assets = [
+    ["target/release/server", "usr/bin/stream-server", "755"],
+]
+
+[package.metadata.wix]
+upgrade-guid = "A1B2C3D4-E5F6-7890-ABCD-EF1234567890"
+path-guid = "B2C3D4E5-F678-90AB-CDEF-123456789012"
+license = false
+eula = false
