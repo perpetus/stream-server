@@ -25,12 +25,14 @@ jobs:
             target: x86_64-pc-windows-msvc
 
       - name: Install cargo-chef
-        uses: taiki-e/install-action@cargo-chef
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-chef
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
         with:
-          vcpkgGitCommitId: '2025.12.12'
+          vcpkgGitCommitId: '84bab45'
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgJsonGlob: 'vcpkg.json'
 
@@ -73,7 +75,9 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install cargo-chef
-        uses: taiki-e/install-action@cargo-chef
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-chef
 
       - name: Install System Dependencies
         run: |
@@ -83,6 +87,7 @@ jobs:
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
         with:
+          vcpkgGitCommitId: '84bab45'
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgJsonGlob: 'vcpkg.json'
 
