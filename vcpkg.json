@@ -1,0 +1,8 @@
+{
+    "name": "stream-server",
+    "version-string": "0.1.0",
+    "dependencies": [
+        "libtorrent"
+    ],
+    "builtin-baseline": "2025.12.12"
+}

@@ -622,6 +622,16 @@ impl LibtorrentHandle {
         ffi::handle_set_piece_deadline(self.inner.pin_mut(), piece, deadline_ms)
     }
 
+    /// Reset piece deadline
+    pub fn reset_piece_deadline(&mut self, piece: i32) {
+        ffi::handle_reset_piece_deadline(self.inner.pin_mut(), piece)
+    }
+
+    /// Clear all piece deadlines
+    pub fn clear_piece_deadlines(&mut self) {
+        ffi::handle_clear_piece_deadlines(self.inner.pin_mut())
+    }
+
     /// Check if piece is downloaded
     pub fn have_piece(&self, piece: i32) -> bool {
         ffi::handle_have_piece(&self.inner, piece)

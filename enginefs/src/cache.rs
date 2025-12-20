@@ -117,7 +117,7 @@ impl AsyncRead for CachedStream {
             }
 
             // Trigger prefetch for next chunks if starting a new chunk
-            if self.position % CHUNK_SIZE == 0 {
+            if self.position.is_multiple_of(CHUNK_SIZE) {
                 let chunk_index = self.position / CHUNK_SIZE;
                 self.prefetch(chunk_index);
             }
@@ -186,7 +186,7 @@ impl AsyncRead for CachedStream {
                     .await
                     .map_err(|e| {
                         // Unwrap the Arc error or create generic io error
-                        io::Error::new(io::ErrorKind::Other, e.to_string())
+                        io::Error::other(e.to_string())
                     })
             };
 

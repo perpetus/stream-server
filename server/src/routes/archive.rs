@@ -31,7 +31,7 @@ pub struct ArchiveStreamBody {
 pub struct ArchiveUrl {
     pub url: String,
     // Core sends bytes sometimes, but we might not need it for simple streaming
-    pub bytes: Option<u64>,
+    pub _bytes: Option<u64>,
 }
 
 pub fn router() -> Router<AppState> {
@@ -79,7 +79,7 @@ pub async fn archive_handler(
                 Err(_) => return (StatusCode::NOT_FOUND, "File not found in zip").into_response(),
             };
             let mut buffer = Vec::new();
-            if let Err(_) = zip_file.read_to_end(&mut buffer) {
+            if zip_file.read_to_end(&mut buffer).is_err() {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "Failed to read file from zip",
@@ -216,11 +216,11 @@ async fn handle_remote_archive(query: ArchiveQuery) -> Response {
     if is_zip {
         return handle_zip_extraction(temp, &body).await;
     } else {
-        return (
+        (
             StatusCode::NOT_IMPLEMENTED,
             "Remote RAR streaming not yet fully implemented",
         )
-            .into_response();
+            .into_response()
     }
 }
 

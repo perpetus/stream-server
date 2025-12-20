@@ -1,5 +1,5 @@
 use crate::backend::{EngineStats, PeerStat, SubtitleTrack, TorrentHandle};
-use crate::cache::{CachedStream, DataCache};
+use crate::cache::DataCache;
 use anyhow::Context;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
@@ -186,11 +186,7 @@ impl<H: TorrentHandle> Engine<H> {
         file.read_exact(&mut head).await?;
 
         let mut tail = vec![0u8; tail_size as usize];
-        let start_pos = if file_len > chunk_size {
-            file_len - chunk_size
-        } else {
-            0
-        };
+        let start_pos = file_len.saturating_sub(chunk_size);
         file.seek(std::io::SeekFrom::Start(start_pos)).await?;
         file.read_exact(&mut tail).await?;
 

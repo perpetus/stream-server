@@ -383,11 +383,9 @@ async fn get_segment(
                 .iter()
                 .any(|c| audio_codec.contains(c));
 
-            let channels_ok = if let Some(_) = transcode_params.max_audio_channels {
-                true // Simplified check
-            } else {
-                true
-            };
+            // TODO: Implement channel count check when we have that info in probe results
+            let _ = transcode_params.max_audio_channels;
+            let channels_ok = true;
 
             if codec_supported && channels_ok {
                 "copy"

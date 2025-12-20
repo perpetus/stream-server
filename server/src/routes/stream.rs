@@ -58,8 +58,8 @@ pub async fn stream_video(
         // Handle Range header
         let (start, end) = if let Some(range_header) = headers.get(header::RANGE) {
             let range_str = range_header.to_str().unwrap_or("");
-            if range_str.starts_with("bytes=") {
-                let parts: Vec<&str> = range_str["bytes=".len()..].split('-').collect();
+            if let Some(stripped) = range_str.strip_prefix("bytes=") {
+                let parts: Vec<&str> = stripped.split('-').collect();
                 if parts.len() == 2 {
                     let start = parts[0].parse::<u64>().unwrap_or(0);
                     let end = parts[1].parse::<u64>().unwrap_or(size - 1);
@@ -148,6 +148,6 @@ pub async fn stream_video(
             (StatusCode::OK, res_headers, body).into_response()
         }
     } else {
-        return (StatusCode::NOT_FOUND, "File not found").into_response();
+        (StatusCode::NOT_FOUND, "File not found").into_response()
     }
 }

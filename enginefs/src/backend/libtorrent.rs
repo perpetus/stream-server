@@ -30,13 +30,14 @@ impl LibtorrentBackend {
             enable_lsd: true,
             enable_upnp: true,
             enable_natpmp: true,
-            max_connections: 200,
-            max_connections_per_torrent: 50,
+            // Increased limits for better throughput
+            max_connections: 500,
+            max_connections_per_torrent: 100,
             download_rate_limit: 0,
             upload_rate_limit: 0,
-            active_downloads: 10,
-            active_seeds: 5,
-            active_limit: 15,
+            active_downloads: 20,
+            active_seeds: 10,
+            active_limit: 30,
             anonymous_mode: false,
             proxy_host: String::new(),
             proxy_port: 0,
@@ -103,9 +104,9 @@ impl TorrentBackend for LibtorrentBackend {
             }
         };
 
-        // Add trackers
-        for tracker in trackers {
-            handle.add_tracker(&tracker, 0);
+        // Add trackers with tier based on position
+        for (idx, tracker) in trackers.iter().enumerate() {
+            handle.add_tracker(tracker, idx as i32);
         }
 
         // Enable sequential download for streaming
@@ -212,8 +213,9 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
             .find_torrent(&self.info_hash)
             .map_err(|e| anyhow!("Torrent not found: {}", e))?;
 
-        for tracker in trackers {
-            handle.add_tracker(&tracker, 0);
+        // Add trackers with tier based on position (faster trackers first get lower tier = higher priority)
+        for (idx, tracker) in trackers.iter().enumerate() {
+            handle.add_tracker(tracker, idx as i32);
         }
         Ok(())
     }
@@ -287,7 +289,8 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
             piece_length,
             file_offset: (first_piece as u64) * piece_length,
             current_pos: 0,
-            is_complete: false,
+            is_complete, // Use actual completion status
+            last_priorities_piece: -1, // Force initial priority update
         }))
     }
 
@@ -342,6 +345,7 @@ struct LibtorrentFileStream {
     file_offset: u64,
     current_pos: u64,
     is_complete: bool,
+    last_priorities_piece: i32, // Track last piece we set priorities for
 }
 
 impl LibtorrentFileStream {
@@ -354,8 +358,16 @@ impl LibtorrentFileStream {
         if self.piece_length == 0 {
             return;
         }
+        
         let current_piece =
             self.first_piece + ((self.file_offset + pos) / self.piece_length) as i32;
+
+        // Efficient cache check: if we are on the same piece, do nothing
+        // This handles 99% of read calls with 0 FFI overhead
+        if current_piece == self.last_priorities_piece {
+            return;
+        }
+        self.last_priorities_piece = current_piece;
 
         // Check if complete (all pieces downloaded)
         let mut all_downloaded = true;
@@ -370,34 +382,29 @@ impl LibtorrentFileStream {
             return;
         }
 
-        // Prioritize the immediate piece with the most urgent deadline
-        if current_piece <= self.last_piece {
-            let mut h = self.handle.clone();
-            h.set_piece_deadline(current_piece, 0); // Immediate priority
-        }
-
-        // Prioritize the next 30 pieces with increasing deadlines
-        // This creates a ~30 piece buffer which is typically 4-8MB
-        for i in 1..30 {
+        // Prioritize the immediate window (5 pieces ~ 2-10MB) ASAP
+        // We set deadline=0 (immediate) for the first 5 pieces to ensure instant playback start
+        for i in 0..5 {
             let p = current_piece + i;
-            if p <= self.last_piece {
-                let mut h = self.handle.clone();
-                // First 5 pieces: 100-500ms, next 10: 500-1500ms, rest: 1500-3000ms
-                let deadline = if i < 5 {
-                    100 * i
-                } else if i < 15 {
-                    500 + 100 * (i - 5)
-                } else {
-                    1500 + 100 * (i - 15)
-                };
-                h.set_piece_deadline(p, deadline);
-            }
+            if p <= self.last_piece
+                && !self.handle.have_piece(p) {
+                    self.handle.set_piece_deadline(p, 0); // ASAP
+                }
+        }
+
+        // Prioritize the next 20 pieces with increasing deadlines
+        for i in 5..25 {
+            let p = current_piece + i;
+            if p <= self.last_piece
+                && !self.handle.have_piece(p) {
+                    // 100ms * (i-4) => 100ms, 200ms...
+                    // This creates a smooth gradient of urgency
+                    self.handle.set_piece_deadline(p, 100 * (i - 4));
+                }
         }
     }
 
-    fn wait_for_piece(&self, piece: i32) -> bool {
-        self.handle.have_piece(piece)
-    }
+
 }
 
 impl tokio::io::AsyncRead for LibtorrentFileStream {
@@ -408,6 +415,24 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
     ) -> std::task::Poll<std::io::Result<()>> {
         let pos = self.current_pos;
         self.set_priorities(pos);
+
+        // Critical Fix: Block read if piece is not downloaded yet.
+        // Reading undownloaded parts from disk returns sparse zeros, which confuses parsers (ffmpeg).
+        if self.piece_length > 0 {
+            let piece = self.first_piece + ((self.file_offset + pos) / self.piece_length) as i32;
+            if !self.handle.have_piece(piece) {
+                // Ensure we prioritize this piece (redundant with set_priorities but safe)
+                self.handle.set_piece_deadline(piece, 0);
+
+                // Schedule a wakeup to check again
+                let waker = cx.waker().clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    waker.wake();
+                });
+                return std::task::Poll::Pending;
+            }
+        }
 
         let rem_before = buf.remaining();
         match std::pin::Pin::new(&mut self.file).poll_read(cx, buf) {
@@ -436,6 +461,10 @@ impl tokio::io::AsyncSeek for LibtorrentFileStream {
         match std::pin::Pin::new(&mut self.file).poll_complete(cx) {
             std::task::Poll::Ready(Ok(pos)) => {
                 self.current_pos = pos;
+                // Clear old piece deadlines so libtorrent can focus entirely on the new position
+                // This resolves the "bitrate reduced" issue after seeking
+                self.handle.clear_piece_deadlines();
+                self.last_priorities_piece = -1; // Force immediate priority update
                 std::task::Poll::Ready(Ok(pos))
             }
             other => other,

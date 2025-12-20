@@ -174,7 +174,7 @@ fn rewrite_playlist(body: &str, base_url: &Url) -> String {
     let mut rewritten = String::new();
     for line in body.lines() {
         if line.is_empty() {
-            rewritten.push_str("\n");
+            rewritten.push('\n');
             continue;
         }
         if line.starts_with("#") {
@@ -195,12 +195,12 @@ fn rewrite_playlist(body: &str, base_url: &Url) -> String {
                     rewritten.push_str(&line[..start + 5]);
                     rewritten.push_str(&proxy_uri);
                     rewritten.push_str(&rest[end..]);
-                    rewritten.push_str("\n");
+                    rewritten.push('\n');
                     continue;
                 }
             }
             rewritten.push_str(line);
-            rewritten.push_str("\n");
+            rewritten.push('\n');
         } else {
             // It's a URL
             let absolute_uri = if line.contains("://") {
@@ -213,7 +213,7 @@ fn rewrite_playlist(body: &str, base_url: &Url) -> String {
             };
             let proxy_uri = format!("/proxy/?d={}", urlencoding::encode(&absolute_uri));
             rewritten.push_str(&proxy_uri);
-            rewritten.push_str("\n");
+            rewritten.push('\n');
         }
     }
     rewritten

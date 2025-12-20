@@ -1,0 +1,115 @@
+name: Release Build
+
+on:
+  push:
+    branches: [ "master", "main" ]
+  pull_request:
+    branches: [ "master", "main" ]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+
+jobs:
+  build-windows:
+    name: Build Windows
+    runs-on: blacksmith-4vcpu-windows
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+            toolchain: stable
+            target: x86_64-pc-windows-msvc
+
+      - name: Install cargo-chef
+        uses: taiki-e/install-action@cargo-chef
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: '2025.12.12'
+          vcpkgDirectory: '${{ github.workspace }}/vcpkg'
+          vcpkgJsonGlob: 'vcpkg.json'
+
+      - name: Cargo Chef Prepare
+        run: cargo chef prepare --recipe-path recipe.json
+
+      - name: Cargo Chef Cache
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-chef-${{ hashFiles('recipe.json') }}
+
+      - name: Cargo Chef Cook
+        run: |
+          $env:VCPKG_ROOT = "${{ github.workspace }}\vcpkg"
+          cargo chef cook --release --recipe-path recipe.json --features libtorrent --no-default-features
+        env:
+          VCPKG_ROOT: ${{ github.workspace }}\vcpkg
+          VCPKGRS_TRIPLET: x64-windows-static
+
+      - name: Build Release
+        run: cargo build --release --features libtorrent --no-default-features
+        env:
+          VCPKG_ROOT: ${{ github.workspace }}\vcpkg
+          VCPKGRS_TRIPLET: x64-windows-static
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-windows-amd64
+          path: target/release/server.exe
+
+  build-linux:
+    name: Build Linux
+    runs-on: blacksmith-4vcpu-ubuntu-2204
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-chef
+        uses: taiki-e/install-action@cargo-chef
+
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libssl-dev
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgDirectory: '${{ github.workspace }}/vcpkg'
+          vcpkgJsonGlob: 'vcpkg.json'
+
+      - name: Cargo Chef Prepare
+        run: cargo chef prepare --recipe-path recipe.json
+
+      - name: Cargo Chef Cache
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-chef-${{ hashFiles('recipe.json') }}
+
+      - name: Cargo Chef Cook
+        run: |
+           export VCPKG_ROOT=${{ github.workspace }}/vcpkg
+           cargo chef cook --release --recipe-path recipe.json --features libtorrent --no-default-features
+        env:
+           VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+
+      - name: Build Release
+        run: cargo build --release --features libtorrent --no-default-features
+        env:
+          VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-linux-amd64
+          path: target/release/server
+

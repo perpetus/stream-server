@@ -15,7 +15,7 @@ pub mod hls;
 pub mod tracker_prober;
 pub mod trackers;
 
-#[cfg(feature = "librqbit")]
+#[cfg(all(feature = "librqbit", not(feature = "libtorrent")))]
 use crate::backend::librqbit::LibrqbitBackend;
 #[cfg(feature = "libtorrent")]
 use crate::backend::libtorrent::LibtorrentBackend;

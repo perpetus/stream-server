@@ -12,6 +12,12 @@ pub struct TrackerManager {
     trackers: Arc<RwLock<Vec<String>>>,
 }
 
+impl Default for TrackerManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TrackerManager {
     pub fn new() -> Self {
         let instance = Self {

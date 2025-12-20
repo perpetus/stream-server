@@ -80,7 +80,7 @@ impl TrackerProber {
 
         // Resolve address first
         let socket = UdpSocket::bind("0.0.0.0:0").await.ok()?;
-        if let Err(_) = socket.connect(&addr).await {
+        if socket.connect(&addr).await.is_err() {
             return None;
         }
 
@@ -100,7 +100,7 @@ impl TrackerProber {
         buf[12..16].copy_from_slice(&transaction_id.to_be_bytes());
 
         let start = Instant::now();
-        if let Err(_) = socket.send(&buf).await {
+        if socket.send(&buf).await.is_err() {
             return None;
         }
 

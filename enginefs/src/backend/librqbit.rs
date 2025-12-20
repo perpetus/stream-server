@@ -55,7 +55,7 @@ impl LibrqbitBackend {
         if let Ok(mut entries) = tokio::fs::read_dir(&cache_dir).await {
             while let Ok(Some(entry)) = entries.next_entry().await {
                 let path = entry.path();
-                if path.extension().map_or(false, |ext| ext == "torrent") {
+                if path.extension().is_some_and(|ext| ext == "torrent") {
                     if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
                         let info_hash = stem.to_string();
                         if !restored_handles.contains_key(&info_hash) {

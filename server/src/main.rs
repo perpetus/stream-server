@@ -7,11 +7,8 @@ use axum::{
 use enginefs::EngineFS;
 use state::AppState;
 use std::{net::SocketAddr, sync::Arc};
-use tokio;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
-use tracing;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-use urlencoding;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;

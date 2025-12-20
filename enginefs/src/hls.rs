@@ -304,9 +304,9 @@ impl HlsEngine {
         // -flags low_delay: force low-delay codec mode
         // -analyzeduration 500000: 0.5s analysis (needed for proper HEVC initialization)
         // -probesize 1000000: 1MB probing (needed for HEVC with Dolby Vision)
-        cmd.args(&[
+        cmd.args([
             "-hwaccel",
-            &hwaccel_method,
+            hwaccel_method,
             "-fflags",
             "+genpts+discardcorrupt+nobuffer+fastseek",
             "-flags",
@@ -322,8 +322,8 @@ impl HlsEngine {
         }
 
         // Reverse-engineered flags from split_output
-        cmd.args(&["-fflags", "+genpts"]);
-        cmd.args(&["-noaccurate_seek", "-seek_timestamp", "1"]);
+        cmd.args(["-fflags", "+genpts"]);
+        cmd.args(["-noaccurate_seek", "-seek_timestamp", "1"]);
         // -copyts is used in split_output and is critical for correct timing with these flags
         cmd.arg("-copyts");
 
@@ -340,22 +340,22 @@ impl HlsEngine {
         if target_video_codec == "none" {
             // Audio-only segment: Map ONLY audio (specific or 0:a:0)
             if let Some(audio_idx) = audio_stream_index {
-                cmd.args(&["-map", &format!("0:{}", audio_idx)]);
+                cmd.args(["-map", &format!("0:{}", audio_idx)]);
             } else {
-                cmd.args(&["-map", "0:a:0"]);
+                cmd.args(["-map", "0:a:0"]);
             }
             cmd.arg("-vn"); // No video
         } else if target_audio_codec == "none" {
             // Video-only segment: Map ONLY video
-            cmd.args(&["-map", "0:v:0"]);
+            cmd.args(["-map", "0:v:0"]);
             cmd.arg("-an"); // No audio
         } else {
             // Combined segment (fallback/legacy): Map both
-            cmd.args(&["-map", "0:v:0"]);
+            cmd.args(["-map", "0:v:0"]);
             if let Some(audio_idx) = audio_stream_index {
-                cmd.args(&["-map", &format!("0:{}", audio_idx)]);
+                cmd.args(["-map", &format!("0:{}", audio_idx)]);
             } else {
-                cmd.args(&["-map", "0:a:0"]);
+                cmd.args(["-map", "0:a:0"]);
             }
         }
 
@@ -365,7 +365,7 @@ impl HlsEngine {
         } else if target_video_codec == "copy" {
             cmd.arg("-c:v").arg("copy");
         } else {
-            cmd.args(&["-c:v", target_video_codec]);
+            cmd.args(["-c:v", target_video_codec]);
 
             // Hardware encoders have different parameter support
             let is_hw_encoder = target_video_codec.contains("nvenc")
@@ -383,7 +383,7 @@ impl HlsEngine {
                     // Use -rc vbr -tune hq (vbr_hq is deprecated in newer ffmpeg)
                     // OPTIMIZATION: Use p2 (faster than p3) for lower latency
                     // OPTIMIZATION: Reduce bitrate to 4M (max 6M) for better streaming performance
-                    cmd.args(&[
+                    cmd.args([
                         "-pix_fmt", "yuv420p", "-preset", "p2", "-rc", "vbr", "-tune", "hq", "-cq",
                         "23", "-b:v", "4M", "-maxrate", "6M", "-bufsize", "12M",
                     ]);
@@ -391,14 +391,14 @@ impl HlsEngine {
                     // VAAPI requires input to be on a VAAPI surface.
                     // If input is SW decoded, we need to upload it.
                     // Also force nv12 (8-bit) to avoid compatibility issues with 10-bit H264.
-                    cmd.args(&["-vf", "format=nv12,hwupload"]);
+                    cmd.args(["-vf", "format=nv12,hwupload"]);
                 } else if target_video_codec.contains("qsv") {
                     // QSV also often expects 8-bit nv12 for H264
-                    cmd.args(&["-vf", "format=nv12", "-preset", "fast"]);
+                    cmd.args(["-vf", "format=nv12", "-preset", "fast"]);
                 }
             } else {
                 // Software encoder - use full optimization flags
-                cmd.args(&[
+                cmd.args([
                     "-pix_fmt",
                     "yuv420p",
                     "-preset",
@@ -415,7 +415,7 @@ impl HlsEngine {
         } else if target_audio_codec == "copy" {
             cmd.arg("-c:a").arg("copy");
         } else {
-            cmd.args(&[
+            cmd.args([
                 "-c:a",
                 target_audio_codec,
                 "-ac",
@@ -428,12 +428,12 @@ impl HlsEngine {
         }
 
         // Output flags
-        cmd.args(&["-max_muxing_queue_size", "2048"]);
-        cmd.args(&["-map_metadata", "-1", "-map_chapters", "-1"]);
+        cmd.args(["-max_muxing_queue_size", "2048"]);
+        cmd.args(["-map_metadata", "-1", "-map_chapters", "-1"]);
 
         // Output format flags
         // Switch to mp4/fMP4 as per split_output
-        cmd.args(&[
+        cmd.args([
             "-f",
             "mp4",
             "-movflags",
