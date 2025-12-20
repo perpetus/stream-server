@@ -43,7 +43,9 @@ jobs:
       - name: Cargo Chef Cache
         uses: actions/cache@v4
         with:
-          path: target
+          path: |
+            target
+            vcpkg_installed
           key: ${{ runner.os }}-cargo-chef-${{ hashFiles('recipe.json') }}
 
       - name: Cargo Chef Cook
@@ -56,6 +58,12 @@ jobs:
 
       - name: Build Release
         run: cargo build --release --features libtorrent --no-default-features
+        env:
+          VCPKG_ROOT: ${{ github.workspace }}\vcpkg
+          VCPKGRS_TRIPLET: x64-windows-static
+
+      - name: Initialize WiX
+        run: cargo wix init --package server --force
         env:
           VCPKG_ROOT: ${{ github.workspace }}\vcpkg
           VCPKGRS_TRIPLET: x64-windows-static
@@ -110,7 +118,9 @@ jobs:
       - name: Cargo Chef Cache
         uses: actions/cache@v4
         with:
-          path: target
+          path: |
+            target
+            vcpkg_installed
           key: ${{ runner.os }}-cargo-chef-${{ hashFiles('recipe.json') }}
 
       - name: Cargo Chef Cook
@@ -187,7 +197,7 @@ jobs:
       - name: Install dependencies
         run: |
           pacman -Syu --noconfirm
-          pacman -S --noconfirm base-devel rust git openssl pkg-config
+          pacman -S --noconfirm base-devel rust git openssl pkg-config libtorrent-rasterbar boost
 
       - name: Build binary
         run: cargo build --release --features libtorrent --no-default-features

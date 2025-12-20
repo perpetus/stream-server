@@ -2,6 +2,9 @@
 name = "server"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+description = "High-performance torrent streaming server"
+authors = ["Perpetus <perpetus@example.com>"]
 
 [dependencies]
 enginefs = { path = "../enginefs" }
@@ -40,9 +43,7 @@ license-file = ["../LICENSE", "0"]
 extended-description = "High-performance torrent streaming server with HLS transcoding support"
 section = "net"
 priority = "optional"
-assets = [
-    ["target/release/server", "usr/bin/stream-server", "755"],
-]
+assets = [["target/release/server", "usr/bin/stream-server", "755"]]
 
 [package.metadata.wix]
 upgrade-guid = "A1B2C3D4-E5F6-7890-ABCD-EF1234567890"
