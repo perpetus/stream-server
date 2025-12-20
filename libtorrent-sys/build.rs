@@ -15,6 +15,7 @@ fn main() {
     build
         .file("cpp/wrapper.cpp")
         .std("c++17")
+        .define("TORRENT_ABI_VERSION", "2") // Default to v2 for 2.0+
         .flag_if_supported("-Wno-unused-parameter")
         .flag_if_supported("-Wno-missing-field-initializers");
 

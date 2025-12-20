@@ -69,7 +69,7 @@ jobs:
           VCPKGRS_TRIPLET: x64-windows-static
 
       - name: Build MSI Installer
-        run: cargo wix --package server --nocapture
+        run: cargo wix --package server --no-build --nocapture
         env:
           VCPKG_ROOT: ${{ github.workspace }}\vcpkg
           VCPKGRS_TRIPLET: x64-windows-static
@@ -214,9 +214,9 @@ jobs:
           pkgrel=1
           pkgdesc="High-performance torrent streaming server with HLS transcoding"
           arch=('x86_64')
-          url="https://github.com/user/stream-server"
+          url="https://github.com/perpetus/stream-server"
           license=('MIT')
-          depends=('openssl')
+          depends=('openssl' 'libtorrent-rasterbar' 'boost-libs')
           source=("stream-server")
           sha256sums=('SKIP')
 
