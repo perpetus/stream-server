@@ -1,4 +1,4 @@
-use crate::files::FileStreamTrait;
+use crate::backend::FileStreamTrait;
 use moka::future::Cache;
 use std::future::Future;
 use std::io::{self, SeekFrom};
@@ -8,7 +8,7 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncSeek, ReadBuf};
 use tokio::sync::Mutex;
 
-const CHUNK_SIZE: u64 = 128 * 1024; // 128KB chunks
+const CHUNK_SIZE: u64 = 512 * 1024; // 512KB chunks
 
 pub type DataCache = Cache<(usize, u64), Arc<Vec<u8>>>;
 type ReadFuture = Pin<Box<dyn Future<Output = io::Result<Arc<Vec<u8>>>> + Send>>;
@@ -43,6 +43,48 @@ impl CachedStream {
             current_future: None,
         }
     }
+
+    fn prefetch(&self, chunk_index: u64) {
+        // Prefetch next 2 chunks
+        for i in 1..=2 {
+            let next_chunk = chunk_index + i;
+            if next_chunk * CHUNK_SIZE >= self.file_length {
+                break;
+            }
+
+            let key = (self.file_index, next_chunk);
+            if self.cache.contains_key(&key) {
+                continue;
+            }
+
+            let cache = self.cache.clone();
+            let inner = self.inner.clone();
+            let chunk_start = next_chunk * CHUNK_SIZE;
+
+            // Spawn background task to populate cache
+            tokio::spawn(async move {
+                // We use try_get_with just to populate. We don't care about the result here.
+                // Explicitly type the future's return to help inference
+                let _ = cache
+                    .try_get_with(key, async move {
+                        let mut stream = inner.lock().await;
+                        use tokio::io::AsyncReadExt;
+                        use tokio::io::AsyncSeekExt;
+
+                        stream.seek(SeekFrom::Start(chunk_start)).await?;
+
+                        let mut buffer = Vec::with_capacity(CHUNK_SIZE as usize);
+                        let mut take = (&mut *stream).take(CHUNK_SIZE);
+                        take.read_to_end(&mut buffer).await?;
+
+                        let res: Result<Arc<Vec<u8>>, std::io::Error> =
+                            Ok(Arc::<Vec<u8>>::new(buffer));
+                        res
+                    })
+                    .await;
+            });
+        }
+    }
 }
 
 impl AsyncSeek for CachedStream {
@@ -53,11 +95,6 @@ impl AsyncSeek for CachedStream {
             SeekFrom::End(diff) => (self.file_length as i64 + diff) as u64,
         };
         self.position = new_pos;
-        // Invalidate current read future if we seek?
-        // Actually, if we seek, we might still be waiting for a block we don't need.
-        // But for simplicity, we can drop the future.
-        // However, `get_with` might still be running in background populating the cache, which is GOOD.
-        // So simply dropping the future here to switch to a new read is fine.
         self.current_future = None;
         Ok(())
     }
@@ -79,7 +116,12 @@ impl AsyncRead for CachedStream {
                 return Poll::Ready(Ok(()));
             }
 
-            // If we have a pending future, poll it
+            // Trigger prefetch for next chunks if starting a new chunk
+            if self.position % CHUNK_SIZE == 0 {
+                let chunk_index = self.position / CHUNK_SIZE;
+                self.prefetch(chunk_index);
+            }
+
             // If we have a pending future, poll it
             if let Some(wrapper) = self.current_future.as_mut() {
                 match wrapper.0.as_mut().poll(cx) {
@@ -93,11 +135,6 @@ impl AsyncRead for CachedStream {
                                 let chunk_offset = (self.position - chunk_start) as usize;
 
                                 if chunk_offset >= data.len() {
-                                    // Should not happen if logic is correct unless file grew or something weird?
-                                    // Or maybe we are at EOF of this chunk?
-                                    // Actually, if we sought past the data length of this chunk, we move to next chunk.
-                                    // But loop logic below should handle that.
-                                    // Just strictly restart loop to recalculate chunk_index/offsets.
                                     continue;
                                 }
 
@@ -119,9 +156,11 @@ impl AsyncRead for CachedStream {
             let key = (self.file_index, chunk_index);
             let chunk_start = chunk_index * CHUNK_SIZE;
 
+            // Trigger prefetch here too in case we jumped into middle of chunk
+            self.prefetch(chunk_index);
+
             let cache = self.cache.clone();
             let inner = self.inner.clone();
-            let _file_length = self.file_length; // keep just in case or remove? It's unused. remove block capture.
 
             let fut = async move {
                 cache
@@ -133,17 +172,12 @@ impl AsyncRead for CachedStream {
                         use tokio::io::AsyncSeekExt;
 
                         // We need to re-seek deeply because other consumers (or previous reads) might have moved it
-                        stream
-                            .seek(SeekFrom::Start(chunk_start))
-                            .await
-                            .map_err(|e| std::sync::Arc::new(e))?;
+                        stream.seek(SeekFrom::Start(chunk_start)).await?;
 
                         let mut buffer = Vec::with_capacity(CHUNK_SIZE as usize);
                         // Take from mutable reference to avoid moving out of MutexGuard
                         let mut take = (&mut *stream).take(CHUNK_SIZE);
-                        take.read_to_end(&mut buffer)
-                            .await
-                            .map_err(|e| std::sync::Arc::new(e))?;
+                        take.read_to_end(&mut buffer).await?;
 
                         let res: Result<Arc<Vec<u8>>, std::sync::Arc<io::Error>> =
                             Ok(Arc::<Vec<u8>>::new(buffer));
@@ -152,7 +186,6 @@ impl AsyncRead for CachedStream {
                     .await
                     .map_err(|e| {
                         // Unwrap the Arc error or create generic io error
-                        // Moka error is Arc<E>.
                         io::Error::new(io::ErrorKind::Other, e.to_string())
                     })
             };

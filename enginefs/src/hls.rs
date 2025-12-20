@@ -17,6 +17,7 @@ pub struct VideoStream {
     pub fps: Option<f64>,
     pub lang: Option<String>,
     pub is_default: bool,
+    pub profile: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,11 +84,28 @@ impl HlsEngine {
                 let index: usize = caps[1].parse().unwrap_or(0);
                 let lang = caps.get(2).map(|m| m.as_str().to_string());
                 let type_str = caps[3].to_lowercase();
-                let codec_name = caps[4]
+
+                let raw_codec_desc = caps[4].to_string(); // e.g., "hevc (Main 10)"
+                let codec_name = raw_codec_desc
                     .split_whitespace()
                     .next()
                     .unwrap_or("unknown")
                     .to_lowercase();
+
+                // Extract profile from parens if present: "hevc (Main 10)" -> "Main 10"
+                let profile = if let Some(start) = raw_codec_desc.find('(') {
+                    if let Some(end) = raw_codec_desc.find(')') {
+                        if start < end {
+                            Some(raw_codec_desc[start + 1..end].to_string())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
 
                 let width = re_dim.captures(line).and_then(|c| c[1].parse().ok());
                 let height = re_dim.captures(line).and_then(|c| c[2].parse().ok());
@@ -108,6 +126,7 @@ impl HlsEngine {
                     fps,
                     lang,
                     is_default,
+                    profile,
                 });
                 trace!(
                     index,
@@ -129,7 +148,8 @@ impl HlsEngine {
     }
 
     pub fn get_segments(duration: f64) -> Vec<(f64, f64)> {
-        let segment_duration = 6.0;
+        // Shorter segments = faster initial load and seeking
+        let segment_duration = 2.0;
         let count = (duration / segment_duration).ceil() as usize;
         let mut segments = Vec::new();
         for i in 0..count {
@@ -149,6 +169,7 @@ impl HlsEngine {
         info_hash: &str,
         file_idx: usize,
         base_url: &str,
+        query_str: &str,
     ) -> String {
         let mut m3u = String::from("#EXTM3U\n#EXT-X-VERSION:4\n");
 
@@ -174,8 +195,8 @@ impl HlsEngine {
 
             // Each audio track gets its own stream playlist with audio index
             m3u.push_str(&format!(
-                "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"{}\",LANGUAGE=\"{}\",NAME=\"{}\",DEFAULT={},AUTOSELECT={},URI=\"{}/hlsv2/{}/{}/audio-{}.m3u8\"\n",
-                audio_group_id, lang, name, is_default, is_autoselect, base_url, info_hash, file_idx, audio.index
+                "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"{}\",LANGUAGE=\"{}\",NAME=\"{}\",DEFAULT={},AUTOSELECT={},URI=\"{}/hlsv2/{}/{}/audio-{}.m3u8?{}\"\n",
+                audio_group_id, lang, name, is_default, is_autoselect, base_url, info_hash, file_idx, audio.index, query_str
             ));
         }
 
@@ -193,8 +214,8 @@ impl HlsEngine {
             ));
         }
         m3u.push_str(&format!(
-            "{}/hlsv2/{}/{}/stream-0.m3u8\n",
-            base_url, info_hash, file_idx
+            "{}/hlsv2/{}/{}/stream-0.m3u8?{}\n",
+            base_url, info_hash, file_idx, query_str
         ));
 
         m3u
@@ -204,22 +225,65 @@ impl HlsEngine {
         probe: &ProbeResult,
         _stream_idx: usize,
         segment_base_url: &str,
+        audio_track_idx: Option<usize>,
+        query_str: &str,
     ) -> String {
         let segments = Self::get_segments(probe.duration);
-        let target_duration = 6;
 
         let mut m3u = String::from("#EXTM3U\n#EXT-X-VERSION:4\n");
-        m3u.push_str(&format!("#EXT-X-TARGETDURATION:{}\n", target_duration));
+        m3u.push_str("#EXT-X-TARGETDURATION:2\n");
         m3u.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
         m3u.push_str("#EXT-X-PLAYLIST-TYPE:VOD\n");
 
         for (i, (_start, dur)) in segments.iter().enumerate() {
             m3u.push_str(&format!("#EXTINF:{},\n", dur));
-            m3u.push_str(&format!("{}{}.ts\n", segment_base_url, i));
+            let filename = if let Some(audio_idx) = audio_track_idx {
+                format!(
+                    "{}audio-{}-{}.ts?{}",
+                    segment_base_url, audio_idx, i, query_str
+                )
+            } else {
+                format!("{}{}.ts?{}", segment_base_url, i, query_str)
+            };
+            m3u.push_str(&format!("{}\n", filename));
         }
-
         m3u.push_str("#EXT-X-ENDLIST\n");
         m3u
+    }
+
+    pub async fn probe_hwaccel() -> &'static str {
+        static HW_ACCEL_METHOD: tokio::sync::OnceCell<String> = tokio::sync::OnceCell::const_new();
+
+        HW_ACCEL_METHOD
+            .get_or_init(|| async {
+                let mut cmd = Command::new("ffmpeg");
+                cmd.arg("-hwaccels");
+                cmd.stdout(Stdio::piped());
+                cmd.stderr(Stdio::null());
+
+                if let Ok(output) = cmd.output().await {
+                    let output_str = String::from_utf8_lossy(&output.stdout);
+                    let methods: Vec<&str> = output_str.lines().map(|l| l.trim()).collect();
+
+                    // Priority list for HW acceleration
+                    if methods.contains(&"cuda") {
+                        return "cuda".to_string();
+                    } else if methods.contains(&"vaapi") {
+                        return "vaapi".to_string();
+                    } else if methods.contains(&"qsv") {
+                        return "qsv".to_string();
+                    } else if methods.contains(&"vulkan") {
+                        return "vulkan".to_string();
+                    } else if methods.contains(&"videotoolbox") {
+                        // macOS
+                        return "videotoolbox".to_string();
+                    }
+                }
+
+                "auto".to_string() // Fallback
+            })
+            .await
+            .as_str()
     }
 
     pub async fn transcode_segment(
@@ -227,63 +291,164 @@ impl HlsEngine {
         start: f64,
         duration: f64,
         container: Option<&str>,
-        transcode_audio: bool,
+        target_audio_codec: &str,
+        target_video_codec: &str,
         audio_stream_index: Option<usize>,
     ) -> Result<tokio::process::Child> {
+        let hwaccel_method = Self::probe_hwaccel().await;
+
         let mut cmd = Command::new("ffmpeg");
 
-        // Input flags optimization
-        cmd.args(&["-analyzeduration", "0", "-probesize", "1000000"]); // Reduce analysis time
+        // ========== OPTIMIZED INPUT FLAGS FOR LOW LATENCY ==========
+        // -fflags: nobuffer (reduce buffering), genpts (generate pts), discardcorrupt, fastseek
+        // -flags low_delay: force low-delay codec mode
+        // -analyzeduration 500000: 0.5s analysis (needed for proper HEVC initialization)
+        // -probesize 1000000: 1MB probing (needed for HEVC with Dolby Vision)
+        cmd.args(&[
+            "-hwaccel",
+            &hwaccel_method,
+            "-fflags",
+            "+genpts+discardcorrupt+nobuffer+fastseek",
+            "-flags",
+            "low_delay",
+            "-analyzeduration",
+            "500000",
+            "-probesize",
+            "1000000",
+        ]);
 
         if let Some(cont) = container {
             cmd.arg("-f").arg(cont);
         }
 
-        cmd.arg("-ss").arg(format!("{}", start));
-        cmd.arg("-t").arg(format!("{}", duration));
-        cmd.arg("-i").arg(input_path);
+        // Reverse-engineered flags from split_output
+        cmd.args(&["-fflags", "+genpts"]);
+        cmd.args(&["-noaccurate_seek", "-seek_timestamp", "1"]);
+        // -copyts is used in split_output and is critical for correct timing with these flags
+        cmd.arg("-copyts");
 
-        // Stream mapping - select specific audio track if provided
-        if let Some(audio_idx) = audio_stream_index {
-            cmd.args(&["-map", "0:v:0"]); // Map first video stream
-            cmd.args(&["-map", &format!("0:{}", audio_idx)]); // Map specific audio stream
+        // -ss BEFORE -i: Fast keyframe-based seeking (demuxer-level)
+        cmd.arg("-ss").arg(format!("{}", start));
+        cmd.arg("-i").arg(input_path);
+        // -t after -i limits output duration
+        cmd.arg("-t").arg(format!("{}", duration));
+
+        // Always disable subtitles to prevent failures with image-based subs
+        cmd.arg("-sn");
+
+        // Stream mapping logic
+        if target_video_codec == "none" {
+            // Audio-only segment: Map ONLY audio (specific or 0:a:0)
+            if let Some(audio_idx) = audio_stream_index {
+                cmd.args(&["-map", &format!("0:{}", audio_idx)]);
+            } else {
+                cmd.args(&["-map", "0:a:0"]);
+            }
+            cmd.arg("-vn"); // No video
+        } else if target_audio_codec == "none" {
+            // Video-only segment: Map ONLY video
+            cmd.args(&["-map", "0:v:0"]);
+            cmd.arg("-an"); // No audio
+        } else {
+            // Combined segment (fallback/legacy): Map both
+            cmd.args(&["-map", "0:v:0"]);
+            if let Some(audio_idx) = audio_stream_index {
+                cmd.args(&["-map", &format!("0:{}", audio_idx)]);
+            } else {
+                cmd.args(&["-map", "0:a:0"]);
+            }
         }
 
         // Video flags
-        cmd.args(&[
-            "-c:v",
-            "libx264",
-            "-pix_fmt",
-            "yuv420p",
-            "-preset",
-            "veryfast",
-            "-tune",
-            "zerolatency",
-        ]);
+        if target_video_codec == "none" {
+            // Do nothing
+        } else if target_video_codec == "copy" {
+            cmd.arg("-c:v").arg("copy");
+        } else {
+            cmd.args(&["-c:v", target_video_codec]);
+
+            // Hardware encoders have different parameter support
+            let is_hw_encoder = target_video_codec.contains("nvenc")
+                || target_video_codec.contains("vaapi")
+                || target_video_codec.contains("qsv")
+                || target_video_codec.contains("v4l2m2m")
+                || target_video_codec.contains("videotoolbox");
+
+            if is_hw_encoder {
+                tracing::info!("Using hardware encoder: {}", target_video_codec);
+                // Hardware encoders - use their native presets
+                if target_video_codec.contains("nvenc") {
+                    // NVENC H264 usually requires 8-bit input (yuv420p).
+                    // Input is 10-bit HEVC, so we MUST force 8-bit conversion.
+                    // Use -rc vbr -tune hq (vbr_hq is deprecated in newer ffmpeg)
+                    // OPTIMIZATION: Use p2 (faster than p3) for lower latency
+                    // OPTIMIZATION: Reduce bitrate to 4M (max 6M) for better streaming performance
+                    cmd.args(&[
+                        "-pix_fmt", "yuv420p", "-preset", "p2", "-rc", "vbr", "-tune", "hq", "-cq",
+                        "23", "-b:v", "4M", "-maxrate", "6M", "-bufsize", "12M",
+                    ]);
+                } else if target_video_codec.contains("vaapi") {
+                    // VAAPI requires input to be on a VAAPI surface.
+                    // If input is SW decoded, we need to upload it.
+                    // Also force nv12 (8-bit) to avoid compatibility issues with 10-bit H264.
+                    cmd.args(&["-vf", "format=nv12,hwupload"]);
+                } else if target_video_codec.contains("qsv") {
+                    // QSV also often expects 8-bit nv12 for H264
+                    cmd.args(&["-vf", "format=nv12", "-preset", "fast"]);
+                }
+            } else {
+                // Software encoder - use full optimization flags
+                cmd.args(&[
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-preset",
+                    "ultrafast",
+                    "-tune",
+                    "zerolatency",
+                ]);
+            }
+        }
 
         // Audio flags
-        if transcode_audio {
-            // Transcode to AAC Stereo for browser compatibility (handles Dolby etc.)
-            cmd.args(&["-c:a", "aac", "-ac", "2", "-strict", "experimental"]);
-        } else {
-            // Copy audio stream as-is (efficient for native players that support it)
+        if target_audio_codec == "none" {
+            // Do nothing
+        } else if target_audio_codec == "copy" {
             cmd.arg("-c:a").arg("copy");
+        } else {
+            cmd.args(&[
+                "-c:a",
+                target_audio_codec,
+                "-ac",
+                "2",
+                "-b:a", // Ensure decent bitrate
+                "192k",
+                "-strict",
+                "experimental",
+            ]);
         }
 
         // Output flags
+        cmd.args(&["-max_muxing_queue_size", "2048"]);
+        cmd.args(&["-map_metadata", "-1", "-map_chapters", "-1"]);
+
+        // Output format flags
+        // Switch to mp4/fMP4 as per split_output
         cmd.args(&[
-            "-copyts",
-            "-mpegts_copyts",
-            "1",
             "-f",
-            "mpegts",
+            "mp4",
+            "-movflags",
+            "frag_keyframe+empty_moov+default_base_moof+delay_moov+dash",
+            "-use_editlist",
+            "1",
             "-threads",
             "0",
             "pipe:1",
         ]);
 
         cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::inherit()); // inherit stderr for easier debugging in server logs
+        cmd.stderr(Stdio::inherit()); // See ffmpeg errors in console
+
+        tracing::info!("Running ffmpeg: {:?}", cmd);
 
         let child = cmd.spawn().context("Failed to spawn ffmpeg transcoder")?;
         Ok(child)

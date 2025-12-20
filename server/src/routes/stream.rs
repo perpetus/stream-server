@@ -1,7 +1,7 @@
 use crate::state::AppState;
 use axum::{
     body::Body,
-    extract::{Path, State},
+    extract::{Path, RawQuery, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
 };
@@ -13,8 +13,19 @@ pub async fn stream_video(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path((info_hash, idx)): Path<(String, usize)>,
+    RawQuery(query_str): RawQuery,
 ) -> Response {
     let info_hash = info_hash.to_lowercase();
+
+    // Parse trackers from query string 'tr=url&tr=url2'
+    let mut trackers = Vec::new();
+    if let Some(q) = query_str {
+        for (key, val) in url::form_urlencoded::parse(q.as_bytes()) {
+            if key == "tr" {
+                trackers.push(val.into_owned());
+            }
+        }
+    }
 
     // Try to get existing engine, or auto-create from info hash
     let engine = if let Some(e) = state.engine.get_engine(&info_hash).await {
@@ -23,8 +34,10 @@ pub async fn stream_video(
         // Auto-create engine from magnet link
         tracing::info!("Auto-creating engine for info_hash: {}", info_hash);
         let magnet = format!("magnet:?xt=urn:btih:{}", info_hash);
-        let add_torrent = librqbit::AddTorrent::from_url(magnet);
-        match state.engine.add_torrent(add_torrent, None).await {
+        // Note: usage of enginefs::backend::TorrentSource requires enginefs dependency or import
+        let source = enginefs::backend::TorrentSource::Url(magnet);
+
+        match state.engine.add_torrent(source, Some(trackers)).await {
             Ok(e) => e,
             Err(e) => {
                 tracing::error!("Failed to create engine: {}", e);
@@ -90,6 +103,24 @@ pub async fn stream_video(
             "video/x-ms-wmv"
         } else if name.ends_with(".webm") {
             "video/webm"
+        } else if name.ends_with(".mp3") {
+            "audio/mpeg"
+        } else if name.ends_with(".m4a") {
+            "audio/mp4"
+        } else if name.ends_with(".aac") {
+            "audio/aac"
+        } else if name.ends_with(".flac") {
+            "audio/flac"
+        } else if name.ends_with(".wav") {
+            "audio/wav"
+        } else if name.ends_with(".ogg") {
+            "audio/ogg"
+        } else if name.ends_with(".opus") {
+            "audio/opus"
+        } else if name.ends_with(".ac3") {
+            "audio/ac3"
+        } else if name.ends_with(".eac3") || name.ends_with(".ec3") {
+            "audio/eac3"
         } else {
             "application/octet-stream"
         };

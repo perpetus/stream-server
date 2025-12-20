@@ -24,14 +24,55 @@ pub async fn proxy_handler(
     method: Method,
 ) -> impl IntoResponse {
     // Porting the logic from express_805.js
-    // It expects either d (destination) in params or as the first part of rest.
-    // Stremio Shell usually passes ?d=URL
-    let target_url = if let Some(d) = params.get("d") {
-        d.clone()
+    // Format 1: ?d=URL (standard)
+    // Format 2: /<query_params>/<path> (Core) where query_params contains d=ORIGIN&h=HEADER
+
+    let mut target_url = String::new();
+    let mut custom_headers = HashMap::new();
+
+    // Check for standard query param '?d='
+    if let Some(d) = params.get("d") {
+        target_url = d.clone();
+        // Fallback: If rest is not empty and d is just origin, we might need to append rest?
+        // But usually ?d=FULL_URL
     } else {
-        // Fallback: maybe it's in the path
-        rest.clone()
-    };
+        // Handle path-based format: /proxy/d=...&h=.../path/to/file
+        // Split rest by first slash to get query_segment and path
+        let (query_seg, path_seg) = match rest.split_once('/') {
+            Some((q, p)) => (q, p),
+            None => (rest.as_str(), ""),
+        };
+
+        // Parse the query segment
+        for (key, val) in url::form_urlencoded::parse(query_seg.as_bytes()) {
+            match key.as_ref() {
+                "d" => target_url = val.into_owned(),
+                "h" => {
+                    // Header format "Name:Value"
+                    if let Some((name, value)) = val.split_once(':') {
+                        custom_headers.insert(name.trim().to_string(), value.trim().to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // If we found 'd', construct the full URL
+        if !target_url.is_empty() {
+            // target_url is the origin (e.g. http://example.com)
+            // path_seg is the relative path (e.g. video.mp4)
+            // Join them carefully
+            if !path_seg.is_empty() {
+                if !target_url.ends_with('/') {
+                    target_url.push('/');
+                }
+                target_url.push_str(path_seg);
+            }
+        } else {
+            // Fallback: assume whole rest is the URL (legacy/simple proxy)
+            target_url = rest.clone();
+        }
+    }
 
     let url = match Url::parse(&target_url) {
         Ok(u) => u,
@@ -45,7 +86,7 @@ pub async fn proxy_handler(
 
     let mut req_builder = client.request(method, url.clone());
 
-    // Forward headers
+    // Forward standard headers
     let allowed_req_headers = [
         "accept",
         "accept-encoding",
@@ -61,6 +102,11 @@ pub async fn proxy_handler(
         if let Some(value) = headers.get(name) {
             req_builder = req_builder.header(name, value);
         }
+    }
+
+    // Apply custom headers from query params (Core format)
+    for (name, value) in custom_headers {
+        req_builder = req_builder.header(name, value);
     }
 
     let response = match req_builder.send().await {

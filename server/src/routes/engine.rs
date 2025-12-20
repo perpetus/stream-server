@@ -4,14 +4,14 @@ use axum::{
     response::IntoResponse,
 };
 use hex;
-use librqbit;
 use serde::Deserialize;
 use serde_json::json;
 
 #[derive(Deserialize)]
 pub struct CreateEngineRequest {
-    pub from: Option<String>,    // Magnet link or URL
-    pub torrent: Option<String>, // Torrent blob (hex encoded)
+    pub from: Option<String>, // Magnet link or URL
+    #[serde(alias = "blob")]
+    pub torrent: Option<String>, // Torrent blob (hex encoded) - alias "blob" for stremio-core compat
     pub announce: Option<Vec<String>>,
 }
 
@@ -19,22 +19,18 @@ pub async fn create_engine(
     State(state): State<AppState>,
     Json(payload): Json<CreateEngineRequest>,
 ) -> impl IntoResponse {
-    let add_torrent = if let Some(hex_str) = payload.torrent {
+    let source = if let Some(hex_str) = payload.torrent {
         match hex::decode(hex_str) {
-            Ok(bytes) => librqbit::AddTorrent::from_bytes(bytes),
+            Ok(bytes) => enginefs::backend::TorrentSource::Bytes(bytes),
             Err(e) => return Json(json!({ "error": format!("Invalid hex blob: {}", e) })),
         }
     } else if let Some(from) = payload.from {
-        librqbit::AddTorrent::from_url(from)
+        enginefs::backend::TorrentSource::Url(from)
     } else {
         return Json(json!({ "error": "Missing 'from' or 'torrent' field" }));
     };
 
-    match state
-        .engine
-        .add_torrent(add_torrent, payload.announce)
-        .await
-    {
+    match state.engine.add_torrent(source, payload.announce).await {
         Ok(engine) => {
             let stats = engine.get_statistics().await;
             // Note: guessed_file_idx and file_must_include heuristics are now
@@ -92,9 +88,9 @@ pub async fn create_magnet(
 
     // Create magnet URL from info hash
     let magnet = format!("magnet:?xt=urn:btih:{}", ih);
-    let add_torrent = librqbit::AddTorrent::from_url(magnet);
+    let source = enginefs::backend::TorrentSource::Url(magnet);
 
-    match state.engine.add_torrent(add_torrent, None).await {
+    match state.engine.add_torrent(source, None).await {
         Ok(engine) => {
             let stats = engine.get_statistics().await;
             Json(json!(stats))

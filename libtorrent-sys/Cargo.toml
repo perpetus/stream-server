@@ -1,0 +1,16 @@
+[package]
+name = "libtorrent-sys"
+version = "0.1.0"
+edition = "2024"
+description = "FFI bindings to libtorrent-rasterbar via cxx"
+license = "MIT"
+
+[lib]
+name = "libtorrent_sys"
+
+[dependencies]
+cxx = "1.0"
+
+[build-dependencies]
+cxx-build = "1.0"
+pkg-config = "0.3"

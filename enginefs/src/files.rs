@@ -1,24 +1,23 @@
+use crate::backend::{FileStreamTrait, TorrentHandle};
 use std::pin::Pin;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use tokio::io::{AsyncRead, AsyncSeek}; // Added for Arc
+use tokio::io::{AsyncRead, AsyncSeek};
 
-pub struct FileHandle {
+pub struct FileHandle<H: TorrentHandle> {
     pub size: u64,
     pub name: String,
     pub stream: Box<dyn FileStreamTrait>,
-    pub engine: Arc<crate::engine::Engine>, // Added this field
+    pub engine: Arc<crate::engine::Engine<H>>,
 }
 
-pub trait FileStreamTrait: AsyncRead + AsyncSeek + Unpin + Send + Sync {}
-impl<T: AsyncRead + AsyncSeek + Unpin + Send + Sync> FileStreamTrait for T {}
-
-impl FileHandle {
+impl<H: TorrentHandle> FileHandle<H> {
     pub fn new(
         size: u64,
         name: String,
         stream: Box<dyn FileStreamTrait>,
-        engine: Arc<crate::engine::Engine>,
+        engine: Arc<crate::engine::Engine<H>>,
     ) -> Self {
         Self {
             size,
@@ -29,7 +28,7 @@ impl FileHandle {
     }
 }
 
-impl AsyncRead for FileHandle {
+impl<H: TorrentHandle> AsyncRead for FileHandle<H> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -38,15 +37,14 @@ impl AsyncRead for FileHandle {
         Pin::new(&mut self.stream).poll_read(cx, buf)
     }
 }
-use std::sync::atomic::Ordering;
 
-impl Drop for FileHandle {
+impl<H: TorrentHandle> Drop for FileHandle<H> {
     fn drop(&mut self) {
         self.engine.active_streams.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
-impl AsyncSeek for FileHandle {
+impl<H: TorrentHandle> AsyncSeek for FileHandle<H> {
     fn start_seek(mut self: Pin<&mut Self>, position: std::io::SeekFrom) -> std::io::Result<()> {
         Pin::new(&mut self.stream).start_seek(position)
     }

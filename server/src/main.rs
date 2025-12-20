@@ -13,6 +13,9 @@ use tracing;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use urlencoding;
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod routes;
 mod state;
 
@@ -21,7 +24,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "server=debug,tower_http=debug".into()),
+                .unwrap_or_else(|_| "server=info,tower_http=info".into()),
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
@@ -29,7 +32,11 @@ async fn main() -> anyhow::Result<()> {
     // EngineFS::new() now handles its own librqbit session and background cleanup.
     let engine_fs = EngineFS::new().await?;
     let engine = Arc::new(engine_fs);
-    let state = AppState { engine };
+
+    // Load settings from disk or use defaults
+    let default_settings = routes::system::ServerSettings::default();
+    let settings = AppState::load_settings(&default_settings.cache_root);
+    let state = AppState::new(engine, settings);
 
     let app = Router::new()
         .route("/", get(root_redirect))
@@ -57,16 +64,28 @@ async fn main() -> anyhow::Result<()> {
             "/:infoHash/:idx/stats.json",
             get(routes::system::get_file_stats),
         )
+        .route("/:infoHash/peers", get(routes::peers::get_peers))
         // Stream routes - both patterns for compatibility
         .route(
             "/stream/:infoHash/:fileIdx",
-            get(routes::stream::stream_video),
+            get(routes::stream::stream_video).head(routes::stream::stream_video),
         )
-        .route("/:infoHash/:fileIdx", get(routes::stream::stream_video))
-        .route("/subtitles.vtt", get(routes::subtitles::get_subtitles_vtt))
+        .route(
+            "/:infoHash/:fileIdx",
+            get(routes::stream::stream_video).head(routes::stream::stream_video),
+        )
+        .route(
+            "/subtitles.vtt",
+            get(routes::subtitles::proxy_subtitles_vtt),
+        )
+        .route(
+            "/:infoHash/:fileIdx/subtitles.vtt",
+            get(routes::subtitles::get_subtitles_vtt),
+        )
+        .route("/opensubHash", get(routes::subtitles::opensub_hash))
         .route(
             "/opensubHash/:infoHash/:fileIdx",
-            get(routes::subtitles::opensub_hash),
+            get(routes::subtitles::opensub_hash_path),
         )
         .route(
             "/subtitlesTracks/:infoHash",
@@ -83,6 +102,7 @@ async fn main() -> anyhow::Result<()> {
         .nest("/tgz", routes::archive::router())
         .nest("/local-addon", routes::local_addon::router())
         .nest("/proxy", routes::proxy::router())
+        .nest("/ftp", routes::ftp::router())
         .route("/samples/:filename", get(routes::system::get_samples))
         // HLS routes with query params for Stremio compatibility
         .route(

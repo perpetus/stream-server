@@ -28,3 +28,7 @@ url = "2.5.7"
 rusty_ytdl = "0.7.4"
 mime_guess = "2.0.5"
 unrar = "0.5.8"
+lz-str = "0.2.1"
+tempfile = "3.23.0"
+mimalloc = { version = "0.1.48", default-features = false }
+rayon = "1.11.0"

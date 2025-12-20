@@ -1,8 +1,10 @@
 pub mod archive;
 pub mod casting;
 pub mod engine;
+pub mod ftp;
 pub mod hls;
 pub mod local_addon;
+pub mod peers;
 pub mod proxy;
 pub mod stream;
 pub mod subtitles;

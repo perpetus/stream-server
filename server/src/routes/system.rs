@@ -121,16 +121,65 @@ impl Default for ServerSettings {
 
 /// Returns server settings in the SettingsResponse format expected by stremio-core
 /// Response format: { "baseUrl": "http://...", "values": { ...settings } }
-pub async fn get_settings() -> impl IntoResponse {
-    let settings = ServerSettings::default();
+pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
+    let settings = state.settings.read().await;
     Json(json!({
         "baseUrl": "http://127.0.0.1:11470",
-        "values": settings
+        "values": settings.clone()
     }))
 }
 
-pub async fn set_settings(Json(_payload): Json<ServerSettings>) -> impl IntoResponse {
-    // We'd save to file here.
+pub async fn set_settings(
+    State(state): State<AppState>,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
+    tracing::debug!("set_settings: received payload: {:?}", payload);
+
+    // Merge with existing settings
+    let mut settings = state.settings.write().await;
+
+    if let Some(obj) = payload.as_object() {
+        // Update fields that are present in the payload
+        if let Some(v) = obj.get("transcodeProfile") {
+            if v.is_null() {
+                settings.transcode_profile = None;
+            } else if let Some(s) = v.as_str() {
+                settings.transcode_profile = Some(s.to_string());
+            }
+        }
+        if let Some(v) = obj.get("cacheSize") {
+            if let Some(n) = v.as_f64() {
+                settings.cache_size = n;
+            }
+        }
+        if let Some(v) = obj.get("proxyStreamsEnabled") {
+            if let Some(b) = v.as_bool() {
+                settings.proxy_streams_enabled = b;
+            }
+        }
+        if let Some(v) = obj.get("btMaxConnections") {
+            if let Some(n) = v.as_u64() {
+                settings.bt_max_connections = n;
+            }
+        }
+        if let Some(v) = obj.get("remoteHttps") {
+            if v.is_null() {
+                settings.remote_https = None;
+            } else if let Some(s) = v.as_str() {
+                settings.remote_https = Some(s.to_string());
+            }
+        }
+    }
+
+    // Release the write lock before saving
+    drop(settings);
+
+    // Save to disk
+    if let Err(e) = state.save_settings().await {
+        tracing::error!("Failed to save settings: {}", e);
+        return Json(json!({ "success": false, "error": e.to_string() }));
+    }
+
     Json(json!({ "success": true }))
 }
 pub async fn get_device_info() -> impl IntoResponse {
@@ -292,8 +341,8 @@ pub async fn get_engine_stats(
     } else {
         tracing::info!("Auto-creating engine for stats request: {}", info_hash);
         let magnet = format!("magnet:?xt=urn:btih:{}", info_hash);
-        let add_torrent = librqbit::AddTorrent::from_url(magnet);
-        match state.engine.add_torrent(add_torrent, None).await {
+        let source = enginefs::backend::TorrentSource::Url(magnet);
+        match state.engine.add_torrent(source, None).await {
             Ok(e) => e,
             Err(e) => {
                 tracing::error!("Failed to create engine: {}", e);
@@ -322,8 +371,8 @@ pub async fn get_file_stats(
     } else {
         tracing::info!("Auto-creating engine for file stats request: {}", info_hash);
         let magnet = format!("magnet:?xt=urn:btih:{}", info_hash);
-        let add_torrent = librqbit::AddTorrent::from_url(magnet);
-        match state.engine.add_torrent(add_torrent, None).await {
+        let source = enginefs::backend::TorrentSource::Url(magnet);
+        match state.engine.add_torrent(source, None).await {
             Ok(e) => e,
             Err(e) => {
                 tracing::error!("Failed to create engine: {}", e);
