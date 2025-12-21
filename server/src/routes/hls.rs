@@ -48,6 +48,7 @@ fn parse_transcode_params(query_str: &str) -> TranscodeParams {
 /// Probe endpoint using mediaURL query parameter (for Stremio compatibility)
 /// GET /hlsv2/probe?mediaURL=http://127.0.0.1:11470/{infoHash}/{fileIdx}?
 pub async fn probe_by_url(Query(params): Query<ProbeQuery>) -> Response {
+    let start = std::time::Instant::now();
     // Extract infoHash and fileIdx from the mediaURL
     // Format: http://127.0.0.1:11470/{infoHash}/{fileIdx}?
     let media_url = params.media_url.trim_end_matches('?');
@@ -57,7 +58,7 @@ pub async fn probe_by_url(Query(params): Query<ProbeQuery>) -> Response {
         return (StatusCode::BAD_REQUEST, "Invalid mediaURL format").into_response();
     }
 
-    let file_idx_str = parts[parts.len() - 1];
+    let file_idx_str = parts[parts.len() - 1].split('?').next().unwrap_or("0");
     let info_hash = parts[parts.len() - 2];
 
     let file_idx: usize = match file_idx_str.parse() {
@@ -76,6 +77,9 @@ pub async fn probe_by_url(Query(params): Query<ProbeQuery>) -> Response {
                 .into_response()
         }
     };
+
+    let elapsed = start.elapsed();
+    tracing::info!("Probe request for {} took {:?}", media_url, elapsed);
 
     Json(serde_json::json!({
         "infoHash": info_hash,

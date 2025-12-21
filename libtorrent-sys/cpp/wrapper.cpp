@@ -1,10 +1,5 @@
 
-// Force configuration to match vcpkg static build
-// NOTE: Do NOT define TORRENT_USE_STD_STRING_VIEW - library uses boost::string_view
-#define TORRENT_LINKING_STATIC 1
-#define TORRENT_ABI_VERSION 3
-#define BOOST_ASIO_STATIC_LINK 1
-#define BOOST_ASIO_SEPARATE_COMPILATION 1
+
 
 // Include the cxx-generated header first (contains struct definitions)
 #include "libtorrent-sys/src/lib.rs.h"

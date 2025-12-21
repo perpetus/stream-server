@@ -4,7 +4,6 @@ use serde::{Deserialize, Serialize};
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
-use tracing::trace;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VideoStream {
@@ -32,6 +31,7 @@ pub struct HlsEngine;
 
 impl HlsEngine {
     pub async fn probe_video(file_path: &str) -> Result<ProbeResult> {
+        tracing::info!("Starting probe_video for {}", file_path);
         // "Improve it without change in functionality":
         // We use ffmpeg -i as the JS did, but we use robust async process handling.
 
@@ -40,6 +40,7 @@ impl HlsEngine {
         cmd.stdout(Stdio::null());
         cmd.stderr(Stdio::piped());
 
+        tracing::info!("Spawning ffmpeg probe command: {:?}", cmd);
         let mut child = cmd.spawn().context("Failed to spawn ffmpeg")?;
         let stderr = child.stderr.take().context("Failed to capture stderr")?;
         let mut reader = BufReader::new(stderr).lines();
@@ -57,8 +58,10 @@ impl HlsEngine {
         let re_fps = Regex::new(r"(\d+(\.\d+)?) fps")?;
         let re_bitrate = Regex::new(r"(\d+) kb/s")?;
 
+        tracing::info!("Reading ffmpeg stderr...");
         while let Ok(Some(line)) = reader.next_line().await {
             let line = line.trim();
+            // tracing::trace!("ffmpeg stderr: {}", line);
 
             if let Some(caps) = re_input.captures(line) {
                 if let Some(formats) = caps.get(1) {
@@ -70,6 +73,7 @@ impl HlsEngine {
                     } else {
                         container = fmts.split(',').next().unwrap_or("unknown").to_string();
                     }
+                    tracing::info!("Found container: {}", container);
                 }
             }
 
@@ -78,6 +82,7 @@ impl HlsEngine {
                 let m: f64 = caps[2].parse().unwrap_or(0.0);
                 let s: f64 = caps[3].parse().unwrap_or(0.0);
                 duration = h * 3600.0 + m * 60.0 + s;
+                tracing::info!("Found duration: {}s", duration);
             }
 
             if let Some(caps) = re_stream.captures(line) {
@@ -128,7 +133,7 @@ impl HlsEngine {
                     is_default,
                     profile,
                 });
-                trace!(
+                tracing::info!(
                     index,
                     type_str = %type_str,
                     codec = %codec_name,
@@ -137,8 +142,10 @@ impl HlsEngine {
             }
         }
 
+        tracing::info!("Finished reading stderr, waiting for child process...");
         // We don't care about exit status being non-zero because ffmpeg -i without output always errors.
-        let _ = child.wait().await;
+        let status = child.wait().await;
+        tracing::info!("ffmpeg probe finished with status: {:?}", status);
 
         Ok(ProbeResult {
             duration,

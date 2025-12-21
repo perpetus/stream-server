@@ -17,6 +17,12 @@ pub async fn stream_video(
 ) -> Response {
     let info_hash = info_hash.to_lowercase();
 
+    tracing::info!(
+        "stream_video: Request for info_hash={} idx={}",
+        info_hash,
+        idx
+    );
+
     // Parse trackers from query string 'tr=url&tr=url2'
     let mut trackers = Vec::new();
     if let Some(q) = query_str {
@@ -26,19 +32,27 @@ pub async fn stream_video(
             }
         }
     }
+    tracing::info!("stream_video: Found {} trackers", trackers.len());
 
     // Try to get existing engine, or auto-create from info hash
     let engine = if let Some(e) = state.engine.get_engine(&info_hash).await {
+        tracing::info!("stream_video: Engine found in cache");
         e
     } else {
         // Auto-create engine from magnet link
-        tracing::info!("Auto-creating engine for info_hash: {}", info_hash);
+        tracing::info!(
+            "stream_video: Auto-creating engine for info_hash: {}",
+            info_hash
+        );
         let magnet = format!("magnet:?xt=urn:btih:{}", info_hash);
         // Note: usage of enginefs::backend::TorrentSource requires enginefs dependency or import
         let source = enginefs::backend::TorrentSource::Url(magnet);
 
         match state.engine.add_torrent(source, Some(trackers)).await {
-            Ok(e) => e,
+            Ok(e) => {
+                tracing::info!("stream_video: Engine created successfully");
+                e
+            }
             Err(e) => {
                 tracing::error!("Failed to create engine: {}", e);
                 return (
@@ -51,7 +65,12 @@ pub async fn stream_video(
     };
 
     // Await the async get_file
+    tracing::info!("stream_video: Calling get_file({})", idx);
     if let Some(mut file) = engine.get_file(idx).await {
+        tracing::info!(
+            "stream_video: get_file returned success. Size={}",
+            file.size
+        );
         let size = file.size;
         let name = file.name.clone();
 
@@ -74,16 +93,26 @@ pub async fn stream_video(
             (0, size - 1)
         };
 
+        tracing::info!(
+            "stream_video: Range request: {}-{} (total {})",
+            start,
+            end,
+            size
+        );
+
         if start >= size {
+            tracing::warn!("stream_video: Range not satisfiable");
             return (StatusCode::RANGE_NOT_SATISFIABLE, "Range Not Satisfiable").into_response();
         }
 
         // Seek to the start position
         if start > 0 {
+            tracing::info!("stream_video: Seeking to {}", start);
             if let Err(e) = file.seek(std::io::SeekFrom::Start(start)).await {
                 tracing::warn!("Seek error: {}", e);
                 return (StatusCode::INTERNAL_SERVER_ERROR, "Seek failed").into_response();
             }
+            tracing::info!("stream_video: Seek complete");
         }
 
         let content_length = end - start + 1;
@@ -141,6 +170,8 @@ pub async fn stream_video(
         // Use ReaderStream to convert AsyncRead to Stream for Axum Body
         let stream = tokio_util::io::ReaderStream::new(reader);
         let body = Body::from_stream(stream);
+
+        tracing::info!("stream_video: Sending body response");
 
         if headers.contains_key(header::RANGE) {
             (StatusCode::PARTIAL_CONTENT, res_headers, body).into_response()

@@ -47,6 +47,7 @@ pub struct BackendEngineFS<B: TorrentBackend> {
     engines: Arc<RwLock<HashMap<String, Arc<Engine<B::Handle>>>>>,
     tracker_manager: Arc<crate::trackers::TrackerManager>,
     pub cache_dir: std::path::PathBuf,
+    pub download_dir: std::path::PathBuf,
 }
 
 #[cfg(all(feature = "librqbit", not(feature = "libtorrent")))]
@@ -60,6 +61,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         backend: B,
         restored_handles: HashMap<String, B::Handle>,
         cache_dir: std::path::PathBuf,
+        download_dir: std::path::PathBuf,
     ) -> Self {
         let mut engines_map = HashMap::new();
         for (hash, handle) in restored_handles {
@@ -77,6 +79,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             engines: engines.clone(),
             tracker_manager,
             cache_dir,
+            download_dir: download_dir.clone(),
         };
 
         let engines_clone = engines.clone();
@@ -200,26 +203,28 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
 
 #[cfg(all(feature = "librqbit", not(feature = "libtorrent")))]
 impl BackendEngineFS<LibrqbitBackend> {
-    pub async fn new() -> Result<Self> {
-        let download_dir = std::env::current_dir()?.join("rqbit-downloads");
+    pub async fn new(root_dir: std::path::PathBuf) -> Result<Self> {
+        let download_dir = root_dir.join("rqbit-downloads");
         let (backend, restored) = LibrqbitBackend::new(download_dir.clone()).await?;
         Ok(Self::new_with_backend(
             backend,
             restored,
-            download_dir.join(".cache"),
+            root_dir.join("cache"),
+            download_dir,
         ))
     }
 }
 
 #[cfg(feature = "libtorrent")]
 impl BackendEngineFS<LibtorrentBackend> {
-    pub async fn new() -> Result<Self> {
-        let download_dir = std::env::current_dir()?.join("libtorrent-downloads");
+    pub async fn new(root_dir: std::path::PathBuf) -> Result<Self> {
+        let download_dir = root_dir.join("libtorrent-downloads");
         let backend = LibtorrentBackend::new(download_dir.clone())?;
         // For libtorrent we don't restore handles automatically yet in this simple impl
         Ok(Self::new_with_backend(
             backend,
             HashMap::new(),
+            download_dir.clone(),
             download_dir,
         ))
     }

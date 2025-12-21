@@ -4,7 +4,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use enginefs::EngineFS;
+use enginefs::EngineFS; // This is a type alias in enginefs::lib.rs based on features
 use state::AppState;
 use std::{net::SocketAddr, sync::Arc};
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
@@ -13,27 +13,82 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+mod cache_cleaner;
+mod ffmpeg_setup;
 mod routes;
 mod state;
+mod tui;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "server=info,tower_http=info".into()),
-        )
-        .with(tracing_subscriber::fmt::layer())
-        .init();
+    // Check for --tui flag
+    let use_tui = std::env::args().any(|arg| arg == "--tui");
+
+    let (tui_log_layer, tui_rx) = if use_tui {
+        let (tx, rx) = crossbeam_channel::bounded(1000); // 1000 log buffer
+        (Some(tui::log_layer::TuiLogLayer::new(tx)), Some(rx))
+    } else {
+        (None, None)
+    };
+
+    let registry = tracing_subscriber::registry().with(
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| "server=info,tower_http=info,enginefs=info".into()),
+    );
+
+    if let Some(layer) = tui_log_layer {
+        registry.with(layer).init();
+    } else {
+        registry.with(tracing_subscriber::fmt::layer()).init();
+    }
+
+    // Check/Install FFmpeg on Windows
+    // Check/Install FFmpeg on Windows
+    if let Err(e) = ffmpeg_setup::setup_ffmpeg().await {
+        tracing::warn!("FFmpeg setup failed: {}", e);
+    }
+
+    // Determine paths
+    let config_dir = dirs::config_dir()
+        .ok_or_else(|| anyhow::anyhow!("Could not find config directory"))?
+        .join("stremio-server");
+    let cache_dir = dirs::cache_dir()
+        .ok_or_else(|| anyhow::anyhow!("Could not find cache directory"))?
+        .join("stremio-server");
+
+    // Ensure directories exist
+    tokio::fs::create_dir_all(&config_dir).await?;
+    tokio::fs::create_dir_all(&cache_dir).await?;
+
+    tracing::info!("Config Dir: {:?}", config_dir);
+    tracing::info!("Cache/Download Dir: {:?}", cache_dir);
 
     // EngineFS::new() now handles its own librqbit session and background cleanup.
-    let engine_fs = EngineFS::new().await?;
+    // We pass the cache_dir as the root for downloads
+    let engine_fs = EngineFS::new(cache_dir.clone()).await?;
     let engine = Arc::new(engine_fs);
 
     // Load settings from disk or use defaults
-    let default_settings = routes::system::ServerSettings::default();
-    let settings = AppState::load_settings(&default_settings.cache_root);
-    let state = AppState::new(engine, settings);
+    // We ideally want settings in config_dir
+    let mut default_settings = routes::system::ServerSettings::default();
+    // Override default cache root to our determined path, so the settings struct reflects reality
+    default_settings.cache_root = cache_dir.to_string_lossy().to_string();
+
+    let settings = AppState::load_settings(&config_dir, &default_settings);
+    // Create state once
+    let state = AppState::new(engine, settings, config_dir);
+
+    // Start Cache Cleaner
+    cache_cleaner::start(Arc::new(state.clone()));
+
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel(1);
+
+    // Start TUI if enabled
+    if use_tui {
+        if let Some(rx) = tui_rx {
+            tui::start_tui(Arc::new(state.clone()), rx, shutdown_tx);
+        }
+    }
 
     let app = Router::new()
         .route("/", get(root_redirect))
@@ -128,7 +183,22 @@ async fn main() -> anyhow::Result<()> {
     let addr = SocketAddr::from(([0, 0, 0, 0], 11470));
     tracing::info!("listening on {}", addr);
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+
+    // Shutdown signal
+    let shutdown = async move {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("Ctrl+C received, shutting down");
+            }
+            _ = shutdown_rx.recv() => {
+                tracing::info!("Shutdown signal received from TUI, shutting down");
+            }
+        }
+    };
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await?;
 
     Ok(())
 }

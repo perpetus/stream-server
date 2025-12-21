@@ -12,9 +12,8 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(engine: Arc<EngineFS>, settings: ServerSettings) -> Self {
-        let cache_root = &settings.cache_root;
-        let settings_path = PathBuf::from(cache_root).join("settings.json");
+    pub fn new(engine: Arc<EngineFS>, settings: ServerSettings, config_dir: PathBuf) -> Self {
+        let settings_path = config_dir.join("settings.json");
 
         Self {
             engine,
@@ -37,19 +36,30 @@ impl AppState {
         Ok(())
     }
 
-    pub fn load_settings(cache_root: &str) -> ServerSettings {
-        let settings_path = PathBuf::from(cache_root).join("settings.json");
+    pub fn load_settings(
+        config_dir: &std::path::Path,
+        defaults: &ServerSettings,
+    ) -> ServerSettings {
+        let settings_path = config_dir.join("settings.json");
 
         if settings_path.exists() {
             if let Ok(content) = std::fs::read_to_string(&settings_path) {
-                if let Ok(settings) = serde_json::from_str::<ServerSettings>(&content) {
+                if let Ok(mut settings) = serde_json::from_str::<ServerSettings>(&content) {
                     tracing::info!("Loaded settings from {:?}", settings_path);
+                    // Ensure the cache_root in the loaded settings matches what we expect from runtime?
+                    // Or do we respect the file?
+                    // User might have customized it in the file.
+                    // If it's the default value (empty or old default), maybe update it?
+                    // For now, let's respect the file, but if missing/empty, use our runtime defaults.
+                    if settings.cache_root.is_empty() {
+                        settings.cache_root = defaults.cache_root.clone();
+                    }
                     return settings;
                 }
             }
         }
 
         tracing::info!("Using default settings");
-        ServerSettings::default()
+        defaults.clone()
     }
 }
