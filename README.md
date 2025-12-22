@@ -2,7 +2,7 @@
 
 **A blazing-fast, self-hosted torrent streaming server** — a modern, high-performance alternative to traditional streaming servers. Built in Rust for maximum performance and reliability.
 
-[![Release](https://img.shields.io/github/v/release/perpetus/stream-server?style=flat-square)](https://github.com/perpetus/stream-server/releases)
+[![Release Build](https://github.com/perpetus/stream-server/actions/workflows/release.yml/badge.svg)](https://github.com/perpetus/stream-server/actions/workflows/release.yml)
 [![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 
 ## 🌟 Why Stream Server?
