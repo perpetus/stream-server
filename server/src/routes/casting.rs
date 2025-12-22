@@ -57,8 +57,8 @@ pub fn router() -> Router<AppState> {
         .route("/", get(list_devices))
         .route("/transcode", get(transcode))
         .route("/convert", get(transcode))
-        .route("/:devID", get(get_device))
-        .route("/:devID/player", get(player_control).post(player_control))
+        .route("/{devID}", get(get_device))
+        .route("/{devID}/player", get(player_control).post(player_control))
 }
 
 pub async fn list_devices() -> impl IntoResponse {

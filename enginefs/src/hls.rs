@@ -211,12 +211,12 @@ impl HlsEngine {
         let bandwidth = 5_000_000;
         if !audio_streams.is_empty() {
             m3u.push_str(&format!(
-                "#EXT-X-STREAM-INF:BANDWIDTH={},CODECS=\"avc1.42E01E,mp4a.40.2\",AUDIO=\"{}\"\n",
+                "#EXT-X-STREAM-INF:BANDWIDTH={},CODECS=\"avc1.640033,mp4a.40.2\",AUDIO=\"{}\"\n",
                 bandwidth, audio_group_id
             ));
         } else {
             m3u.push_str(&format!(
-                "#EXT-X-STREAM-INF:BANDWIDTH={},CODECS=\"avc1.42E01E,mp4a.40.2\"\n",
+                "#EXT-X-STREAM-INF:BANDWIDTH={},CODECS=\"avc1.640033,mp4a.40.2\"\n",
                 bandwidth
             ));
         }
@@ -238,7 +238,7 @@ impl HlsEngine {
         let segments = Self::get_segments(probe.duration);
 
         let mut m3u = String::from("#EXTM3U\n#EXT-X-VERSION:4\n");
-        m3u.push_str("#EXT-X-TARGETDURATION:2\n");
+        m3u.push_str("#EXT-X-TARGETDURATION:4\n");
         m3u.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
         m3u.push_str("#EXT-X-PLAYLIST-TYPE:VOD\n");
 
@@ -315,7 +315,7 @@ impl HlsEngine {
             "-hwaccel",
             hwaccel_method,
             "-fflags",
-            "+genpts+discardcorrupt+nobuffer+fastseek",
+            "+genpts+discardcorrupt+nobuffer",
             "-flags",
             "low_delay",
             "-analyzeduration",
@@ -330,9 +330,9 @@ impl HlsEngine {
 
         // Reverse-engineered flags from split_output
         cmd.args(["-fflags", "+genpts"]);
-        cmd.args(["-noaccurate_seek", "-seek_timestamp", "1"]);
+        // cmd.args(["-noaccurate_seek", "-seek_timestamp", "1"]);
         // -copyts is used in split_output and is critical for correct timing with these flags
-        cmd.arg("-copyts");
+        // cmd.arg("-copyts");
 
         // -ss BEFORE -i: Fast keyframe-based seeking (demuxer-level)
         cmd.arg("-ss").arg(format!("{}", start));
@@ -388,23 +388,27 @@ impl HlsEngine {
                     // NVENC H264 usually requires 8-bit input (yuv420p).
                     // Input is 10-bit HEVC, so we MUST force 8-bit conversion.
                     // Use -rc vbr -tune hq (vbr_hq is deprecated in newer ffmpeg)
-                    // OPTIMIZATION: Use p2 (faster than p3) for lower latency
+                    // OPTIMIZATION: Use p1 (fastest) for lowest startup latency
                     // OPTIMIZATION: Reduce bitrate to 4M (max 6M) for better streaming performance
                     cmd.args([
-                        "-pix_fmt", "yuv420p", "-preset", "p2", "-rc", "vbr", "-tune", "hq", "-cq",
-                        "23", "-b:v", "4M", "-maxrate", "6M", "-bufsize", "12M",
+                        "-pix_fmt", "yuv420p", "-preset", "p1", "-rc", "vbr", "-tune", "hq", "-cq",
+                        "23", "-b:v", "4M", "-maxrate", "6M", "-bufsize", "12M", "-g", "60",
                     ]);
                 } else if target_video_codec.contains("vaapi") {
                     // VAAPI requires input to be on a VAAPI surface.
                     // If input is SW decoded, we need to upload it.
                     // Also force nv12 (8-bit) to avoid compatibility issues with 10-bit H264.
-                    cmd.args(["-vf", "format=nv12,hwupload"]);
+                    // Add keyframe interval for HLS segment alignment (2sec @ 30fps = 60 frames)
+                    cmd.args(["-vf", "format=nv12,hwupload", "-g", "60", "-keyint_min", "60"]);
                 } else if target_video_codec.contains("qsv") {
                     // QSV also often expects 8-bit nv12 for H264
-                    cmd.args(["-vf", "format=nv12", "-preset", "fast"]);
+                    // Add keyframe interval for HLS segment alignment
+                    cmd.args(["-vf", "format=nv12", "-preset", "fast", "-g", "60", "-keyint_min", "60"]);
                 }
             } else {
                 // Software encoder - use full optimization flags
+                // Add keyframe interval for HLS segment alignment (2sec @ 30fps = 60 frames)
+                // Add H.264 High profile level 4.1 for maximum browser compatibility
                 cmd.args([
                     "-pix_fmt",
                     "yuv420p",
@@ -412,6 +416,14 @@ impl HlsEngine {
                     "ultrafast",
                     "-tune",
                     "zerolatency",
+                    "-g",
+                    "60",
+                    "-keyint_min",
+                    "60",
+                    "-profile:v",
+                    "high",
+                    "-level",
+                    "4.1",
                 ]);
             }
         }
@@ -439,14 +451,28 @@ impl HlsEngine {
         cmd.args(["-map_metadata", "-1", "-map_chapters", "-1"]);
 
         // Output format flags
-        // Switch to mp4/fMP4 as per split_output
+        // Use MPEG-TS for HLS segment compatibility (.ts files in playlist)
+        // This ensures browsers can properly parse and play segments
+        // NOTE: Do NOT use -reset_timestamps when using separate audio/video streams
+        // as it breaks synchronization. Use -copyts instead to preserve timestamps.
         cmd.args([
             "-f",
-            "mp4",
-            "-movflags",
-            "frag_keyframe+empty_moov+default_base_moof+delay_moov+dash",
-            "-use_editlist",
-            "1",
+            "mpegts",
+            "-muxdelay",
+            "0",
+            "-muxpreload",
+            "0",
+            // Copy timestamps from input - CRITICAL for audio/video sync
+            "-copyts",
+            // Set output timestamp offset to match segment start time
+            "-output_ts_offset",
+            &format!("{}", start),
+            // Frequent PAT/PMT tables for mid-segment player joins
+            "-pat_period",
+            "0.1",
+            // Avoid negative timestamps which can cause playback issues
+            "-avoid_negative_ts",
+            "make_zero",
             "-threads",
             "0",
             "pipe:1",

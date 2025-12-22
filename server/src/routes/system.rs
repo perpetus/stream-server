@@ -237,6 +237,7 @@ async fn probe_hwaccel() -> Vec<String> {
 }
 
 pub async fn get_https(
+    State(state): State<AppState>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
     let ip_address = match params.get("ipAddress") {
@@ -299,6 +300,23 @@ pub async fn get_https(
                 .into_response()
         }
     };
+
+    // Save to disk for main.rs HTTPS listener
+    if let (Some(cert), Some(key)) = (
+        cert_data["certificate"].as_str(),
+        cert_data["privateKey"].as_str(),
+    ) {
+        let cert_path = state.config_dir.join("https-cert.pem");
+        let key_path = state.config_dir.join("https-key.pem");
+
+        if let Err(e) = tokio::fs::write(&cert_path, cert).await {
+             tracing::error!("Failed to write https-cert.pem: {}", e);
+        }
+        if let Err(e) = tokio::fs::write(&key_path, key).await {
+             tracing::error!("Failed to write https-key.pem: {}", e);
+        }
+        tracing::info!("Saved HTTPS certificates to {:?}", state.config_dir);
+    }
 
     let domain = format!(
         "{}-{}",

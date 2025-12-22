@@ -164,8 +164,8 @@ impl TorrentHandle for LibrqbitHandle {
         let stats = self.handle.stats();
         let (download_speed, upload_speed) = if let Some(ref live) = stats.live {
             (
-                live.download_speed.mbps * 1_048_576.0,
-                live.upload_speed.mbps * 1_048_576.0,
+                live.download_speed.mbps * 1_048_576.0 / 8.0,
+                live.upload_speed.mbps * 1_048_576.0 / 8.0,
             )
         } else {
             (0.0, 0.0)
@@ -256,7 +256,7 @@ impl TorrentHandle for LibrqbitHandle {
         Ok(())
     }
 
-    async fn get_file_reader(&self, file_idx: usize) -> Result<Box<dyn FileStreamTrait>> {
+    async fn get_file_reader(&self, file_idx: usize, _start_offset: u64) -> Result<Box<dyn FileStreamTrait>> {
         let stream = self
             .handle
             .clone()

@@ -18,6 +18,9 @@ mod ffmpeg_setup;
 mod routes;
 mod state;
 mod tui;
+mod local_addon;
+mod archives;
+
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -76,10 +79,19 @@ async fn main() -> anyhow::Result<()> {
 
     let settings = AppState::load_settings(&config_dir, &default_settings);
     // Create state once
-    let state = AppState::new(engine, settings, config_dir);
+    let state = AppState::new(engine, settings, config_dir.clone());
 
     // Start Cache Cleaner
+    // Start Cache Cleaner
     cache_cleaner::start(Arc::new(state.clone()));
+
+    // Local Addon Init
+    // Ensure localFiles directory exists
+    let local_files_dir = config_dir.join("localFiles");
+    tokio::fs::create_dir_all(&local_files_dir).await?;
+    
+    // Start background scan
+    local_addon::scan_background(local_files_dir.to_string_lossy().to_string(), state.local_index.clone()).await;
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel(1);
 
@@ -106,24 +118,24 @@ async fn main() -> anyhow::Result<()> {
             "/create",
             get(routes::engine::create_engine).post(routes::engine::create_engine),
         )
-        .route("/:infoHash/create", post(routes::engine::create_magnet))
-        .route("/:infoHash/remove", get(routes::engine::remove_engine))
+        .route("/{infoHash}/create", post(routes::engine::create_magnet))
+        .route("/{infoHash}/remove", get(routes::engine::remove_engine))
         .route(
-            "/:infoHash/stats.json",
+            "/{infoHash}/stats.json",
             get(routes::system::get_engine_stats),
         )
         .route(
-            "/:infoHash/:idx/stats.json",
+            "/{infoHash}/{idx}/stats.json",
             get(routes::system::get_file_stats),
         )
-        .route("/:infoHash/peers", get(routes::peers::get_peers))
+        .route("/{infoHash}/peers", get(routes::peers::get_peers))
         // Stream routes - both patterns for compatibility
         .route(
-            "/stream/:infoHash/:fileIdx",
+            "/stream/{infoHash}/{fileIdx}",
             get(routes::stream::stream_video).head(routes::stream::stream_video),
         )
         .route(
-            "/:infoHash/:fileIdx",
+            "/{infoHash}/{fileIdx}",
             get(routes::stream::stream_video).head(routes::stream::stream_video),
         )
         .route(
@@ -131,16 +143,16 @@ async fn main() -> anyhow::Result<()> {
             get(routes::subtitles::proxy_subtitles_vtt),
         )
         .route(
-            "/:infoHash/:fileIdx/subtitles.vtt",
+            "/{infoHash}/{fileIdx}/subtitles.vtt",
             get(routes::subtitles::get_subtitles_vtt),
         )
         .route("/opensubHash", get(routes::subtitles::opensub_hash))
         .route(
-            "/opensubHash/:infoHash/:fileIdx",
+            "/opensubHash/{infoHash}/{fileIdx}",
             get(routes::subtitles::opensub_hash_path),
         )
         .route(
-            "/subtitlesTracks/:infoHash",
+            "/subtitlesTracks",
             get(routes::subtitles::subtitles_tracks),
         )
         .route("/device-info", get(routes::system::get_device_info))
@@ -152,28 +164,34 @@ async fn main() -> anyhow::Result<()> {
         .nest("/7zip", routes::archive::router())
         .nest("/tar", routes::archive::router())
         .nest("/tgz", routes::archive::router())
-        .nest("/local-addon", routes::local_addon::router())
+        .nest("/nzb", routes::nzb::router())
+        .nest("/local-addon", local_addon::get_router())
         .nest("/proxy", routes::proxy::router())
+
         .nest("/ftp", routes::ftp::router())
-        .route("/samples/:filename", get(routes::system::get_samples))
+        .route("/samples/{filename}", get(routes::system::get_samples))
         // HLS routes with query params for Stremio compatibility
         .route(
-            "/hlsv2/:hash/master.m3u8",
+            "/hlsv2/{hash}/master.m3u8",
             get(routes::hls::master_playlist_by_url),
         )
         // HLS routes with path params (original)
         .route(
-            "/hlsv2/:infoHash/:fileIdx/master.m3u8",
+            "/hlsv2/{infoHash}/{fileIdx}/master.m3u8",
             get(routes::hls::get_master_playlist),
         )
+        // Generic route for HLS resources (segments, audio, subtitles)
+        // {fileIdx} accepts both numeric (0, 1, 2) and string identifiers (subtitle4, audio-1)
         .route(
-            "/hlsv2/:infoHash/:fileIdx/:resource",
+            "/hlsv2/{infoHash}/{fileIdx}/{resource}",
             get(routes::hls::handle_hls_resource),
         )
         // HLS probe with query params for Stremio compatibility
         .route("/hlsv2/probe", get(routes::hls::probe_by_url))
-        .route("/probe/:infoHash/:fileIdx", get(routes::hls::get_probe))
-        .route("/tracks/:infoHash/:fileIdx", get(routes::hls::get_tracks))
+        // Legacy generic probe
+        .route("/probe", get(routes::hls::probe_by_url))
+        .route("/probe/{infoHash}/{fileIdx}", get(routes::hls::get_probe))
+        .route("/tracks/{infoHash}/{fileIdx}", get(routes::hls::get_tracks))
         .nest("/casting", routes::casting::router())
         .route("/favicon.ico", get(|| async { StatusCode::NOT_FOUND }))
         .layer(TraceLayer::new_for_http())
@@ -195,6 +213,32 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     };
+
+    // HTTPS Server (Port 12470)
+    let https_cert_path = config_dir.join("https-cert.pem");
+    let https_key_path = config_dir.join("https-key.pem");
+
+    if https_cert_path.exists() && https_key_path.exists() {
+        tracing::info!("Found HTTPS certificates, starting HTTPS server on port 12470");
+        let https_app = app.clone();
+        let https_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(
+            https_cert_path,
+            https_key_path,
+        )
+        .await?;
+
+        let https_addr = SocketAddr::from(([0, 0, 0, 0], 12470));
+        tokio::spawn(async move {
+            if let Err(e) = axum_server::bind_rustls(https_addr, https_config)
+                .serve(https_app.into_make_service())
+                .await
+            {
+                tracing::error!("HTTPS server error: {}", e);
+            }
+        });
+    } else {
+        tracing::info!("No HTTPS certificates found in {:?}, skipping HTTPS server (Port 12470)", config_dir);
+    }
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)

@@ -38,7 +38,7 @@ pub trait TorrentHandle: Send + Sync + Clone {
 
     async fn stats(&self) -> EngineStats;
     async fn add_trackers(&self, trackers: Vec<String>) -> Result<()>;
-    async fn get_file_reader(&self, file_idx: usize) -> Result<Box<dyn FileStreamTrait>>;
+    async fn get_file_reader(&self, file_idx: usize, start_offset: u64) -> Result<Box<dyn FileStreamTrait>>;
     async fn get_files(&self) -> Vec<BackendFileInfo>;
 }
 

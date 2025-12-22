@@ -161,10 +161,14 @@ fn add_to_path(path: &Path) {
         let mut paths = std::env::split_paths(&current_path).collect::<Vec<_>>();
         paths.push(path.to_path_buf());
         if let Ok(new_path) = std::env::join_paths(paths) {
-            std::env::set_var("PATH", new_path);
+            unsafe {
+                std::env::set_var("PATH", new_path);
+            }
             info!("Added {:?} to process PATH", path);
         }
     } else {
-        std::env::set_var("PATH", new_path_os);
+        unsafe {
+            std::env::set_var("PATH", new_path_os);
+        }
     }
 }

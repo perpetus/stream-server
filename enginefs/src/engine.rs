@@ -145,7 +145,7 @@ impl<H: TorrentHandle> Engine<H> {
         stats
     }
 
-    pub async fn get_file(self: &Arc<Self>, file_idx: usize) -> Option<FileHandle<H>> {
+    pub async fn get_file(self: &Arc<Self>, file_idx: usize, start_offset: u64) -> Option<FileHandle<H>> {
         self.last_accessed
             .store(Instant::now().elapsed().as_secs() as i64, Ordering::SeqCst);
 
@@ -157,7 +157,7 @@ impl<H: TorrentHandle> Engine<H> {
         let length = files[file_idx].length;
         let name = files[file_idx].name.clone();
 
-        let reader = self.handle.get_file_reader(file_idx).await.ok()?;
+        let reader = self.handle.get_file_reader(file_idx, start_offset).await.ok()?;
 
         self.active_streams.fetch_add(1, Ordering::SeqCst);
 
@@ -173,7 +173,7 @@ impl<H: TorrentHandle> Engine<H> {
         }
         let file_len = files[file_idx].length;
 
-        let file_opt = self.get_file(file_idx).await;
+        let file_opt = self.get_file(file_idx, 0).await;
         let mut file = file_opt.context("failed to get file handle")?;
 
         let chunk_size = 65536u64;

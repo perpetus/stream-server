@@ -4,11 +4,17 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+use crate::local_addon::LocalIndex;
+
 #[derive(Clone)]
 pub struct AppState {
     pub engine: Arc<EngineFS>,
     pub settings: Arc<RwLock<ServerSettings>>,
     pub settings_path: PathBuf,
+    pub config_dir: PathBuf,
+    pub local_index: LocalIndex,
+    pub archive_cache: Arc<dashmap::DashMap<String, crate::archives::ArchiveSession>>,
+    pub nzb_sessions: Arc<dashmap::DashMap<String, crate::archives::nzb::session::NzbSession>>,
 }
 
 impl AppState {
@@ -19,6 +25,10 @@ impl AppState {
             engine,
             settings: Arc::new(RwLock::new(settings)),
             settings_path,
+            config_dir,
+            local_index: LocalIndex::new(),
+            archive_cache: Arc::new(dashmap::DashMap::new()),
+            nzb_sessions: Arc::new(dashmap::DashMap::new()),
         }
     }
 

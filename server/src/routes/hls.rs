@@ -98,7 +98,7 @@ pub struct HlsQuery {
 }
 
 /// Master playlist endpoint using mediaURL query parameter (for Stremio compatibility)
-/// GET /hlsv2/:hash/master.m3u8?mediaURL=http://127.0.0.1:11470/{infoHash}/{fileIdx}?
+/// GET /hlsv2/{hash}/master.m3u8?mediaURL=http://127.0.0.1:11470/{infoHash}/{fileIdx}?
 pub async fn master_playlist_by_url(
     Path(_hash): Path<String>,
     axum::extract::Query(params): axum::extract::Query<HlsQuery>,
@@ -201,6 +201,10 @@ pub async fn get_master_playlist(
         [(
             axum::http::header::CONTENT_TYPE,
             "application/vnd.apple.mpegurl",
+        ),
+        (
+            axum::http::header::CACHE_CONTROL,
+            "no-cache, no-store, must-revalidate",
         )],
         playlist,
     )
@@ -208,12 +212,16 @@ pub async fn get_master_playlist(
 }
 
 // Dispatcher for stream playlist or segment to avoid route conflict
+// {file_idx} can be numeric (0, 1) or text (subtitle4, audio-1)
 pub async fn handle_hls_resource(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
-    Path((info_hash, file_idx, resource)): Path<(String, usize, String)>,
+    Path((info_hash, file_idx_str, resource)): Path<(String, String, String)>,
     axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
 ) -> Response {
+    // Parse file_idx - default to 0 if non-numeric (e.g., "subtitle4", "audio-1")
+    let file_idx: usize = file_idx_str.parse().unwrap_or(0);
+    
     if resource.ends_with(".m3u8") {
         get_stream_playlist(State(state), info_hash, file_idx, resource, raw_query).await
     } else {
@@ -284,6 +292,10 @@ async fn get_stream_playlist(
         [(
             axum::http::header::CONTENT_TYPE,
             "application/vnd.apple.mpegurl",
+        ),
+        (
+            axum::http::header::CACHE_CONTROL,
+            "no-cache, no-store, must-revalidate",
         )],
         playlist,
     )
@@ -344,15 +356,30 @@ async fn get_segment(
     };
 
     // Check if client is a browser
-    // Heuristic: "Mozilla" present, but NOT "Stremio" (unless Stremio Web also sends Stremio in UA, but usually we want to treat Stremio App as native)
-    // Actually, if it's Stremio Shell, we want native behavior.
-    // If it's a browser (Chrome, Safari, etc), we generally need AAC.
+    // Browsers typically need AAC audio and H.264 video for compatibility.
+    // Native apps (Stremio Shell) can handle more codecs directly.
     let user_agent = headers
         .get(axum::http::header::USER_AGENT)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    let is_browser = user_agent.contains("Mozilla") && !user_agent.contains("Stremio");
+    // Improved browser detection: check for common browser identifiers
+    // but exclude Stremio Shell which has native codec support
+    let is_browser = (user_agent.contains("Mozilla")
+        || user_agent.contains("Chrome")
+        || user_agent.contains("Safari")
+        || user_agent.contains("Firefox")
+        || user_agent.contains("Edge"))
+        && !user_agent.contains("Stremio");
+
+    if is_browser {
+        tracing::info!("HLS segment request from browser client (UA: {})", user_agent);
+    } else {
+        tracing::info!("HLS segment request from native app (UA: {})", user_agent);
+    }
+
+    // Audio codecs that browsers cannot play natively and require transcoding to AAC
+    let browser_incompatible_audio = ["ac3", "eac3", "dts", "truehd", "mlp", "flac", "pcm", "opus"];
 
     // Check if audio needs transcoding
     // If it's a browser, we generally require AAC.
@@ -418,8 +445,14 @@ async fn get_segment(
                 }
             }
         } else {
-            // No params -> Browser logic
-            if is_browser && audio_codec != "aac" {
+            // No params -> Browser logic with comprehensive codec checking
+            // Check if audio codec is incompatible with browsers
+            let needs_transcode = is_browser
+                && (audio_codec != "aac"
+                    && browser_incompatible_audio
+                        .iter()
+                        .any(|c| audio_codec.contains(c)));
+            if needs_transcode || (is_browser && audio_codec != "aac") {
                 "aac"
             } else {
                 "copy"
@@ -536,7 +569,10 @@ async fn get_segment(
     (
         [
             (axum::http::header::CONTENT_TYPE, "video/mp2t"),
-            (axum::http::header::CACHE_CONTROL, "no-cache"),
+            (
+                axum::http::header::CACHE_CONTROL,
+                "public, max-age=3600, immutable",
+            ),
         ],
         body,
     )

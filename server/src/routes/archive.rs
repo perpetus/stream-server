@@ -1,296 +1,231 @@
-use crate::state::AppState;
 use axum::{
-    extract::{Path, Query},
-    http::{header, StatusCode},
-    response::{IntoResponse, Response},
-    routing::get,
+    extract::{Path, Query, State},
+    response::Response,
+    routing::{get, post},
     Router,
+    http::{StatusCode, header},
+    body::Body,
+    Json,
 };
-// use futures_util::StreamExt;
-use serde::Deserialize;
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
-use tempfile::tempfile;
-use zip::ZipArchive;
+use crate::state::AppState;
+use crate::archives::ArchiveSession;
+use std::path::PathBuf;
+use serde::{Deserialize, Serialize};
+use tokio_util::io::ReaderStream;
+use uuid::Uuid;
 
-#[derive(Debug, Deserialize)]
-pub struct ArchiveQuery {
-    pub lz: Option<String>,
+#[derive(Deserialize)]
+struct CreateBody {
+    url: String, // Expecting local path (since we are local addon server mostly)
+    // Other fields ignored
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ArchiveStreamBody {
-    pub urls: Vec<ArchiveUrl>,
-    pub file_idx: Option<usize>,
-    pub file_must_include: Option<Vec<String>>,
+// Support List of CreateBody or Single?
+// Legacy sends Array.
+type CreatePayload = Vec<CreateBody>;
+
+#[derive(Serialize)]
+struct CreateResponse {
+    key: String,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ArchiveUrl {
-    pub url: String,
-    // Core sends bytes sometimes, but we might not need it for simple streaming
-    pub _bytes: Option<u64>,
+#[derive(Deserialize)]
+struct StreamParams {
+    key: String,
+    // Support file param via query or we might use path param in router
+    file: Option<String>,
 }
 
 pub fn router() -> Router<AppState> {
-    Router::new().route("/*rest", get(archive_handler))
+    Router::new()
+        .route("/create", post(create_session_auto))
+        .route("/create/{key}", post(create_session_with_key))
+        .route("/stream", get(stream_content_query))
+        .route("/stream/{key}", get(stream_redirection)) // If just key, maybe redirect?
+        .route("/stream/{key}/{file}", get(stream_content_path))
 }
 
-pub async fn archive_handler(
-    Path(rest): Path<String>,
-    Query(query): Query<ArchiveQuery>,
-) -> impl IntoResponse {
-    // Check if this is a remote archive creation request
-    if rest == "create" {
-        return handle_remote_archive(query).await;
-    }
-
-    // Existing legacy/local logic
-    // Parity with /rar/... etc.
-    // rest format usually: path/to/archive.zip/file/inside
-    // We'll try to find the archive boundary.
-    let parts: Vec<&str> = rest.split('/').collect();
-
-    // Simplistic check for .zip or .rar
-    if let Some(archive_idx) = parts
-        .iter()
-        .position(|&p| p.ends_with(".zip") || p.ends_with(".rar"))
-    {
-        let is_zip = parts[archive_idx].ends_with(".zip");
-        let archive_path = parts[..=archive_idx].join("/");
-        let file_path = parts[archive_idx + 1..].join("/");
-
-        if is_zip {
-            let file = match File::open(&archive_path) {
-                Ok(f) => f,
-                Err(_) => return (StatusCode::NOT_FOUND, "Archive not found").into_response(),
-            };
-            let mut archive = match ZipArchive::new(file) {
-                Ok(a) => a,
-                Err(_) => {
-                    return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to open zip")
-                        .into_response()
-                }
-            };
-            let mut zip_file = match archive.by_name(&file_path) {
-                Ok(f) => f,
-                Err(_) => return (StatusCode::NOT_FOUND, "File not found in zip").into_response(),
-            };
-            let mut buffer = Vec::new();
-            if zip_file.read_to_end(&mut buffer).is_err() {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Failed to read file from zip",
-                )
-                    .into_response();
-            }
-            let content_type = mime_guess::from_path(&file_path)
-                .first_raw()
-                .unwrap_or("application/octet-stream");
-            return ([(header::CONTENT_TYPE, content_type)], buffer).into_response();
-        } else {
-            // RAR handling
-            // Note: unrar crate might need system dependencies or static linking
-            let archive = match unrar::Archive::new(&archive_path).open_for_processing() {
-                Ok(a) => a,
-                Err(_) => {
-                    return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to open rar")
-                        .into_response()
-                }
-            };
-
-            if let Ok(Some(_header)) = archive.read_header() {
-                return (
-                    StatusCode::NOT_IMPLEMENTED,
-                    "RAR streaming is still being refined (unrar-lib dependency)",
-                )
-                    .into_response();
-            }
-
-            return (StatusCode::NOT_FOUND, "File not found in rar").into_response();
+// Helper to download URL to temp file
+async fn resolve_path(url: &str) -> Result<PathBuf, StatusCode> {
+    if url.starts_with("http://") || url.starts_with("https://") {
+        tracing::info!("Downloading archive from URL: {}", url);
+        let response = reqwest::get(url).await.map_err(|e| {
+            tracing::error!("Failed to fetch URL {}: {}", url, e);
+            StatusCode::BAD_REQUEST
+        })?;
+        
+        if !response.status().is_success() {
+             tracing::error!("URL {} returned status {}", url, response.status());
+             return Err(StatusCode::NOT_FOUND);
         }
-    }
 
-    (StatusCode::NOT_IMPLEMENTED, "Unknown archive path format").into_response()
-}
-
-async fn handle_remote_archive(query: ArchiveQuery) -> Response {
-    let lz_data = match query.lz {
-        Some(lz) => lz,
-        None => return (StatusCode::BAD_REQUEST, "Missing lz parameter").into_response(),
-    };
-
-    // Decompress lz-string
-    let utf16_data = match lz_str::decompress_from_encoded_uri_component(&lz_data) {
-        Some(s) => s,
-        None => return (StatusCode::BAD_REQUEST, "Failed to decompress lz data").into_response(),
-    };
-    let json_str = match String::from_utf16(&utf16_data) {
-        Ok(s) => s,
-        Err(_) => return (StatusCode::BAD_REQUEST, "Invalid UTF-16 in lz data").into_response(),
-    };
-
-    let body: ArchiveStreamBody = match serde_json::from_str(&json_str) {
-        Ok(b) => b,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                format!("Failed to parse archive body: {}", e),
-            )
-                .into_response()
+        let mut content = response.bytes_stream();
+        // Create temp file
+        // We use Builder to put it in a specific place? Or default temp.
+        let temp_file = tempfile::NamedTempFile::new().map_err(|e| {
+             tracing::error!("Failed to create temp file: {}", e);
+             StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        
+        let (file, path) = temp_file.keep().map_err(|e| {
+             tracing::error!("Failed to persist temp file: {}", e);
+             StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        
+        // We write using std::fs::File inside tokio? usage of bytes_stream implies async.
+        // Better to use tokio::fs::File for async writing.
+        // But NamedTempFile gives std::fs::File.
+        // Convert to tokio.
+        let mut async_file = tokio::fs::File::from_std(file);
+        
+        use futures_util::StreamExt;
+        while let Some(chunk) = content.next().await {
+            let chunk = chunk.map_err(|e| {
+                tracing::error!("Download stream error: {}", e);
+                StatusCode::BAD_GATEWAY
+            })?;
+            use tokio::io::AsyncWriteExt;
+            async_file.write_all(&chunk).await.map_err(|e| {
+                 tracing::error!("Failed to write to temp file: {}", e);
+                 StatusCode::INTERNAL_SERVER_ERROR
+            })?;
         }
-    };
-
-    if body.urls.is_empty() {
-        return (StatusCode::BAD_REQUEST, "No archive URLs provided").into_response();
-    }
-
-    // For now, take the first URL
-    let archive_url = &body.urls[0].url;
-
-    // Download to temp file
-    let mut temp = match tempfile() {
-        Ok(t) => t,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to create temp file: {}", e),
-            )
-                .into_response()
-        }
-    };
-
-    let client = reqwest::Client::new();
-    let mut response = match client.get(archive_url).send().await {
-        Ok(r) => r,
-        Err(e) => {
-            return (
-                StatusCode::BAD_GATEWAY,
-                format!("Failed to fetch upstream archive: {}", e),
-            )
-                .into_response()
-        }
-    };
-
-    if !response.status().is_success() {
-        return (
-            StatusCode::BAD_GATEWAY,
-            format!("Upstream returned {}", response.status()),
-        )
-            .into_response();
-    }
-
-    while let Some(chunk) = match response.chunk().await {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::BAD_GATEWAY,
-                format!("Failed to download archive chunk: {}", e),
-            )
-                .into_response()
-        }
-    } {
-        if let Err(e) = std::io::Write::write_all(&mut temp, &chunk) {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to write to temp file: {}", e),
-            )
-                .into_response();
-        }
-    }
-
-    // Seek back to start
-    if let Err(e) = temp.seek(SeekFrom::Start(0)) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to seek temp file: {}", e),
-        )
-            .into_response();
-    }
-
-    // Process ZIP
-    let is_zip = archive_url.to_lowercase().ends_with(".zip");
-
-    if is_zip {
-        return handle_zip_extraction(temp, &body).await;
+        
+        tracing::info!("Downloaded {} to {:?}", url, path);
+        Ok(path)
     } else {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "Remote RAR streaming not yet fully implemented",
-        )
-            .into_response()
+        let path = PathBuf::from(url);
+        if !path.exists() {
+             return Err(StatusCode::NOT_FOUND);
+        }
+        Ok(path)
     }
 }
 
-async fn handle_zip_extraction(file: File, body: &ArchiveStreamBody) -> Response {
-    let mut archive = match ZipArchive::new(file) {
-        Ok(a) => a,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to open zip: {}", e),
-            )
-                .into_response()
-        }
-    };
+async fn create_session_auto(
+    State(state): State<AppState>,
+    Json(payload): Json<CreatePayload>,
+) -> Result<Json<CreateResponse>, StatusCode> {
+    let item = payload.first().ok_or(StatusCode::BAD_REQUEST)?;
+    let key = Uuid::new_v4().to_string();
+    
+    let path = resolve_path(&item.url).await?;
+    
+    state.archive_cache.insert(key.clone(), ArchiveSession {
+        path,
+        created: std::time::Instant::now(),
+    });
+    
+    Ok(Json(CreateResponse { key }))
+}
 
-    // Find file index
-    let target_index = if let Some(idx) = body.file_idx {
-        idx
-    } else if let Some(includes) = &body.file_must_include {
-        let mut found_idx = None;
-        for i in 0..archive.len() {
-            if let Ok(f) = archive.by_index(i) {
-                let name = f.name();
-                if !includes.is_empty() && name.contains(&includes[0]) {
-                    found_idx = Some(i);
-                    break;
-                }
-            }
-        }
-        match found_idx {
-            Some(i) => i,
-            None => {
-                return (StatusCode::NOT_FOUND, "No matching file found in zip").into_response()
-            }
-        }
-    } else {
-        // Default to largest
-        let mut largest_idx = 0;
-        let mut max_size = 0;
-        for i in 0..archive.len() {
-            if let Ok(f) = archive.by_index(i) {
-                if f.size() > max_size {
-                    max_size = f.size();
-                    largest_idx = i;
-                }
-            }
-        }
-        largest_idx
-    };
+async fn create_session_with_key(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+    Json(payload): Json<CreatePayload>,
+) -> Result<Json<CreateResponse>, StatusCode> {
+    let item = payload.first().ok_or(StatusCode::BAD_REQUEST)?;
+    
+    let path = resolve_path(&item.url).await?;
+    
+    state.archive_cache.insert(key.clone(), ArchiveSession {
+        path,
+        created: std::time::Instant::now(),
+    });
+    
+    Ok(Json(CreateResponse { key }))
+}
 
-    let mut zip_file = match archive.by_index(target_index) {
-        Ok(f) => f,
-        Err(_) => {
-            return (StatusCode::NOT_FOUND, "Target file index not found in zip").into_response()
-        }
-    };
+async fn stream_content_query(
+    State(state): State<AppState>,
+    Query(params): Query<StreamParams>,
+) -> Result<Response, StatusCode> {
+    let file = params.file.ok_or(StatusCode::BAD_REQUEST)?;
+    stream_file(&state, &params.key, &file).await
+}
 
-    let mut buffer = Vec::new();
-    if let Err(e) = zip_file.read_to_end(&mut buffer) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to extract file: {}", e),
-        )
-            .into_response();
+async fn stream_content_path(
+    State(state): State<AppState>,
+    Path((key, file)): Path<(String, String)>,
+) -> Result<Response, StatusCode> {
+    // Decode file param if it's URL encoded? Axum usually handles decoding path segments.
+    stream_file(&state, &key, &file).await
+}
+
+async fn stream_redirection(
+     State(_state): State<AppState>,
+     Path(_key): Path<String>,
+) -> Result<Response, StatusCode> {
+    // Legacy might use this to show file list?
+    // For now, not implemented.
+    Err(StatusCode::NOT_IMPLEMENTED)
+}
+
+async fn stream_file(state: &AppState, key: &str, file_path_in_archive: &str) -> Result<Response, StatusCode> {
+    let session = state.archive_cache.get(key).ok_or(StatusCode::NOT_FOUND)?;
+    let archive_path = session.path.clone();
+    drop(session); // Release lock
+    
+    // Get reader
+    let reader = crate::archives::get_archive_reader(&archive_path)
+        .map_err(|e| {
+            tracing::error!("Failed to get archive reader: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        
+    // Open internal file
+    let file_stream = reader.open_file(file_path_in_archive)
+        .map_err(|e| {
+            tracing::error!("Failed to open archive file entry '{}': {}", file_path_in_archive, e);
+            StatusCode::NOT_FOUND 
+        })?;
+        
+    // Wrap stream
+    let stream = ReaderStream::new(tokio::io::BufReader::new(AllowStdIo::new(file_stream)));
+    let body = Body::from_stream(stream);
+    
+    let mime = mime_guess::from_path(file_path_in_archive).first_or_octet_stream();
+
+    Ok(Response::builder()
+        .header(header::CONTENT_TYPE, mime.as_ref())
+        .header("Accept-Ranges", "bytes") // Hint, even if we don't fully support range yet without seeking
+        .body(body)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?)
+}
+
+// Adapter struct to wrap Sync Read as AsyncRead
+// NOTE: This blocks the executor thread if used directly! 
+// BUT ReaderStream usually polls. 
+// Ideally we should use `tokio_util::io::SyncIoBridge` but it's experimental?
+// Or just impl AsyncRead.
+
+use std::io::Read;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::io::AsyncRead;
+
+struct AllowStdIo<R> {
+    inner: R,
+}
+
+impl<R> AllowStdIo<R> {
+    fn new(inner: R) -> Self {
+        Self { inner }
     }
+}
 
-    let fname = zip_file.name().to_string();
-    let content_type = mime_guess::from_path(&fname)
-        .first_raw()
-        .unwrap_or("application/octet-stream");
-
-    ([(header::CONTENT_TYPE, content_type)], buffer).into_response()
+impl<R: Read + Unpin> AsyncRead for AllowStdIo<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        // WARNING: This works but blocks the async runtime thread. 
+        // For high load, this should be wrapped in `spawn_blocking`.
+        
+        let slice = buf.initialize_unfilled();
+        let n = self.inner.read(slice)?;
+        buf.advance(n);
+        Poll::Ready(Ok(()))
+    }
 }

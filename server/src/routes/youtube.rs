@@ -8,7 +8,7 @@ use axum::{
 };
 
 pub fn router() -> Router<AppState> {
-    Router::new().route("/:id", get(youtube_handler))
+    Router::new().route("/{id}", get(youtube_handler))
 }
 
 pub async fn youtube_handler(Path(id): Path<String>) -> impl IntoResponse {

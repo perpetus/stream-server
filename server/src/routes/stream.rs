@@ -17,7 +17,7 @@ pub async fn stream_video(
 ) -> Response {
     let info_hash = info_hash.to_lowercase();
 
-    tracing::info!(
+    tracing::debug!(
         "stream_video: Request for info_hash={} idx={}",
         info_hash,
         idx
@@ -32,15 +32,15 @@ pub async fn stream_video(
             }
         }
     }
-    tracing::info!("stream_video: Found {} trackers", trackers.len());
+    tracing::debug!("stream_video: Found {} trackers", trackers.len());
 
     // Try to get existing engine, or auto-create from info hash
     let engine = if let Some(e) = state.engine.get_engine(&info_hash).await {
-        tracing::info!("stream_video: Engine found in cache");
+        tracing::debug!("stream_video: Engine found in cache");
         e
     } else {
         // Auto-create engine from magnet link
-        tracing::info!(
+        tracing::debug!(
             "stream_video: Auto-creating engine for info_hash: {}",
             info_hash
         );
@@ -50,7 +50,7 @@ pub async fn stream_video(
 
         match state.engine.add_torrent(source, Some(trackers)).await {
             Ok(e) => {
-                tracing::info!("stream_video: Engine created successfully");
+                tracing::debug!("stream_video: Engine created successfully");
                 e
             }
             Err(e) => {
@@ -64,10 +64,25 @@ pub async fn stream_video(
         }
     };
 
+    // Parse start offset from Range header for prioritization
+    let start_offset_hint = if let Some(range_header) = headers.get(header::RANGE) {
+        let range_str = range_header.to_str().unwrap_or("");
+        if let Some(stripped) = range_str.strip_prefix("bytes=") {
+            let parts: Vec<&str> = stripped.split('-').collect();
+            // If bytes=100-200, parts[0] is "100"
+            // If bytes=-500, parts[0] is "" -> 0
+            parts[0].parse::<u64>().unwrap_or(0)
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+
     // Await the async get_file
-    tracing::info!("stream_video: Calling get_file({})", idx);
-    if let Some(mut file) = engine.get_file(idx).await {
-        tracing::info!(
+    tracing::debug!("stream_video: Calling get_file({}) with offset {}", idx, start_offset_hint);
+    if let Some(mut file) = engine.get_file(idx, start_offset_hint).await {
+        tracing::debug!(
             "stream_video: get_file returned success. Size={}",
             file.size
         );
@@ -93,7 +108,7 @@ pub async fn stream_video(
             (0, size - 1)
         };
 
-        tracing::info!(
+        tracing::debug!(
             "stream_video: Range request: {}-{} (total {})",
             start,
             end,
@@ -107,12 +122,12 @@ pub async fn stream_video(
 
         // Seek to the start position
         if start > 0 {
-            tracing::info!("stream_video: Seeking to {}", start);
+            tracing::debug!("stream_video: Seeking to {}", start);
             if let Err(e) = file.seek(std::io::SeekFrom::Start(start)).await {
                 tracing::warn!("Seek error: {}", e);
                 return (StatusCode::INTERNAL_SERVER_ERROR, "Seek failed").into_response();
             }
-            tracing::info!("stream_video: Seek complete");
+            tracing::debug!("stream_video: Seek complete");
         }
 
         let content_length = end - start + 1;
@@ -171,7 +186,7 @@ pub async fn stream_video(
         let stream = tokio_util::io::ReaderStream::new(reader);
         let body = Body::from_stream(stream);
 
-        tracing::info!("stream_video: Sending body response");
+        tracing::debug!("stream_video: Sending body response");
 
         if headers.contains_key(header::RANGE) {
             (StatusCode::PARTIAL_CONTENT, res_headers, body).into_response()

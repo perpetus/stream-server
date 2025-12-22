@@ -1,16 +1,16 @@
 [package]
 name = "server"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 license = "MIT"
 description = "High-performance torrent streaming server"
 authors = ["Perpetus <perpetus@example.com>"]
 
 [dependencies]
 enginefs = { path = "../enginefs" }
-axum = { version = "0.7", features = ["default"] }
+axum = { version = "0.8.8", features = ["default"] }
 tokio = { version = "1.42", features = ["full"] }
-tower-http = { version = "0.6", features = ["cors", "trace", "fs", "limit"] }
+tower-http = { version = "0.6.8", features = ["cors", "trace", "fs", "limit"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1.0.216", features = ["derive"] }
@@ -24,7 +24,7 @@ urlencoding = "2.1"
 regex = "1.11"
 reqwest = { version = "0.12.26", features = ["json", "stream"] }
 futures-util = "0.3.31"
-zip = "6.0.0"
+zip = "2.0"
 base64 = "0.22.1"
 walkdir = "2.5.0"
 url = "2.5.7"
@@ -42,7 +42,19 @@ crossbeam-channel = "0.5.13"
 notify = { version = "8.2.0", default-features = false, features = [
     "macos_kqueue",
 ] }
+sevenz-rust = "0.6"
 dirs = "6.0"
+dashmap = "6.1.0"
+tar = "0.4.44"
+flate2 = "1.1.5"
+uuid = "1.19.0"
+quick-xml = { version = "0.38.4", features = ["serialize"] }
+yenc = "0.2.2"
+tokio-native-tls = "0.3.1"
+native-tls = "0.2.14"
+async-channel = "2.5.0"
+bytes = "1.11.0"
+axum-server = { version = "0.8.0", features = ["tls-rustls"] }
 
 [features]
 default = ["libtorrent"]

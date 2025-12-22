@@ -14,7 +14,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         // The original JS uses /proxy/:opts/:pathname*
         // We can use a wildcard capturing the whole path.
-        .route("/*rest", any(proxy_handler))
+        .route("/{*rest}", any(proxy_handler))
 }
 
 pub async fn proxy_handler(

@@ -112,7 +112,7 @@ pub async fn get_subtitles_vtt(
     Path((info_hash, file_idx)): Path<(String, usize)>,
 ) -> Response {
     if let Some(engine) = state.engine.get_engine(&info_hash).await {
-        if let Some(mut file) = engine.get_file(file_idx).await {
+        if let Some(mut file) = engine.get_file(file_idx, 0).await {
             let mut content = String::new();
             if file.read_to_string(&mut content).await.is_ok() {
                 // Convert to VTT if needed
