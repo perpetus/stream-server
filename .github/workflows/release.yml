@@ -57,7 +57,7 @@ jobs:
       - name: Cargo Chef Cook
         run: |
           $env:VCPKG_ROOT = "${{ github.workspace }}\vcpkg"
-          cargo chef cook --release --recipe-path recipe.json --features libtorrent --no-default-features
+          cargo chef cook --release --recipe-path recipe.json --target x86_64-pc-windows-msvc --features libtorrent --no-default-features
         env:
           VCPKG_ROOT: ${{ github.workspace }}\vcpkg
           VCPKGRS_TRIPLET: x64-windows-static
