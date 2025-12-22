@@ -70,6 +70,12 @@ jobs:
           VCPKG_ROOT: ${{ github.workspace }}\vcpkg
           VCPKGRS_TRIPLET: x64-windows-static
 
+      - name: Upload EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-windows-amd64
+          path: target/x86_64-pc-windows-msvc/release/server.exe
+
       - name: Initialize WiX
         run: cargo wix init --package server --force
         env:
@@ -82,17 +88,19 @@ jobs:
           VCPKG_ROOT: ${{ github.workspace }}\vcpkg
           VCPKGRS_TRIPLET: x64-windows-static
 
-      - name: Upload EXE
-        uses: actions/upload-artifact@v4
-        with:
-          name: server-windows-amd64
-          path: target/x86_64-pc-windows-msvc/release/server.exe
 
       - name: Upload MSI
         uses: actions/upload-artifact@v4
         with:
           name: server-windows-msi
           path: target/wix/*.msi
+
+      - name: Debug VCPKG Location
+        if: always()
+        run: |
+          Get-ChildItem -Path . -Force
+          if (Test-Path vcpkg) { Get-ChildItem -Path vcpkg -Force }
+          if (Test-Path vcpkg_installed) { Get-ChildItem -Path vcpkg_installed -Force }
 
   build-linux:
     name: Build Linux
