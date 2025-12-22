@@ -1,3 +1,5 @@
 /target
 /libtorrent-downloads
 /rqbit-downloads
+/vcpkg
+/vcpkg_installed

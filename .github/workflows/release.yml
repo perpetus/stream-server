@@ -63,7 +63,7 @@ jobs:
           VCPKGRS_TRIPLET: x64-windows-static
 
       - name: Restore Source Code
-        run: git restore .
+        run: git restore server enginefs libtorrent-sys
 
       - name: Build Release
         run: |
@@ -150,7 +150,7 @@ jobs:
            VCPKG_ROOT: ${{ github.workspace }}/vcpkg
 
       - name: Restore Source Code
-        run: git restore .
+        run: git restore server enginefs libtorrent-sys
 
       - name: Build Release
         run: cargo build --release --features libtorrent --no-default-features
