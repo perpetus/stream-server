@@ -62,6 +62,9 @@ jobs:
           VCPKG_ROOT: ${{ github.workspace }}\vcpkg
           VCPKGRS_TRIPLET: x64-windows-static
 
+      - name: Restore Source Code
+        run: git restore .
+
       - name: Build Release
         run: |
           cargo clean -p server --release
@@ -145,6 +148,9 @@ jobs:
            cargo chef cook --release --recipe-path recipe.json --features libtorrent --no-default-features
         env:
            VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+
+      - name: Restore Source Code
+        run: git restore .
 
       - name: Build Release
         run: cargo build --release --features libtorrent --no-default-features
