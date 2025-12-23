@@ -55,6 +55,7 @@ native-tls = "0.2.14"
 async-channel = "2.5.0"
 bytes = "1.11.0"
 axum-server = { version = "0.8.0", features = ["tls-rustls"] }
+ssdp-client = "2.1.0"
 
 [features]
 default = ["libtorrent"]

@@ -162,6 +162,31 @@ pub async fn set_settings(
                 settings.bt_max_connections = n;
             }
         }
+        if let Some(v) = obj.get("btHandshakeTimeout") {
+            if let Some(n) = v.as_u64() {
+                settings.bt_handshake_timeout = n;
+            }
+        }
+        if let Some(v) = obj.get("btRequestTimeout") {
+            if let Some(n) = v.as_u64() {
+                settings.bt_request_timeout = n;
+            }
+        }
+        if let Some(v) = obj.get("btDownloadSpeedSoftLimit") {
+            if let Some(n) = v.as_f64() {
+                settings.bt_download_speed_soft_limit = n;
+            }
+        }
+        if let Some(v) = obj.get("btDownloadSpeedHardLimit") {
+            if let Some(n) = v.as_f64() {
+                settings.bt_download_speed_hard_limit = n;
+            }
+        }
+        if let Some(v) = obj.get("btMinPeersForStable") {
+            if let Some(n) = v.as_u64() {
+                settings.bt_min_peers_for_stable = n;
+            }
+        }
         if let Some(v) = obj.get("remoteHttps") {
             if v.is_null() {
                 settings.remote_https = None;
@@ -171,8 +196,21 @@ pub async fn set_settings(
         }
     }
 
+    // Build new speed profile from updated settings
+    let new_profile = enginefs::backend::TorrentSpeedProfile {
+        bt_download_speed_hard_limit: settings.bt_download_speed_hard_limit,
+        bt_download_speed_soft_limit: settings.bt_download_speed_soft_limit,
+        bt_handshake_timeout: settings.bt_handshake_timeout,
+        bt_max_connections: settings.bt_max_connections,
+        bt_min_peers_for_stable: settings.bt_min_peers_for_stable,
+        bt_request_timeout: settings.bt_request_timeout,
+    };
+
     // Release the write lock before saving
     drop(settings);
+
+    // Apply new speed profile to libtorrent session dynamically
+    state.engine.update_speed_profile(&new_profile).await;
 
     // Save to disk
     if let Err(e) = state.save_settings().await {

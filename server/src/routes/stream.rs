@@ -79,9 +79,16 @@ pub async fn stream_video(
         0
     };
 
+    // Parse priority from enginefs-prio header
+    let priority: u8 = if let Some(prio_val) = headers.get("enginefs-prio") {
+        prio_val.to_str().unwrap_or("1").parse().unwrap_or(1)
+    } else {
+        1
+    };
+
     // Await the async get_file
-    tracing::debug!("stream_video: Calling get_file({}) with offset {}", idx, start_offset_hint);
-    if let Some(mut file) = engine.get_file(idx, start_offset_hint).await {
+    tracing::debug!("stream_video: Calling get_file({}) with offset {} and priority {}", idx, start_offset_hint, priority);
+    if let Some(mut file) = engine.get_file(idx, start_offset_hint, priority).await {
         tracing::debug!(
             "stream_video: get_file returned success. Size={}",
             file.size

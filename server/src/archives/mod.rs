@@ -1,6 +1,6 @@
 use anyhow::Result;
 use std::path::Path;
-use std::io::Read;
+
 
 pub mod zip;
 pub mod rar;
@@ -8,6 +8,7 @@ pub mod sevenz;
 pub mod tar;
 pub mod tgz;
 pub mod nzb;
+pub mod cache;
 
 /// Represents a file inside an archive
 #[derive(Debug, Clone)]
@@ -54,16 +55,17 @@ pub fn is_split_archive_part(path: &Path) -> Option<(String, u32)> {
     None
 }
 
+/// Trait combining Read, Seek, and Send for trait objects
+pub trait SeekableReader: std::io::Read + std::io::Seek + Send {}
+impl<T: std::io::Read + std::io::Seek + Send> SeekableReader for T {}
+
 /// Trait for Archive implementations
 pub trait ArchiveReader: Send + Sync {
     /// List all files in the archive
     fn list_files(&self) -> Result<Vec<ArchiveEntry>>;
 
     /// Open a stream for a specific file inside the archive
-    /// Returns a Reader that implements Read + Seek preferably, but Read is min required
-    /// For streaming, we might need a way to get a readable object.
-    /// Since we are in async context (Axum), we might need async traits or blocking wrappers.
-    fn open_file(&self, path: &str) -> Result<Box<dyn Read + Send>>;
+    fn open_file(&self, path: &str) -> Result<Box<dyn SeekableReader>>;
 }
 
 pub fn get_archive_reader(path: &Path) -> Result<Box<dyn ArchiveReader>> {

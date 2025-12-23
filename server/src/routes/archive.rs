@@ -138,18 +138,20 @@ async fn create_session_with_key(
 
 async fn stream_content_query(
     State(state): State<AppState>,
+    headers: header::HeaderMap,
     Query(params): Query<StreamParams>,
 ) -> Result<Response, StatusCode> {
     let file = params.file.ok_or(StatusCode::BAD_REQUEST)?;
-    stream_file(&state, &params.key, &file).await
+    stream_file(&state, &params.key, &file, &headers).await
 }
 
 async fn stream_content_path(
     State(state): State<AppState>,
+    headers: header::HeaderMap,
     Path((key, file)): Path<(String, String)>,
 ) -> Result<Response, StatusCode> {
     // Decode file param if it's URL encoded? Axum usually handles decoding path segments.
-    stream_file(&state, &key, &file).await
+    stream_file(&state, &key, &file, &headers).await
 }
 
 async fn stream_redirection(
@@ -161,7 +163,7 @@ async fn stream_redirection(
     Err(StatusCode::NOT_IMPLEMENTED)
 }
 
-async fn stream_file(state: &AppState, key: &str, file_path_in_archive: &str) -> Result<Response, StatusCode> {
+async fn stream_file(state: &AppState, key: &str, file_path_in_archive: &str, headers: &header::HeaderMap) -> Result<Response, StatusCode> {
     let session = state.archive_cache.get(key).ok_or(StatusCode::NOT_FOUND)?;
     let archive_path = session.path.clone();
     drop(session); // Release lock
@@ -174,21 +176,89 @@ async fn stream_file(state: &AppState, key: &str, file_path_in_archive: &str) ->
         })?;
         
     // Open internal file
-    let file_stream = reader.open_file(file_path_in_archive)
+    let mut file_stream = reader.open_file(file_path_in_archive)
         .map_err(|e| {
             tracing::error!("Failed to open archive file entry '{}': {}", file_path_in_archive, e);
             StatusCode::NOT_FOUND 
         })?;
+    
+    // Get full size
+    let file_size = file_stream.seek(std::io::SeekFrom::End(0))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    
+    // Default: Full file
+    let mut start = 0;
+    let mut end = file_size.saturating_sub(1);
+    let mut is_partial = false;
+    
+    // Parse Range header: bytes=start-end
+    if let Some(range) = headers.get(header::RANGE).and_then(|h| h.to_str().ok()) {
+         if range.starts_with("bytes=") {
+             if let Some(parts) = range.strip_prefix("bytes=").and_then(|s| s.split_once('-')) {
+                 let start_str = parts.0;
+                 let end_str = parts.1;
+                 
+                 let req_start = start_str.parse::<u64>().ok();
+                 let req_end = end_str.parse::<u64>().ok();
+                 
+                 if let Some(s) = req_start {
+                     start = s;
+                     if let Some(e) = req_end {
+                         end = std::cmp::min(e, file_size - 1);
+                     } else {
+                         end = file_size - 1;
+                     }
+                     
+                     if start <= end {
+                         is_partial = true;
+                     }
+                 } else if let Some(e) = req_end {
+                     // Suffix range: -500 means last 500 bytes
+                     // Spec: "bytes=-500" -> start = size - 500, end = size - 1
+                     // But split_once('-') for "-500" gives ("", "500")?
+                     // Verify split logic.
+                     if start_str.is_empty() {
+                          start = file_size.saturating_sub(e);
+                          end = file_size - 1;
+                          is_partial = true;
+                     }
+                 }
+             }
+         }
+    }
+    
+    // Seek to Start
+    file_stream.seek(std::io::SeekFrom::Start(start))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         
-    // Wrap stream
-    let stream = ReaderStream::new(tokio::io::BufReader::new(AllowStdIo::new(file_stream)));
+    let content_len = end - start + 1;
+    
+    // Wrap stream and Limit it if partial
+    // We use `take` adaptor on the Read implementation? 
+    // `AllowStdIo` takes a Read, we can use `file_stream.take(content_len)`.
+    
+    use std::io::Read;
+    let stream_reader = file_stream.take(content_len);
+    
+    let stream = ReaderStream::new(tokio::io::BufReader::new(AllowStdIo::new(stream_reader)));
     let body = Body::from_stream(stream);
     
     let mime = mime_guess::from_path(file_path_in_archive).first_or_octet_stream();
 
-    Ok(Response::builder()
+    let mut builder = Response::builder()
         .header(header::CONTENT_TYPE, mime.as_ref())
-        .header("Accept-Ranges", "bytes") // Hint, even if we don't fully support range yet without seeking
+        .header("Accept-Ranges", "bytes")
+        .header(header::CONTENT_LENGTH, content_len);
+
+    if is_partial {
+        builder = builder
+            .status(StatusCode::PARTIAL_CONTENT)
+            .header(header::CONTENT_RANGE, format!("bytes {}-{}/{}", start, end, file_size));
+    } else {
+         builder = builder.status(StatusCode::OK);
+    }
+
+    Ok(builder
         .body(body)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?)
 }

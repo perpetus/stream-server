@@ -8,6 +8,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::backend::{
+    priorities::{calculate_priorities, EngineCacheConfig},
     BackendFileInfo, EngineStats, FileStreamTrait, Growler, PeerSearch, Source, StatsOptions,
     SwarmCap, TorrentBackend, TorrentHandle as TorrentHandleTrait, TorrentSource,
 };
@@ -18,11 +19,12 @@ use libtorrent_sys::{LibtorrentSession, SessionSettings, TorrentStatus};
 pub struct LibtorrentBackend {
     session: Arc<RwLock<LibtorrentSession>>,
     save_path: PathBuf,
+    config: crate::backend::BackendConfig,
 }
 
 impl LibtorrentBackend {
     /// Create a new libtorrent backend
-    pub fn new(save_path: PathBuf) -> Result<Self> {
+    pub fn new(save_path: PathBuf, config: crate::backend::BackendConfig) -> Result<Self> {
         let settings = SessionSettings {
             listen_interfaces: "0.0.0.0:42000-42010,[::]:42000-42010".to_string(),
             user_agent: "stream-server/1.0".to_string(),
@@ -30,42 +32,172 @@ impl LibtorrentBackend {
             enable_lsd: true,
             enable_upnp: true,
             enable_natpmp: true,
-            // Increased limits for better throughput
-            max_connections: 500,
-            max_connections_per_torrent: 200,
-            download_rate_limit: 0,
+            // Apply speed profile settings from config
+            max_connections: config.speed_profile.bt_max_connections as i32,
+            max_connections_per_torrent: (config.speed_profile.bt_max_connections / 2) as i32,
+            download_rate_limit: config.speed_profile.bt_download_speed_hard_limit as i32,
             upload_rate_limit: 0,
-            active_downloads: 20,
-            active_seeds: 10,
-            active_limit: 30,
+            active_downloads: 30,
+            active_seeds: 20,
+            active_limit: 50,
             anonymous_mode: false,
             proxy_host: String::new(),
             proxy_port: 0,
             proxy_type: 0,
         };
 
+        tracing::info!(
+            "LibtorrentBackend: max_connections={}, download_limit={} B/s",
+            settings.max_connections,
+            settings.download_rate_limit
+        );
+
         let session = LibtorrentSession::new(settings)
             .map_err(|e| anyhow!("Failed to create libtorrent session: {}", e))?;
 
         std::fs::create_dir_all(&save_path)?;
 
-        Ok(Self {
+        let backend = Self {
             session: Arc::new(RwLock::new(session)),
             save_path,
-        })
+            config,
+        };
+        backend.start_monitor_task();
+        Ok(backend)
     }
 
     /// Create with custom settings
-    pub fn with_settings(save_path: PathBuf, settings: SessionSettings) -> Result<Self> {
+    pub fn with_settings(
+        save_path: PathBuf,
+        settings: SessionSettings,
+        config: crate::backend::BackendConfig,
+    ) -> Result<Self> {
         let session = LibtorrentSession::new(settings)
             .map_err(|e| anyhow!("Failed to create libtorrent session: {}", e))?;
 
         std::fs::create_dir_all(&save_path)?;
 
-        Ok(Self {
+        let backend = Self {
             session: Arc::new(RwLock::new(session)),
             save_path,
-        })
+            config,
+        };
+        backend.start_monitor_task();
+        Ok(backend)
+    }
+
+    /// Update session settings dynamically (called when user changes settings)
+    pub async fn update_session_settings(&self, profile: &crate::backend::TorrentSpeedProfile) {
+        let mut session = self.session.write().await;
+        
+        // Update download rate limit (0 = unlimited)
+        let download_limit = if profile.bt_download_speed_hard_limit > 0.0 {
+            profile.bt_download_speed_hard_limit as i32
+        } else {
+            0 // Unlimited
+        };
+        
+        // Apply new settings via full settings pack
+        let new_settings = libtorrent_sys::SessionSettings {
+            listen_interfaces: "0.0.0.0:6881,[::]:6881".to_string(),
+            user_agent: "stream-server/1.0".to_string(),
+            enable_dht: true,
+            enable_lsd: true,
+            enable_upnp: true,
+            enable_natpmp: true,
+            max_connections: profile.bt_max_connections as i32,
+            max_connections_per_torrent: (profile.bt_max_connections / 2) as i32,
+            download_rate_limit: download_limit,
+            upload_rate_limit: 0,
+            active_downloads: 30,
+            active_seeds: 20,
+            active_limit: 50,
+            anonymous_mode: false,
+            proxy_host: String::new(),
+            proxy_port: 0,
+            proxy_type: 0,
+        };
+        
+        if let Err(e) = session.apply_settings(&new_settings) {
+            tracing::error!("Failed to apply session settings: {}", e);
+        } else {
+            tracing::info!(
+                "Updated libtorrent settings: max_connections={}, download_limit={} B/s",
+                profile.bt_max_connections,
+                download_limit
+            );
+        }
+    }
+    fn start_monitor_task(&self) {
+        let session = self.session.clone();
+        let config = self.config.clone();
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+            let mut last_reannounce: std::collections::HashMap<String, std::time::Instant> = std::collections::HashMap::new();
+            loop {
+                interval.tick().await;
+                
+                // Get all handles first to avoid holding lock too long?
+                // Actually we need the lock to find them.
+                // We'll iterate.
+                let handles: Vec<_> = {
+                    let s = session.read().await;
+                    s.get_torrents().iter().filter_map(|t| {
+                        s.find_torrent(&t.info_hash).ok()
+                    }).collect()
+                };
+
+                for mut handle in handles {
+                    let status = handle.status();
+
+                    // --- PeerSearch Logic ---
+                    {
+                        let mut force = false;
+                        let min_peers = config.peer_search.min as i32;
+                        let num_peers = status.num_peers as i32;
+                        
+                        // Rule 1: Low peer count
+                        if num_peers < min_peers {
+                            force = true;
+                        }
+
+                        // Rule 2: Periodic Re-announce (every 5 minutes)
+                        let now = std::time::Instant::now();
+                        let last_announce = last_reannounce.entry(handle.info_hash()).or_insert(now);
+                        if now.duration_since(*last_announce) > std::time::Duration::from_secs(300) {
+                            force = true;
+                            *last_announce = now;
+                        }
+
+                        if force {
+                            let _ = handle.force_reannounce(); 
+                        }
+                    }
+
+                    // --- SwarmCap Logic ---
+                    if let Some(max_speed) = config.swarm_cap.max_speed {
+                         if (status.download_rate as f64) > max_speed {
+                             // Limit reached. Pause this torrent?
+                             // handle.auto_managed(true); // Let libtorrent manage?
+                             // Or explicit pause.
+                             // if !status.is_paused { handle.pause(); }
+                         }
+                    }
+                    
+                    // --- Growler Logic ---
+                    let total_downloaded = status.total_downloaded as u64;
+                    if total_downloaded > config.growler.flood {
+                        if let Some(pulse) = config.growler.pulse {
+                             handle.set_download_limit(pulse as i32);
+                        }
+                    } else {
+                        handle.set_download_limit(-1);
+                    }
+                }
+
+            }
+        });
     }
 }
 
@@ -105,16 +237,36 @@ impl TorrentBackend for LibtorrentBackend {
         };
 
         // Add trackers with tier based on position
+        // Disable sequential download for streaming - we manage it manually via deadlines
+        // handle.set_sequential_download(true);
+
+        // DEBUG MONITOR: Log stats every 5 seconds to diagnose slow speeds
+        // let monitor_handle = handle.clone();
+        // tokio::spawn(async move {
+        //      let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        //      loop {
+        //          interval.tick().await;
+        //          let status = monitor_handle.status();
+        //          tracing::info!(
+        //              "Monitor: Peers={} Seeds={} Down={:.2} MB/s Up={:.2} MB/s State={:?}",
+        //              status.num_peers,
+        //              status.num_seeds,
+        //              (status.download_rate as f64) / 1024.0 / 1024.0,
+        //              (status.upload_rate as f64) / 1024.0 / 1024.0,
+        //              status.state
+        //          );
+        //      }
+        // });
+
+        // Add trackers with tier based on position
         for (idx, tracker) in trackers.iter().enumerate() {
             handle.add_tracker(tracker, idx as i32);
         }
 
-        // Disable sequential download for streaming - we manage it manually via deadlines
-        // handle.set_sequential_download(true);
-
         Ok(LibtorrentTorrentHandle {
             session: self.session.clone(),
             info_hash: handle.info_hash(),
+            cache_config: self.config.cache,
         })
     }
 
@@ -124,6 +276,7 @@ impl TorrentBackend for LibtorrentBackend {
             Ok(_) => Some(LibtorrentTorrentHandle {
                 session: self.session.clone(),
                 info_hash: info_hash.to_string(),
+                cache_config: self.config.cache,
             }),
             Err(_) => None,
         }
@@ -155,6 +308,7 @@ impl TorrentBackend for LibtorrentBackend {
 pub struct LibtorrentTorrentHandle {
     session: Arc<RwLock<LibtorrentSession>>,
     info_hash: String,
+    cache_config: EngineCacheConfig,
 }
 
 #[async_trait::async_trait]
@@ -224,7 +378,7 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
         Ok(())
     }
 
-    async fn get_file_reader(&self, file_idx: usize, start_offset: u64) -> Result<Box<dyn FileStreamTrait>> {
+    async fn get_file_reader(&self, file_idx: usize, start_offset: u64, priority: u8) -> Result<Box<dyn FileStreamTrait>> {
         tracing::debug!("get_file_reader: starting for file {}", file_idx);
         let session = self.session.read().await;
         let mut handle = session
@@ -269,13 +423,24 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
             }
         }
 
+        // Calculate TRUE global file offset by summing sizes of preceding files
+        let mut global_file_offset = 0u64;
+        let all_files_calc = handle.files();
+        for (idx, f) in all_files_calc.iter().enumerate() {
+            if idx == file_idx {
+                break;
+            }
+            global_file_offset += f.size as u64;
+        }
+
         let mut actual_start_piece = -1;
 
         if !is_complete {
             // Aggressively prioritize the pieces starting from the requested offset
             // We use a deadline of 10ms to force immediate download
-            let start_piece_offset = ((start_offset as f64) / (piece_length as f64)).floor() as i32;
-            actual_start_piece = first_piece + start_piece_offset;
+            
+            // Correct calculation using global offset
+            actual_start_piece = ((global_file_offset + start_offset) / piece_length) as i32;
 
             tracing::debug!(
                 "get_file_reader: Prioritizing start window from offset {} (piece {})",
@@ -315,19 +480,22 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
         }
 
         tracing::debug!("get_file_reader: opening file {:?}", file_path);
-
-        let file = tokio::fs::File::open(&file_path).await?;
+        let opened_file = tokio::fs::File::open(&file_path).await?;
+        
+        tracing::debug!("get_file_reader: Calculated global offset for file {}: {}", file_idx, global_file_offset);
 
         Ok(Box::new(LibtorrentFileStream {
-            file,
+            file: opened_file,
             handle: handle.clone(),
             first_piece,
             last_piece,
             piece_length,
-            file_offset: (first_piece as u64) * piece_length,
+            file_offset: global_file_offset, // Use the true global offset
             current_pos: 0,
             is_complete,               // Use actual completion status
             last_priorities_piece: if !is_complete { actual_start_piece } else { -1 },
+            cache_config: self.cache_config,
+            priority,
         }))
     }
 
@@ -383,6 +551,8 @@ struct LibtorrentFileStream {
     current_pos: u64,
     is_complete: bool,
     last_priorities_piece: i32, // Track last piece we set priorities for
+    cache_config: EngineCacheConfig,
+    priority: u8,
 }
 
 impl LibtorrentFileStream {
@@ -396,8 +566,19 @@ impl LibtorrentFileStream {
             return;
         }
 
-        let current_piece =
-            self.first_piece + ((self.file_offset + pos) / self.piece_length) as i32;
+        // Correct calculation: file_offset is now the TRUE global byte offset of the file start.
+        // pos is relative to file start.
+        // So (file_offset + pos) is the global byte offset in the torrent.
+        let current_piece = ((self.file_offset + pos) / self.piece_length) as i32;
+
+        // tracing::info!(
+        //     "set_priorities: Pos={} (GlobalOffset={}), Piece={}, Window={}-{}",
+        //     pos,
+        //     self.file_offset,
+        //     current_piece,
+        //     current_piece,
+        //     current_piece + 30 // Approx urgent window
+        // );
 
         // Efficient cache check: if we are on the same piece, do nothing
         if current_piece == self.last_priorities_piece {
@@ -409,13 +590,18 @@ impl LibtorrentFileStream {
         // This is the manual, safe alternative to `clear_piece_deadlines()`.
         if self.last_priorities_piece != -1 {
              let old_start = self.last_priorities_piece;
-             let old_end = old_start + 20; // Assuming previous window was ~20 pieces
+             // Increase cleanup range to cover max possible window (urgent + strict buffer = ~130)
+             // Using 150 to be safe.
+             let old_end = old_start + 150; 
              
              for p in old_start..=old_end {
                  // Only reset if it's not in the NEW window (overlap protection)
                  // And check bounds
                  if p >= self.first_piece && p <= self.last_piece {
-                     if p < current_piece || p > current_piece + 60 {
+                     // If p is behind current (passed) OR way ahead of likely current window (dropped from buffer)
+                     // Logic: If new window is up to 130 pieces, anything beyond current + 130 is definitely out.
+                     // We use current + 140 as a safe cut-off.
+                     if p < current_piece || p > current_piece + 140 {
                          // Reset deadline to 0 (no deadline/normal priority)
                          // This tells libtorrent: "We don't need this ASAP anymore"
                          self.handle.set_piece_deadline(p, 0); 
@@ -439,23 +625,21 @@ impl LibtorrentFileStream {
             return;
         }
 
-        // Prioritize the immediate window (20 pieces ~ 10-40MB) ASAP
-        // Increased from 10 to 20 for faster fill of TCP window
-        // Reduced deadline from 10ms to 1ms for ultra-responsiveness
-        for i in 0..20 {
-            let p = current_piece + i;
-            if p <= self.last_piece && !self.handle.have_piece(p) {
-                self.handle.set_piece_deadline(p, 1);
-            }
-        }
+        // Use centralized priorities calculation
+        // This handles "streaming" mode (cache disabled) vs "download" mode (cache enabled)
+        let total_pieces = self.handle.status().num_pieces;
+        let priorities = calculate_priorities(
+            current_piece,
+            total_pieces,
+            self.piece_length,
+            &self.cache_config,
+            self.priority,
+        );
 
-        // Prioritize the next 50 pieces (buffer)
-        for i in 20..70 {
-            let p = current_piece + i;
-            if p <= self.last_piece && !self.handle.have_piece(p) {
-                // Gradient: 100ms... 
-                self.handle.set_piece_deadline(p, 100 * (i - 19));
-            }
+        for item in priorities {
+             if item.piece_idx <= self.last_piece && !self.handle.have_piece(item.piece_idx) {
+                 self.handle.set_piece_deadline(item.piece_idx, item.deadline);
+             }
         }
     }
 }
@@ -472,7 +656,8 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
         // Critical Fix: Block read if piece is not downloaded yet.
         // Reading undownloaded parts from disk returns sparse zeros, which confuses parsers (ffmpeg).
         if self.piece_length > 0 {
-            let piece = self.first_piece + ((self.file_offset + pos) / self.piece_length) as i32;
+            // Correct calculation: file_offset is TRUE global offset
+            let piece = ((self.file_offset + pos) / self.piece_length) as i32;
             if !self.handle.have_piece(piece) {
                 // Throttle log logs
                 if pos % (1024 * 1024) == 0 {
@@ -551,7 +736,8 @@ impl tokio::io::AsyncSeek for LibtorrentFileStream {
                 self.current_pos = pos;
                 
                 let piece_idx = if self.piece_length > 0 {
-                     self.first_piece + ((self.file_offset + pos) / self.piece_length) as i32
+                     // Correct calculation: file_offset is TRUE global offset
+                     ((self.file_offset + pos) / self.piece_length) as i32
                 } else {
                     -1
                 };

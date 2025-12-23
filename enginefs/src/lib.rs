@@ -19,6 +19,7 @@ pub mod trackers;
 use crate::backend::librqbit::LibrqbitBackend;
 #[cfg(feature = "libtorrent")]
 use crate::backend::libtorrent::LibtorrentBackend;
+
 use crate::backend::{TorrentBackend, TorrentHandle, TorrentSource};
 
 const ENGINE_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
@@ -203,7 +204,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
 
 #[cfg(all(feature = "librqbit", not(feature = "libtorrent")))]
 impl BackendEngineFS<LibrqbitBackend> {
-    pub async fn new(root_dir: std::path::PathBuf) -> Result<Self> {
+    pub async fn new(root_dir: std::path::PathBuf, _cache_config: EngineCacheConfig) -> Result<Self> {
         let download_dir = root_dir.join("rqbit-downloads");
         let (backend, restored) = LibrqbitBackend::new(download_dir.clone()).await?;
         Ok(Self::new_with_backend(
@@ -217,9 +218,9 @@ impl BackendEngineFS<LibrqbitBackend> {
 
 #[cfg(feature = "libtorrent")]
 impl BackendEngineFS<LibtorrentBackend> {
-    pub async fn new(root_dir: std::path::PathBuf) -> Result<Self> {
+    pub async fn new(root_dir: std::path::PathBuf, config: crate::backend::BackendConfig) -> Result<Self> {
         let download_dir = root_dir.join("libtorrent-downloads");
-        let backend = LibtorrentBackend::new(download_dir.clone())?;
+        let backend = LibtorrentBackend::new(download_dir.clone(), config)?;
         // For libtorrent we don't restore handles automatically yet in this simple impl
         Ok(Self::new_with_backend(
             backend,
@@ -228,4 +229,10 @@ impl BackendEngineFS<LibtorrentBackend> {
             download_dir,
         ))
     }
+
+    /// Update session settings dynamically (called when user changes torrent profile)
+    pub async fn update_speed_profile(&self, profile: &crate::backend::TorrentSpeedProfile) {
+        self.backend.update_session_settings(profile).await;
+    }
 }
+

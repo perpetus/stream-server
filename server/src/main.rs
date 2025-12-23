@@ -20,6 +20,7 @@ mod state;
 mod tui;
 mod local_addon;
 mod archives;
+mod ssdp;
 
 
 #[tokio::main]
@@ -66,11 +67,6 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Config Dir: {:?}", config_dir);
     tracing::info!("Cache/Download Dir: {:?}", cache_dir);
 
-    // EngineFS::new() now handles its own librqbit session and background cleanup.
-    // We pass the cache_dir as the root for downloads
-    let engine_fs = EngineFS::new(cache_dir.clone()).await?;
-    let engine = Arc::new(engine_fs);
-
     // Load settings from disk or use defaults
     // We ideally want settings in config_dir
     let mut default_settings = routes::system::ServerSettings::default();
@@ -78,12 +74,44 @@ async fn main() -> anyhow::Result<()> {
     default_settings.cache_root = cache_dir.to_string_lossy().to_string();
 
     let settings = AppState::load_settings(&config_dir, &default_settings);
+
+    // Create BackendConfig from settings
+    let backend_config = enginefs::backend::BackendConfig {
+        cache: enginefs::backend::priorities::EngineCacheConfig {
+            size: settings.cache_size as u64,
+            enabled: true,
+        },
+        growler: enginefs::backend::Growler::default(),
+        peer_search: enginefs::backend::PeerSearch {
+            min: settings.bt_min_peers_for_stable,
+            ..Default::default()
+        },
+        swarm_cap: enginefs::backend::SwarmCap::default(),
+        speed_profile: enginefs::backend::TorrentSpeedProfile {
+            bt_download_speed_hard_limit: settings.bt_download_speed_hard_limit,
+            bt_download_speed_soft_limit: settings.bt_download_speed_soft_limit,
+            bt_handshake_timeout: settings.bt_handshake_timeout,
+            bt_max_connections: settings.bt_max_connections,
+            bt_min_peers_for_stable: settings.bt_min_peers_for_stable,
+            bt_request_timeout: settings.bt_request_timeout,
+        },
+    };
+
+    // EngineFS::new() now handles its own librqbit session and background cleanup.
+    // We pass the cache_dir as the root for downloads
+    // We also pass the backend config for prioritization/monitoring logic
+    let engine_fs = EngineFS::new(cache_dir.clone(), backend_config).await?;
+    let engine = Arc::new(engine_fs);
+
     // Create state once
     let state = AppState::new(engine, settings, config_dir.clone());
 
     // Start Cache Cleaner
     // Start Cache Cleaner
     cache_cleaner::start(Arc::new(state.clone()));
+
+    // Start SSDP Discovery
+    tokio::spawn(crate::ssdp::start_discovery(state.devices.clone()));
 
     // Local Addon Init
     // Ensure localFiles directory exists

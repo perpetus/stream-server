@@ -5,7 +5,6 @@ pub mod stream;
 
 use crate::archives::{ArchiveEntry, ArchiveReader};
 use anyhow::{anyhow, Result};
-use std::io::Read;
 use std::path::PathBuf;
 
 pub struct NzbHandler {
@@ -43,7 +42,7 @@ impl ArchiveReader for NzbHandler {
         Ok(entries)
     }
 
-    fn open_file(&self, _path: &str) -> Result<Box<dyn Read + Send>> {
+    fn open_file(&self, _path: &str) -> Result<Box<dyn crate::archives::SeekableReader>> {
         Err(anyhow!("Direct NZB file streaming from disk not fully implemented (requires NNTP connection details)"))
     }
 }

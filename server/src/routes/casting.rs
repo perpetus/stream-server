@@ -6,28 +6,13 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::json;
 use std::process::Stdio;
 use tokio::process::Command;
 use tokio_util::io::ReaderStream;
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct Device {
-    pub id: String,
-    pub name: String,
-    pub host: String,
-    pub location: String,
-    #[serde(rename = "type")]
-    pub device_type: String,
-    pub icon: String,
-    #[serde(rename = "playerUIRoles")]
-    pub player_ui_roles: Vec<String>,
-    #[serde(rename = "usePlayerUI")]
-    pub use_player_ui: bool,
-    #[serde(rename = "onlyHtml5Formats")]
-    pub only_html5_formats: bool,
-}
+
 
 #[derive(Debug, Deserialize)]
 pub struct TranscodeParams {
@@ -61,9 +46,11 @@ pub fn router() -> Router<AppState> {
         .route("/{devID}/player", get(player_control).post(player_control))
 }
 
-pub async fn list_devices() -> impl IntoResponse {
-    let devices: Vec<Device> = vec![];
-    Json(devices)
+pub async fn list_devices(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> impl IntoResponse {
+    let devices = state.devices.read().await;
+    Json(devices.clone())
 }
 
 pub async fn get_device(Path(dev_id): Path<String>) -> impl IntoResponse {

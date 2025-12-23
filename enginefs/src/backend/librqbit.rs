@@ -256,7 +256,7 @@ impl TorrentHandle for LibrqbitHandle {
         Ok(())
     }
 
-    async fn get_file_reader(&self, file_idx: usize, _start_offset: u64) -> Result<Box<dyn FileStreamTrait>> {
+    async fn get_file_reader(&self, file_idx: usize, _start_offset: u64, _priority: u8) -> Result<Box<dyn FileStreamTrait>> {
         let stream = self
             .handle
             .clone()

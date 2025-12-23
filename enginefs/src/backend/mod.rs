@@ -7,6 +7,8 @@ pub mod librqbit;
 #[cfg(feature = "libtorrent")]
 pub mod libtorrent;
 
+pub mod priorities;
+
 pub trait FileStreamTrait: AsyncRead + AsyncSeek + Unpin + Send + Sync {}
 impl<T: AsyncRead + AsyncSeek + Unpin + Send + Sync> FileStreamTrait for T {}
 
@@ -38,7 +40,7 @@ pub trait TorrentHandle: Send + Sync + Clone {
 
     async fn stats(&self) -> EngineStats;
     async fn add_trackers(&self, trackers: Vec<String>) -> Result<()>;
-    async fn get_file_reader(&self, file_idx: usize, start_offset: u64) -> Result<Box<dyn FileStreamTrait>>;
+    async fn get_file_reader(&self, file_idx: usize, start_offset: u64, priority: u8) -> Result<Box<dyn FileStreamTrait>>;
     async fn get_files(&self) -> Vec<BackendFileInfo>;
 }
 
@@ -81,12 +83,31 @@ pub struct Growler {
     pub pulse: Option<u64>,
 }
 
+impl Default for Growler {
+    fn default() -> Self {
+        Self {
+            flood: 0,
+            pulse: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PeerSearch {
     pub max: u64,
     pub min: u64,
     pub sources: Vec<String>,
+}
+
+impl Default for PeerSearch {
+    fn default() -> Self {
+        Self {
+            max: 200,
+            min: 40,
+            sources: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -97,6 +118,69 @@ pub struct SwarmCap {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub min_peers: Option<u64>,
 }
+
+impl Default for SwarmCap {
+    fn default() -> Self {
+        Self {
+            max_speed: None,
+            min_peers: None,
+        }
+    }
+}
+
+/// Torrent speed profile settings from frontend (stremio-web)
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TorrentSpeedProfile {
+    /// Hard limit on download speed (bytes/sec)
+    pub bt_download_speed_hard_limit: f64,
+    /// Soft limit on download speed (bytes/sec)
+    pub bt_download_speed_soft_limit: f64,
+    /// Handshake timeout (ms)
+    pub bt_handshake_timeout: u64,
+    /// Maximum connections
+    pub bt_max_connections: u64,
+    /// Minimum peers for stable
+    pub bt_min_peers_for_stable: u64,
+    /// Request timeout (ms)
+    pub bt_request_timeout: u64,
+}
+
+impl Default for TorrentSpeedProfile {
+    fn default() -> Self {
+        // "MAXIMUM PERFORMANCE" - even more aggressive than "ultra fast"
+        Self {
+            bt_download_speed_hard_limit: 0.0, // 0 = unlimited
+            bt_download_speed_soft_limit: 0.0, // 0 = unlimited
+            bt_handshake_timeout: 30000, // 30s - more forgiving for slow peers
+            bt_max_connections: 1000, // Very high for maximum throughput
+            bt_min_peers_for_stable: 15, // More peers = faster
+            bt_request_timeout: 8000, // 8s - more forgiving
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BackendConfig {
+    pub cache: priorities::EngineCacheConfig,
+    pub growler: Growler,
+    pub peer_search: PeerSearch,
+    pub swarm_cap: SwarmCap,
+    pub speed_profile: TorrentSpeedProfile,
+}
+
+impl Default for BackendConfig {
+    fn default() -> Self {
+        Self {
+            cache: priorities::EngineCacheConfig::default(),
+            growler: Growler::default(),
+            peer_search: PeerSearch::default(),
+            swarm_cap: SwarmCap::default(),
+            speed_profile: TorrentSpeedProfile::default(),
+        }
+    }
+}
+
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]

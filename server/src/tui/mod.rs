@@ -399,9 +399,15 @@ fn run_tui(
     )?;
     terminal.show_cursor()?;
 
-    // Signal shutdown
-    rt.spawn(async move {
-        let _ = shutdown_tx.send(()).await;
+    // Signal shutdown immediately using blocking_send (not async spawn)
+    // This ensures the shutdown signal is delivered before we return
+    let _ = shutdown_tx.blocking_send(());
+    
+    // Force exit after a short grace period to handle any stuck connections
+    std::thread::spawn(|| {
+        std::thread::sleep(Duration::from_secs(2));
+        tracing::info!("Force exiting after grace period");
+        std::process::exit(0);
     });
 
     Ok(())

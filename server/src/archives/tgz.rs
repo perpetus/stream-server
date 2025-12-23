@@ -39,7 +39,7 @@ impl ArchiveReader for TgzHandler {
         Ok(entries)
     }
 
-    fn open_file(&self, path: &str) -> Result<Box<dyn Read + Send>> {
+    fn open_file(&self, path: &str) -> Result<Box<dyn super::SeekableReader>> {
         Ok(Box::new(TgzEntryReader::new(self.path.clone(), path.to_string())?))
     }
 }
@@ -120,5 +120,11 @@ impl Read for TgzEntryReader {
             Ok(Err(None)) => Err(std::io::Error::new(std::io::ErrorKind::Other, "Unknown error from thread")),
             Err(_) => Ok(0), // Sender closed, EOF
         }
+    }
+}
+
+impl std::io::Seek for TgzEntryReader {
+    fn seek(&mut self, _pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        Err(std::io::Error::new(std::io::ErrorKind::Other, "Seeking not supported for TGZ streams"))
     }
 }

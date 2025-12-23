@@ -558,6 +558,26 @@ impl LibtorrentSession {
     pub fn apply_settings(&mut self, settings: &SessionSettings) -> Result<(), cxx::Exception> {
         ffi::session_apply_settings(self.inner.pin_mut(), settings)
     }
+
+    /// Set download rate limit (0 = unlimited)
+    pub fn set_download_rate_limit(&mut self, limit: i32) {
+        ffi::session_set_download_rate_limit(self.inner.pin_mut(), limit)
+    }
+
+    /// Set upload rate limit (0 = unlimited)
+    pub fn set_upload_rate_limit(&mut self, limit: i32) {
+        ffi::session_set_upload_rate_limit(self.inner.pin_mut(), limit)
+    }
+
+    /// Get download rate limit
+    pub fn get_download_rate_limit(&self) -> i32 {
+        ffi::session_get_download_rate_limit(&self.inner)
+    }
+
+    /// Get upload rate limit
+    pub fn get_upload_rate_limit(&self) -> i32 {
+        ffi::session_get_upload_rate_limit(&self.inner)
+    }
 }
 
 /// High-level wrapper around a torrent handle

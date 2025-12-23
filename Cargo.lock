@@ -1642,6 +1642,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "genawaiter"
+version = "0.99.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c86bd0361bcbde39b13475e6e36cb24c329964aa2611be285289d1e4b751c1a0"
+dependencies = [
+ "futures-core",
+ "genawaiter-macro",
+]
+
+[[package]]
+name = "genawaiter-macro"
+version = "0.99.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b32dfe1fdfc0bbde1f22a5da25355514b5e450c33a6af6770884c8750aedfbc"
+
+[[package]]
 name = "generic-array"
 version = "0.12.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4274,6 +4290,7 @@ dependencies = [
  "serde_json",
  "sevenz-rust",
  "sha2",
+ "ssdp-client",
  "tar",
  "tempfile",
  "tokio",
@@ -4448,6 +4465,18 @@ name = "sptr"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3b9b39299b249ad65f3b7e96443bad61c02ca5cd3589f46cb6d610a0fd6c0d6a"
+
+[[package]]
+name = "ssdp-client"
+version = "2.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "04f4048b05716cdb270e1e5960d9dd4d428e7ceaa939ee5348a84f6e43d52df1"
+dependencies = [
+ "futures-core",
+ "genawaiter",
+ "log",
+ "tokio",
+]
 
 [[package]]
 name = "stable_deref_trait"

@@ -29,7 +29,182 @@ pub struct ProbeResult {
 #[derive(Clone)]
 pub struct HlsEngine;
 
+#[derive(Debug, Clone)]
+pub struct TranscodeProfile {
+    pub name: &'static str,
+    pub input_args: Vec<&'static str>,
+    pub hw_accel: &'static str, // Value for -hwaccel
+    pub encoders: std::collections::HashMap<&'static str, &'static str>, // codec -> encoder name
+    pub decoders: std::collections::HashMap<&'static str, &'static str>, // codec -> decoder name
+    pub extra_output_args: Vec<&'static str>,
+    pub preset: Option<&'static str>,
+    pub pixel_format: Option<&'static str>, // e.g., nv12, yuv420p
+    pub scale_filter: Option<&'static str>, // e.g., scale_cuda, scale_vaapi
+}
+
 impl HlsEngine {
+    fn get_hw_profiles() -> std::collections::HashMap<&'static str, TranscodeProfile> {
+        let mut profiles = std::collections::HashMap::new();
+
+        // --- NVENC (Windows) ---
+        profiles.insert("nvenc-win", TranscodeProfile {
+            name: "nvenc-win",
+            input_args: vec![
+                "-init_hw_device", "cuda=cu:0", 
+                "-filter_hw_device", "cu", 
+                "-hwaccel", "cuda", 
+                "-hwaccel_output_format", "cuda", 
+                "-threads", "1"
+            ],
+            hw_accel: "cuda",
+            encoders: std::collections::HashMap::from([
+                ("h264", "h264_nvenc"),
+                ("hevc", "hevc_nvenc"),
+            ]),
+            decoders: std::collections::HashMap::new(),
+            extra_output_args: vec!["-b:v", "{bitrate}", "-maxrate", "{bitrate}", "-bufsize", "{bufsize}"],
+            preset: Some("p1"),
+            pixel_format: Some("yuv420p"),
+            scale_filter: Some("scale_cuda"),
+        });
+
+        // --- NVENC (Linux) ---
+        profiles.insert("nvenc-linux", TranscodeProfile {
+            name: "nvenc-linux",
+            input_args: vec![
+                "-init_hw_device", "cuda=cu:0", 
+                "-filter_hw_device", "cu", 
+                "-hwaccel", "cuda", 
+                "-hwaccel_output_format", "cuda"
+            ],
+            hw_accel: "cuda",
+            encoders: std::collections::HashMap::from([
+                ("h264", "h264_nvenc"),
+                ("hevc", "hevc_nvenc"),
+            ]),
+            decoders: std::collections::HashMap::from([
+                ("hevc", "hevc_cuvid"),
+                ("h264", "h264_cuvid"),
+                ("av1", "av1_cuvid"),
+                ("vp9", "vp9_cuvid"),
+            ]),
+            extra_output_args: vec!["-b:v", "{bitrate}", "-maxrate", "{bitrate}", "-bufsize", "{bufsize}"],
+            preset: Some("p1"),
+            pixel_format: Some("yuv420p"),
+            scale_filter: Some("scale_cuda"),
+        });
+
+        // --- QSV (Windows) ---
+        profiles.insert("qsv-win", TranscodeProfile {
+            name: "qsv-win",
+            input_args: vec![
+                "-init_hw_device", "d3d11va=dx11:,vendor=0x8086", 
+                "-init_hw_device", "qsv=qs@dx11", 
+                "-filter_hw_device", "qs", 
+                "-hwaccel", "d3d11va", 
+                "-hwaccel_output_format", "d3d11", 
+                "-threads", "3"
+            ],
+            hw_accel: "d3d11va",
+            encoders: std::collections::HashMap::from([
+                ("h264", "h264_qsv"),
+                ("hevc", "hevc_qsv"),
+            ]),
+            decoders: std::collections::HashMap::new(),
+            extra_output_args: vec!["-look_ahead", "0", "-b:v", "{bitrate}", "-maxrate", "{bitrate}", "-bufsize", "{bufsize}"],
+            preset: Some("veryfast"),
+            pixel_format: Some("nv12"),
+            scale_filter: Some("scale_qsv"),
+        });
+
+         // --- QSV (Linux) ---
+        profiles.insert("qsv-linux", TranscodeProfile {
+            name: "qsv-linux",
+            input_args: vec![
+                "-init_hw_device", "vaapi=va:,driver=iHD,kernel_driver=i915", 
+                "-init_hw_device", "qsv=qs@va", 
+                "-filter_hw_device", "qs", 
+                "-hwaccel", "vaapi", 
+                "-hwaccel_output_format", "vaapi"
+            ],
+            hw_accel: "vaapi",
+            encoders: std::collections::HashMap::from([
+                ("h264", "h264_qsv"),
+                ("hevc", "hevc_qsv"),
+            ]),
+            decoders: std::collections::HashMap::new(),
+            extra_output_args: vec!["-look_ahead", "0", "-b:v", "{bitrate}", "-maxrate", "{bitrate}", "-bufsize", "{bufsize}"],
+            preset: Some("veryfast"),
+            pixel_format: Some("nv12"),
+            scale_filter: Some("scale_vaapi"),
+        });
+
+        // --- AMF (Windows) ---
+        profiles.insert("amf", TranscodeProfile {
+            name: "amf",
+            input_args: vec![
+                 "-init_hw_device", "d3d11va=dx11:,vendor=0x1002", 
+                 "-init_hw_device", "opencl=ocl@dx11", 
+                 "-filter_hw_device", "ocl", 
+                 "-hwaccel", "d3d11va", 
+                 "-hwaccel_output_format", "d3d11"
+            ],
+            hw_accel: "d3d11va",
+            encoders: std::collections::HashMap::from([
+                ("h264", "h264_amf"),
+                ("hevc", "hevc_amf"),
+            ]),
+            decoders: std::collections::HashMap::new(),
+            extra_output_args: vec!["-quality", "speed", "-rc", "cbr", "-b:v", "{bitrate}", "-maxrate", "{bitrate}", "-bufsize", "{bufsize}"],
+            preset: None,
+            pixel_format: Some("nv12"),
+            scale_filter: Some("scale_opencl"),
+        });
+
+        // --- VAAPI (Linux) ---
+        profiles.insert("vaapi", TranscodeProfile {
+            name: "vaapi",
+            input_args: vec![
+                "-init_hw_device", "vaapi=va:/dev/dri/renderD128", 
+                "-filter_hw_device", "va", 
+                "-hwaccel", "vaapi", 
+                "-hwaccel_output_format", "vaapi"
+            ],
+            hw_accel: "vaapi",
+            encoders: std::collections::HashMap::from([
+                ("h264", "h264_vaapi"),
+                ("hevc", "hevc_vaapi"),
+                ("vp9", "vp9_vaapi"),
+            ]),
+            decoders: std::collections::HashMap::new(),
+            extra_output_args: vec!["-rc_mode", "VBR", "-b:v", "{bitrate}", "-maxrate", "{bitrate}", "-bufsize", "{bufsize}"],
+            preset: None,
+            pixel_format: Some("nv12"),
+            scale_filter: Some("scale_vaapi"),
+        });
+
+        // --- VideoToolbox (macOS) ---
+        profiles.insert("videotoolbox", TranscodeProfile {
+            name: "videotoolbox",
+            input_args: vec![
+                "-init_hw_device", "videotoolbox=vt", 
+                "-hwaccel", "videotoolbox"
+            ],
+            hw_accel: "videotoolbox",
+            encoders: std::collections::HashMap::from([
+                ("h264", "h264_videotoolbox"),
+                ("hevc", "hevc_videotoolbox"),
+            ]),
+            decoders: std::collections::HashMap::new(),
+            extra_output_args: vec!["-b:v", "{bitrate}", "-maxrate", "{bitrate}", "-bufsize", "{bufsize}"],
+            preset: None,
+            pixel_format: Some("nv12"),
+            scale_filter: None, 
+        });
+
+        profiles
+    }
+
     pub async fn probe_video(file_path: &str) -> Result<ProbeResult> {
         tracing::info!("Starting probe_video for {}", file_path);
         // "Improve it without change in functionality":
@@ -156,7 +331,8 @@ impl HlsEngine {
 
     pub fn get_segments(duration: f64) -> Vec<(f64, f64)> {
         // Shorter segments = faster initial load and seeking
-        let segment_duration = 2.0;
+        // 4.0s is a good balance for efficiency vs latency
+        let segment_duration = 4.0;
         let count = (duration / segment_duration).ceil() as usize;
         let mut segments = Vec::new();
         for i in 0..count {
@@ -267,27 +443,33 @@ impl HlsEngine {
                 cmd.arg("-hwaccels");
                 cmd.stdout(Stdio::piped());
                 cmd.stderr(Stdio::null());
+                let os = std::env::consts::OS;
 
                 if let Ok(output) = cmd.output().await {
                     let output_str = String::from_utf8_lossy(&output.stdout);
                     let methods: Vec<&str> = output_str.lines().map(|l| l.trim()).collect();
 
-                    // Priority list for HW acceleration
                     if methods.contains(&"cuda") {
-                        return "cuda".to_string();
-                    } else if methods.contains(&"vaapi") {
+                        if os == "windows" { return "nvenc-win".to_string(); }
+                        else { return "nvenc-linux".to_string(); }
+                    } 
+                    if methods.contains(&"qsv") {
+                         if os == "windows" { return "qsv-win".to_string(); }
+                         else { return "qsv-linux".to_string(); }
+                    }
+                    if methods.contains(&"videotoolbox") {
+                        return "videotoolbox".to_string(); 
+                    }
+                    if methods.contains(&"d3d11va") && methods.contains(&"opencl") {
+                        // AMF usually requires D3D11VA and OpenCL
+                        if os == "windows" { return "amf".to_string(); }
+                    }
+                    if methods.contains(&"vaapi") {
                         return "vaapi".to_string();
-                    } else if methods.contains(&"qsv") {
-                        return "qsv".to_string();
-                    } else if methods.contains(&"vulkan") {
-                        return "vulkan".to_string();
-                    } else if methods.contains(&"videotoolbox") {
-                        // macOS
-                        return "videotoolbox".to_string();
                     }
                 }
 
-                "auto".to_string() // Fallback
+                "cpu".to_string() // Fallback
             })
             .await
             .as_str()
@@ -302,62 +484,68 @@ impl HlsEngine {
         target_video_codec: &str,
         audio_stream_index: Option<usize>,
     ) -> Result<tokio::process::Child> {
-        let hwaccel_method = Self::probe_hwaccel().await;
+        let profile_key = Self::probe_hwaccel().await;
+        let profiles = Self::get_hw_profiles();
+        let profile = profiles.get(profile_key);
 
         let mut cmd = Command::new("ffmpeg");
 
+        // Input Args (from profile or default)
+        if let Some(p) = profile {
+            cmd.args(&p.input_args);
+        }
+
         // ========== OPTIMIZED INPUT FLAGS FOR LOW LATENCY ==========
-        // -fflags: nobuffer (reduce buffering), genpts (generate pts), discardcorrupt, fastseek
-        // -flags low_delay: force low-delay codec mode
-        // -analyzeduration 500000: 0.5s analysis (needed for proper HEVC initialization)
-        // -probesize 1000000: 1MB probing (needed for HEVC with Dolby Vision)
         cmd.args([
-            "-hwaccel",
-            hwaccel_method,
-            "-fflags",
-            "+genpts+discardcorrupt+nobuffer",
-            "-flags",
-            "low_delay",
-            "-analyzeduration",
-            "500000",
-            "-probesize",
-            "1000000",
+            "-fflags", "+genpts+discardcorrupt+nobuffer",
+            "-flags", "low_delay",
+            "-analyzeduration", "500000",
+            "-probesize", "1000000",
         ]);
 
         if let Some(cont) = container {
             cmd.arg("-f").arg(cont);
+            if cont.contains("matroska") || cont.contains("webm") {
+               cmd.args(["-seek2any", "1"]);
+            }
         }
 
-        // Reverse-engineered flags from split_output
-        cmd.args(["-fflags", "+genpts"]);
-        // cmd.args(["-noaccurate_seek", "-seek_timestamp", "1"]);
-        // -copyts is used in split_output and is critical for correct timing with these flags
-        // cmd.arg("-copyts");
-
-        // -ss BEFORE -i: Fast keyframe-based seeking (demuxer-level)
+        cmd.args([
+            "-fflags", "+genpts", 
+            "-noaccurate_seek", 
+            "-seek_timestamp", "1", 
+            "-ignore_unknown",
+            "-mpegts_copyts", "1",
+            "-map", "-0:d?", 
+            "-map", "-0:t?"
+        ]);
+        
         cmd.arg("-ss").arg(format!("{}", start));
         cmd.arg("-i").arg(input_path);
-        // -t after -i limits output duration
         cmd.arg("-t").arg(format!("{}", duration));
 
-        // Always disable subtitles to prevent failures with image-based subs
+        let is_video_transcoding = target_video_codec != "copy" && target_video_codec != "none";
+        let is_audio_transcoding = target_audio_codec != "copy" && target_audio_codec != "none";
+
+        if is_video_transcoding || is_audio_transcoding {
+             cmd.arg("-ss").arg(format!("{}", start));
+             cmd.arg("-output_ts_offset").arg(format!("{}", start));
+        }
+
         cmd.arg("-sn");
 
         // Stream mapping logic
         if target_video_codec == "none" {
-            // Audio-only segment: Map ONLY audio (specific or 0:a:0)
             if let Some(audio_idx) = audio_stream_index {
                 cmd.args(["-map", &format!("0:{}", audio_idx)]);
             } else {
                 cmd.args(["-map", "0:a:0"]);
             }
-            cmd.arg("-vn"); // No video
+            cmd.arg("-vn");
         } else if target_audio_codec == "none" {
-            // Video-only segment: Map ONLY video
             cmd.args(["-map", "0:v:0"]);
-            cmd.arg("-an"); // No audio
+            cmd.arg("-an");
         } else {
-            // Combined segment (fallback/legacy): Map both
             cmd.args(["-map", "0:v:0"]);
             if let Some(audio_idx) = audio_stream_index {
                 cmd.args(["-map", &format!("0:{}", audio_idx)]);
@@ -366,73 +554,91 @@ impl HlsEngine {
             }
         }
 
-        // Video flags
+        // --- Video Transcoding Logic with Profile ---
         if target_video_codec == "none" {
             // Do nothing
         } else if target_video_codec == "copy" {
             cmd.arg("-c:v").arg("copy");
-        } else {
-            cmd.args(["-c:v", target_video_codec]);
+        } else if let Some(p) = profile {
+            tracing::info!("Using HW Profile: {}", p.name);
+            
+            // 1. Select Encoder
+            // default to codec name if not in map, but usually we want the profile's encoder
+            let encoder = p.encoders.get(target_video_codec).unwrap_or(&target_video_codec);
+            cmd.args(["-c:v", encoder]);
 
-            // Hardware encoders have different parameter support
-            let is_hw_encoder = target_video_codec.contains("nvenc")
-                || target_video_codec.contains("vaapi")
-                || target_video_codec.contains("qsv")
-                || target_video_codec.contains("v4l2m2m")
-                || target_video_codec.contains("videotoolbox");
-
-            if is_hw_encoder {
-                tracing::info!("Using hardware encoder: {}", target_video_codec);
-                // Hardware encoders - use their native presets
-                if target_video_codec.contains("nvenc") {
-                    // NVENC H264 usually requires 8-bit input (yuv420p).
-                    // Input is 10-bit HEVC, so we MUST force 8-bit conversion.
-                    // Use -rc vbr -tune hq (vbr_hq is deprecated in newer ffmpeg)
-                    // OPTIMIZATION: Use p1 (fastest) for lowest startup latency
-                    // OPTIMIZATION: Reduce bitrate to 4M (max 6M) for better streaming performance
-                    cmd.args([
-                        "-pix_fmt", "yuv420p", "-preset", "p1", "-rc", "vbr", "-tune", "hq", "-cq",
-                        "23", "-b:v", "4M", "-maxrate", "6M", "-bufsize", "12M", "-g", "60",
-                    ]);
-                } else if target_video_codec.contains("vaapi") {
-                    // VAAPI requires input to be on a VAAPI surface.
-                    // If input is SW decoded, we need to upload it.
-                    // Also force nv12 (8-bit) to avoid compatibility issues with 10-bit H264.
-                    // Add keyframe interval for HLS segment alignment (2sec @ 30fps = 60 frames)
-                    cmd.args(["-vf", "format=nv12,hwupload", "-g", "60", "-keyint_min", "60"]);
-                } else if target_video_codec.contains("qsv") {
-                    // QSV also often expects 8-bit nv12 for H264
-                    // Add keyframe interval for HLS segment alignment
-                    cmd.args(["-vf", "format=nv12", "-preset", "fast", "-g", "60", "-keyint_min", "60"]);
-                }
-            } else {
-                // Software encoder - use full optimization flags
-                // Add keyframe interval for HLS segment alignment (2sec @ 30fps = 60 frames)
-                // Add H.264 High profile level 4.1 for maximum browser compatibility
-                cmd.args([
-                    "-pix_fmt",
-                    "yuv420p",
-                    "-preset",
-                    "ultrafast",
-                    "-tune",
-                    "zerolatency",
-                    "-g",
-                    "60",
-                    "-keyint_min",
-                    "60",
-                    "-profile:v",
-                    "high",
-                    "-level",
-                    "4.1",
-                ]);
+            // 2. Add Profile Output Args (bitrate, bufsize, etc)
+            // Replace placeholders: {bitrate} -> 4M, {bufsize} -> 8M
+            for arg in &p.extra_output_args {
+                let val = arg.replace("{bitrate}", "4M").replace("{bufsize}", "8M");
+                cmd.arg(val);
             }
+
+            // 3. Preset / Tune
+            if let Some(preset) = p.preset {
+                cmd.args(["-preset", preset]);
+                if p.name.contains("nvenc") {
+                     cmd.args(["-rc", "vbr", "-tune", "hq", "-cq", "23"]);
+                }
+            }
+
+            // 4. Pixel Format
+            if let Some(pix_fmt) = p.pixel_format {
+                 if p.name.contains("qsv") || p.name.contains("vaapi") {
+                      // QSV/VAAPI often handle format in filters
+                 } else {
+                      cmd.args(["-pix_fmt", pix_fmt]);
+                 }
+            }
+
+            // 5. Scaling / Filters
+            // Construct -vf: "format=nv12,hwupload" or "scale_cuda..."
+            let mut filters = Vec::new();
+            
+            // VAAPI speciial handling
+            if p.name == "vaapi" {
+                filters.push("format=nv12".to_string());
+                filters.push("hwupload".to_string());
+            } else if p.name.contains("qsv") {
+                 filters.push("format=nv12".to_string());
+                 // hwupload might be needed if software decode
+            } else if p.name.contains("nvenc") {
+                 // Nothing specific usually if inputs are compatible, else scale_cuda
+            }
+
+            // Add standard HLS flags
+            cmd.args(["-g", "120", "-sc_threshold", "0"]);
+            if p.name.contains("vaapi") || p.name.contains("qsv") {
+                 cmd.args(["-keyint_min", "120"]);
+            }
+
+             if !filters.is_empty() {
+                cmd.arg("-vf").arg(filters.join(","));
+            }
+
+        } else {
+            // Fallback CPU
+             cmd.args(["-c:v", target_video_codec]);
+             cmd.args([
+                "-pix_fmt", "yuv420p",
+                "-preset", "ultrafast",
+                "-tune", "zerolatency",
+                "-g", "120",
+                "-keyint_min", "120",
+                "-sc_threshold", "0",
+                "-profile:v", "high",
+                "-level", "4.1",
+            ]);
         }
+
 
         // Audio flags
         if target_audio_codec == "none" {
             // Do nothing
         } else if target_audio_codec == "copy" {
             cmd.arg("-c:a").arg("copy");
+            // REVERSE ENGINEERED: When copying AAC to MPEG-TS, this filter is often required
+            cmd.args(["-bsf:a", "aac_adtstoasc"]);
         } else {
             cmd.args([
                 "-c:a",
@@ -441,6 +647,9 @@ impl HlsEngine {
                 "2",
                 "-b:a", // Ensure decent bitrate
                 "192k",
+                // REVERSE ENGINEERED: -async 1 handles drift, apad fills gaps
+                "-async", "1",
+                "-filter:a", "apad",
                 "-strict",
                 "experimental",
             ]);

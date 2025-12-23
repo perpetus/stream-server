@@ -30,6 +30,14 @@ jobs:
         with:
           tool: cargo-chef,cargo-wix
 
+      - name: Cache vcpkg installed packages
+        uses: actions/cache@v4
+        with:
+          path: vcpkg_installed
+          key: ${{ runner.os }}-vcpkg-${{ hashFiles('vcpkg.json') }}
+          restore-keys: |
+            ${{ runner.os }}-vcpkg-
+
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
         with:
@@ -37,6 +45,8 @@ jobs:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgJsonGlob: 'vcpkg.json'
           runVcpkgInstall: true
+        env:
+          VCPKG_INSTALLED_DIR: ${{ github.workspace }}/vcpkg_installed
 
       - name: Cargo Chef Prepare
         run: cargo chef prepare --recipe-path recipe.json
@@ -53,6 +63,7 @@ jobs:
           cargo chef cook --release --recipe-path recipe.json --target x86_64-pc-windows-msvc --features libtorrent --no-default-features
         env:
           VCPKG_ROOT: ${{ github.workspace }}\vcpkg
+          VCPKG_INSTALLED_DIR: ${{ github.workspace }}\vcpkg_installed
           VCPKGRS_TRIPLET: x64-windows-static
 
       - name: Restore Source Code
@@ -64,6 +75,7 @@ jobs:
           cargo build --release --target x86_64-pc-windows-msvc --features libtorrent --no-default-features
         env:
           VCPKG_ROOT: ${{ github.workspace }}\vcpkg
+          VCPKG_INSTALLED_DIR: ${{ github.workspace }}\vcpkg_installed
           VCPKGRS_TRIPLET: x64-windows-static
 
       - name: Upload EXE
@@ -76,12 +88,14 @@ jobs:
         run: cargo wix init --package server --force
         env:
           VCPKG_ROOT: ${{ github.workspace }}\vcpkg
+          VCPKG_INSTALLED_DIR: ${{ github.workspace }}\vcpkg_installed
           VCPKGRS_TRIPLET: x64-windows-static
 
       - name: Build MSI Installer
         run: cargo wix --package server --no-build --nocapture --target x86_64-pc-windows-msvc
         env:
           VCPKG_ROOT: ${{ github.workspace }}\vcpkg
+          VCPKG_INSTALLED_DIR: ${{ github.workspace }}\vcpkg_installed
           VCPKGRS_TRIPLET: x64-windows-static
 
 
@@ -117,7 +131,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential pkg-config libssl-dev libfuse2
 
-      - name: VCPKG Cache
+      - name: Cache vcpkg installed packages
         uses: actions/cache@v4
         with:
           path: vcpkg_installed
@@ -132,6 +146,8 @@ jobs:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgJsonGlob: 'vcpkg.json'
           runVcpkgInstall: true
+        env:
+          VCPKG_INSTALLED_DIR: ${{ github.workspace }}/vcpkg_installed
 
       - name: Cargo Chef Prepare
         run: cargo chef prepare --recipe-path recipe.json
@@ -148,6 +164,8 @@ jobs:
            cargo chef cook --release --recipe-path recipe.json --features libtorrent --no-default-features
         env:
            VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+           VCPKG_INSTALLED_DIR: ${{ github.workspace }}/vcpkg_installed
+           PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed/x64-linux/lib/pkgconfig
 
       - name: Restore Source Code
         run: git restore server enginefs libtorrent-sys
@@ -156,6 +174,8 @@ jobs:
         run: cargo build --release --features libtorrent --no-default-features
         env:
           VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+          VCPKG_INSTALLED_DIR: ${{ github.workspace }}/vcpkg_installed
+          PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed/x64-linux/lib/pkgconfig
 
       - name: Build DEB Package
         run: cargo deb --package server --no-build
