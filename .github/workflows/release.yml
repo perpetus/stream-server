@@ -34,7 +34,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: vcpkg_installed
-          key: ${{ runner.os }}-vcpkg-${{ hashFiles('vcpkg.json') }}
+          key: ${{ runner.os }}-vcpkg-static-${{ hashFiles('vcpkg.json') }}
           restore-keys: |
             ${{ runner.os }}-vcpkg-
 
@@ -47,6 +47,7 @@ jobs:
           runVcpkgInstall: true
         env:
           VCPKG_INSTALLED_DIR: ${{ github.workspace }}/vcpkg_installed
+          VCPKG_DEFAULT_TRIPLET: x64-windows-static
 
       - name: Cargo Chef Prepare
         run: cargo chef prepare --recipe-path recipe.json
@@ -65,6 +66,7 @@ jobs:
           VCPKG_ROOT: ${{ github.workspace }}\vcpkg
           VCPKG_INSTALLED_DIR: ${{ github.workspace }}\vcpkg_installed
           VCPKGRS_TRIPLET: x64-windows-static
+          PKG_CONFIG_PATH: ${{ github.workspace }}\vcpkg_installed\x64-windows-static\lib\pkgconfig
 
       - name: Restore Source Code
         run: git restore server enginefs libtorrent-sys
@@ -77,6 +79,7 @@ jobs:
           VCPKG_ROOT: ${{ github.workspace }}\vcpkg
           VCPKG_INSTALLED_DIR: ${{ github.workspace }}\vcpkg_installed
           VCPKGRS_TRIPLET: x64-windows-static
+          PKG_CONFIG_PATH: ${{ github.workspace }}\vcpkg_installed\x64-windows-static\lib\pkgconfig
 
       - name: Upload EXE
         uses: actions/upload-artifact@v4
@@ -90,6 +93,7 @@ jobs:
           VCPKG_ROOT: ${{ github.workspace }}\vcpkg
           VCPKG_INSTALLED_DIR: ${{ github.workspace }}\vcpkg_installed
           VCPKGRS_TRIPLET: x64-windows-static
+          PKG_CONFIG_PATH: ${{ github.workspace }}\vcpkg_installed\x64-windows-static\lib\pkgconfig
 
       - name: Build MSI Installer
         run: cargo wix --package server --no-build --nocapture --target x86_64-pc-windows-msvc
@@ -97,6 +101,7 @@ jobs:
           VCPKG_ROOT: ${{ github.workspace }}\vcpkg
           VCPKG_INSTALLED_DIR: ${{ github.workspace }}\vcpkg_installed
           VCPKGRS_TRIPLET: x64-windows-static
+          PKG_CONFIG_PATH: ${{ github.workspace }}\vcpkg_installed\x64-windows-static\lib\pkgconfig
 
 
       - name: Upload MSI

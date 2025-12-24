@@ -101,6 +101,7 @@ pub struct HlsQuery {
 /// GET /hlsv2/{hash}/master.m3u8?mediaURL=http://127.0.0.1:11470/{infoHash}/{fileIdx}?
 pub async fn master_playlist_by_url(
     Path(_hash): Path<String>,
+    headers: axum::http::HeaderMap,
     axum::extract::Query(params): axum::extract::Query<HlsQuery>,
     axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
 ) -> Response {
@@ -142,14 +143,29 @@ pub async fn master_playlist_by_url(
 
     // Generate master playlist - use the REAL info_hash from mediaURL, not the path hash
     // This ensures subsequent stream/segment requests use the correct torrent identifier
-    // Generate master playlist - use the REAL info_hash from mediaURL, not the path hash
-    // This ensures subsequent stream/segment requests use the correct torrent identifier
+    // Base URL for segments
+    let base_url = format!("http://127.0.0.1:11470");
+
+    let query_str = raw_query.as_deref().unwrap_or("");
+    let query_map: std::collections::HashMap<String, String> = urlencoding::decode(query_str)
+        .unwrap_or(std::borrow::Cow::Borrowed(query_str))
+        .split('&')
+        .filter_map(|s| {
+            let mut parts = s.splitn(2, '=');
+            Some((parts.next()?.to_string(), parts.next().unwrap_or("").to_string()))
+        })
+        .collect();
+    
+    // Determine Profile
+    let profile = get_hls_profile(headers.get("user-agent").and_then(|v| v.to_str().ok()), &query_map);
+
     let playlist = enginefs::hls::HlsEngine::get_master_playlist(
         &probe,
-        info_hash,
+        &info_hash,
         file_idx,
-        "",
-        raw_query.as_deref().unwrap_or(""),
+        &base_url,
+        query_str,
+        profile,
     );
 
     (
@@ -165,6 +181,7 @@ pub async fn master_playlist_by_url(
 pub async fn get_master_playlist(
     State(state): State<AppState>,
     Path((info_hash, file_idx)): Path<(String, usize)>,
+    headers: axum::http::HeaderMap,
     axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
 ) -> Response {
     let engine = match state.engine.get_or_add_engine(&info_hash).await {
@@ -189,12 +206,25 @@ pub async fn get_master_playlist(
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
 
+    let query_str = raw_query.as_deref().unwrap_or("");
+    let query_map: std::collections::HashMap<String, String> = urlencoding::decode(query_str)
+        .unwrap_or(std::borrow::Cow::Borrowed(query_str))
+        .split('&')
+        .filter_map(|s| {
+            let mut parts = s.splitn(2, '=');
+            Some((parts.next()?.to_string(), parts.next().unwrap_or("").to_string()))
+        })
+        .collect();
+
+    let profile = get_hls_profile(headers.get("user-agent").and_then(|v| v.to_str().ok()), &query_map);
+
     let playlist = enginefs::hls::HlsEngine::get_master_playlist(
         &probe,
         &info_hash,
         file_idx,
-        "",
-        raw_query.as_deref().unwrap_or(""),
+        &format!("http://127.0.0.1:{}", port),
+        query_str,
+        profile,
     );
 
     (
@@ -222,8 +252,27 @@ pub async fn handle_hls_resource(
     // Parse file_idx - default to 0 if non-numeric (e.g., "subtitle4", "audio-1")
     let file_idx: usize = file_idx_str.parse().unwrap_or(0);
     
+    // Determine Profile
+    let headers_clone = headers.clone();
+    let ua = headers_clone.get("user-agent").and_then(|v| v.to_str().ok());
+    
+    // We need to parse query params again or pass them down. 
+    // handle_hls_resource doesn't have the HashMap readily available cleanly without re-parsing or changing signature.
+    // We'll quick-parse the query string again, it's cheap.
+    let query_str = raw_query.as_deref().unwrap_or("");
+    let query_map: std::collections::HashMap<String, String> = urlencoding::decode(query_str)
+        .unwrap_or(std::borrow::Cow::Borrowed(query_str))
+        .split('&')
+        .filter_map(|s| {
+            let mut parts = s.splitn(2, '=');
+            Some((parts.next()?.to_string(), parts.next().unwrap_or("").to_string()))
+        })
+        .collect();
+
+    let profile = get_hls_profile(ua, &query_map);
+    
     if resource.ends_with(".m3u8") {
-        get_stream_playlist(State(state), info_hash, file_idx, resource, raw_query).await
+        get_stream_playlist(State(state), info_hash, file_idx, resource, raw_query, profile).await
     } else {
         get_segment(
             State(state),
@@ -232,6 +281,7 @@ pub async fn handle_hls_resource(
             file_idx,
             resource,
             raw_query,
+            profile,
         )
         .await
     }
@@ -243,6 +293,7 @@ async fn get_stream_playlist(
     file_idx: usize,
     playlist_name: String,
     raw_query: Option<String>,
+    profile: HlsProfile,
 ) -> Response {
     let engine = match state.engine.get_or_add_engine(&info_hash).await {
         Ok(e) => e,
@@ -286,6 +337,7 @@ async fn get_stream_playlist(
         segment_base_url,
         audio_track_idx,
         raw_query.as_deref().unwrap_or(""),
+        profile,
     );
 
     (
@@ -309,6 +361,7 @@ async fn get_segment(
     file_idx: usize,
     segment: String,
     raw_query: Option<String>,
+    profile: HlsProfile,
 ) -> Response {
     let engine = match state.engine.get_or_add_engine(&info_hash).await {
         Ok(e) => e,
@@ -321,9 +374,10 @@ async fn get_segment(
         }
     };
 
-    // Check if this is an audio segment request "audio-{idx}-{seg}.ts"
-    let (seg_index, audio_track_idx) = if segment.starts_with("audio-") {
-        let parts: Vec<&str> = segment.trim_end_matches(".ts").split('-').collect();
+    // Check if this is an audio segment request "audio-{idx}-{seg}.ts" or "audio-{idx}-{seg}.m4s"
+    let segment_name = segment.trim_end_matches(".ts").trim_end_matches(".m4s");
+    let (seg_index, audio_track_idx) = if segment_name.starts_with("audio-") {
+        let parts: Vec<&str> = segment_name.split('-').collect();
         if parts.len() >= 3 {
             // audio, idx, seg
             let cur_idx = parts[1].parse::<usize>().ok();
@@ -333,7 +387,7 @@ async fn get_segment(
             return (StatusCode::BAD_REQUEST, "Invalid audio segment format").into_response();
         }
     } else {
-        match segment.trim_end_matches(".ts").parse::<usize>() {
+        match segment_name.parse::<usize>() {
             Ok(i) => (i, None),
             Err(_) => return (StatusCode::BAD_REQUEST, "Invalid segment").into_response(),
         }
@@ -381,7 +435,7 @@ async fn get_segment(
     // Audio codecs that browsers cannot play natively and require transcoding to AAC
     let browser_incompatible_audio = ["ac3", "eac3", "dts", "truehd", "mlp", "flac", "pcm", "opus"];
 
-    // Check if audio needs transcoding
+    // Check if audio needs transcoding and select target codec
     // If it's a browser, we generally require AAC.
     // If the source is already AAC, we don't need to transcode.
     // Note: probe.streams might have multiple audio streams, we are transcoding the default one usually.
@@ -488,9 +542,20 @@ async fn get_segment(
     let transcode_profile = settings.transcode_profile.clone();
     drop(settings);
 
+    let config = profile.get_config();
     let target_video_codec = if audio_track_idx.is_some() {
         // Audio Segment request: STRICTLY NO VIDEO
         "none"
+    } else if config.force_transcode_video {
+        // Profile enforces transcoding (e.g. Browser profile)
+         match transcode_profile.as_deref() {
+            Some("nvenc") => "h264_nvenc",
+            Some("vaapi") => "h264_vaapi",
+            Some("qsv") => "h264_qsv",
+            Some("v4l2m2m") => "h264_v4l2m2m",
+            Some("videotoolbox") => "h264_videotoolbox",
+            _ => "libx264",
+        }
     } else if !transcode_params.video_codecs.is_empty() {
         let codec_supported = transcode_params
             .video_codecs
@@ -523,6 +588,13 @@ async fn get_segment(
             _ => "libx264",
         }
     };
+    
+    // Audio Force Transcode Check
+     let target_audio_codec = if config.force_transcode_audio && target_audio_codec == "copy" {
+         "aac"
+     } else {
+         target_audio_codec
+     };
 
     if target_video_codec != "copy" || target_audio_codec != "copy" {
         tracing::debug!(
@@ -550,8 +622,11 @@ async fn get_segment(
         Some(&probe.container),
         target_audio_codec,
         target_video_codec,
+        video_codec, // Pass the source video codec for BSF selection
         audio_track_idx, // Use scraped audio stream index if available, otherwise default (None)
         is_10bit,        // Use 10-bit detection as proxy for HDR
+        is_browser,      // Use fMP4 for browser, MPEG-TS for native
+        &profile.get_config(),
     )
     .await
     {
@@ -567,9 +642,12 @@ async fn get_segment(
     let stream = ReaderStream::new(stdout);
     let body = Body::from_stream(stream);
 
+    // Use video/mp4 for browser (fMP4), video/mp2t for native (MPEG-TS)
+    let content_type = if is_browser { "video/mp4" } else { "video/mp2t" };
+
     (
         [
-            (axum::http::header::CONTENT_TYPE, "video/mp2t"),
+            (axum::http::header::CONTENT_TYPE, content_type),
             (
                 axum::http::header::CACHE_CONTROL,
                 "public, max-age=3600, immutable",
@@ -620,4 +698,39 @@ pub async fn get_tracks(
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
     Json(probe.streams).into_response()
+}
+// Helper to determine detection
+use enginefs::hls::HlsProfile;
+
+fn get_hls_profile(user_agent: Option<&str>, params: &std::collections::HashMap<String, String>) -> HlsProfile {
+    // 1. Check Query Param Override
+    if let Some(p) = params.get("profile") {
+        if p == "browser" {
+            tracing::info!("HLS Profile Override: Browser (via query param)");
+            return HlsProfile::Browser;
+        }
+        if p == "native" {
+            tracing::info!("HLS Profile Override: Native (via query param)");
+            return HlsProfile::Native;
+        }
+    }
+
+    // 2. Check User Agent
+    if let Some(ua) = user_agent {
+        let ua_lower = ua.to_lowercase();
+        // Known native players usually verifyable
+        if ua_lower.contains("stremio") || ua_lower.contains("vlc") || ua_lower.contains("libmpv") || ua_lower.contains("mpv") {
+            tracing::info!(user_agent = ?ua, "HLS Profile Detected: Native");
+            return HlsProfile::Native;
+        }
+        // Browsers
+        if ua_lower.contains("mozilla") || ua_lower.contains("chrome") || ua_lower.contains("safari") {
+            tracing::info!(user_agent = ?ua, "HLS Profile Detected: Browser");
+            return HlsProfile::Browser;
+        }
+    }
+
+    // 3. Default to Native (safe default for our primary use case)
+    tracing::info!(user_agent = ?user_agent, "HLS Profile Default: Native (Unknown Client)");
+    HlsProfile::Native
 }

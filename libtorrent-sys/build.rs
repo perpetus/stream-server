@@ -16,16 +16,18 @@ fn main() {
         .flag_if_supported("-Wno-unused-parameter")
         .flag_if_supported("-Wno-missing-field-initializers");
 
+    // Set TORRENT_ABI_VERSION for ALL platforms to match vcpkg-built libtorrent
+    // This is critical - without it, C++ name mangling differs and linking fails
+    build.define("TORRENT_ABI_VERSION", "3");
+    build.define("TORRENT_USE_OPENSSL", None);
+
     if cfg!(target_os = "windows") {
         build.flag_if_supported("/std:c++17");
         build.flag("/Zc:__cplusplus"); // Force correct C++ version
         build.flag_if_supported("/EHsc"); // Enable C++ exceptions
 
-        // Static linking configuration - library uses boost::string_view, NOT std::string_view
+        // Static linking configuration
         build.define("TORRENT_LINKING_STATIC", None);
-        build.define("TORRENT_ABI_VERSION", "3"); // Match v2 namespace in vcpkg library
-        build.define("TORRENT_USE_OPENSSL", None);
-
         build.define("BOOST_ASIO_STATIC_LINK", None);
         build.define("BOOST_ASIO_SEPARATE_COMPILATION", None);
     }
