@@ -2,10 +2,7 @@ name: Release Build
 
 on:
   push:
-    branches: [ "master", "main" ]
     tags: [ "v*" ]
-  pull_request:
-    branches: [ "master", "main" ]
   workflow_dispatch:
 
 env:
@@ -34,9 +31,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: vcpkg_installed
-          key: ${{ runner.os }}-vcpkg-static-${{ hashFiles('vcpkg.json') }}
+          key: ${{ runner.os }}-vcpkg-static-release-${{ hashFiles('vcpkg.json') }}
           restore-keys: |
-            ${{ runner.os }}-vcpkg-
+            ${{ runner.os }}-vcpkg-static-release-
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
@@ -47,7 +44,8 @@ jobs:
           runVcpkgInstall: true
         env:
           VCPKG_INSTALLED_DIR: ${{ github.workspace }}/vcpkg_installed
-          VCPKG_DEFAULT_TRIPLET: x64-windows-static
+          VCPKG_DEFAULT_TRIPLET: x64-windows-static-release
+          VCPKG_OVERLAY_TRIPLETS: ${{ github.workspace }}/triplets
 
       - name: Cargo Chef Prepare
         run: cargo chef prepare --recipe-path recipe.json
@@ -65,8 +63,8 @@ jobs:
         env:
           VCPKG_ROOT: ${{ github.workspace }}\vcpkg
           VCPKG_INSTALLED_DIR: ${{ github.workspace }}\vcpkg_installed
-          VCPKGRS_TRIPLET: x64-windows-static
-          PKG_CONFIG_PATH: ${{ github.workspace }}\vcpkg_installed\x64-windows-static\lib\pkgconfig
+          VCPKGRS_TRIPLET: x64-windows-static-release
+          PKG_CONFIG_PATH: ${{ github.workspace }}\vcpkg_installed\x64-windows-static-release\lib\pkgconfig
 
       - name: Restore Source Code
         run: git restore server enginefs libtorrent-sys
@@ -78,8 +76,8 @@ jobs:
         env:
           VCPKG_ROOT: ${{ github.workspace }}\vcpkg
           VCPKG_INSTALLED_DIR: ${{ github.workspace }}\vcpkg_installed
-          VCPKGRS_TRIPLET: x64-windows-static
-          PKG_CONFIG_PATH: ${{ github.workspace }}\vcpkg_installed\x64-windows-static\lib\pkgconfig
+          VCPKGRS_TRIPLET: x64-windows-static-release
+          PKG_CONFIG_PATH: ${{ github.workspace }}\vcpkg_installed\x64-windows-static-release\lib\pkgconfig
 
       - name: Upload EXE
         uses: actions/upload-artifact@v4
@@ -92,16 +90,16 @@ jobs:
         env:
           VCPKG_ROOT: ${{ github.workspace }}\vcpkg
           VCPKG_INSTALLED_DIR: ${{ github.workspace }}\vcpkg_installed
-          VCPKGRS_TRIPLET: x64-windows-static
-          PKG_CONFIG_PATH: ${{ github.workspace }}\vcpkg_installed\x64-windows-static\lib\pkgconfig
+          VCPKGRS_TRIPLET: x64-windows-static-release
+          PKG_CONFIG_PATH: ${{ github.workspace }}\vcpkg_installed\x64-windows-static-release\lib\pkgconfig
 
       - name: Build MSI Installer
         run: cargo wix --package server --no-build --nocapture --target x86_64-pc-windows-msvc
         env:
           VCPKG_ROOT: ${{ github.workspace }}\vcpkg
           VCPKG_INSTALLED_DIR: ${{ github.workspace }}\vcpkg_installed
-          VCPKGRS_TRIPLET: x64-windows-static
-          PKG_CONFIG_PATH: ${{ github.workspace }}\vcpkg_installed\x64-windows-static\lib\pkgconfig
+          VCPKGRS_TRIPLET: x64-windows-static-release
+          PKG_CONFIG_PATH: ${{ github.workspace }}\vcpkg_installed\x64-windows-static-release\lib\pkgconfig
 
 
       - name: Upload MSI
@@ -140,9 +138,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: vcpkg_installed
-          key: ${{ runner.os }}-vcpkg-${{ hashFiles('vcpkg.json') }}
+          key: ${{ runner.os }}-vcpkg-release-${{ hashFiles('vcpkg.json') }}
           restore-keys: |
-            ${{ runner.os }}-vcpkg-
+            ${{ runner.os }}-vcpkg-release-
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
@@ -153,6 +151,8 @@ jobs:
           runVcpkgInstall: true
         env:
           VCPKG_INSTALLED_DIR: ${{ github.workspace }}/vcpkg_installed
+          VCPKG_DEFAULT_TRIPLET: x64-linux-release
+          VCPKG_OVERLAY_TRIPLETS: ${{ github.workspace }}/triplets
 
       - name: Cargo Chef Prepare
         run: cargo chef prepare --recipe-path recipe.json
@@ -165,12 +165,12 @@ jobs:
 
       - name: Cargo Chef Cook
         run: |
-           export VCPKG_ROOT=${{ github.workspace }}/vcpkg
-           cargo chef cook --release --recipe-path recipe.json --features libtorrent --no-default-features
+          export VCPKG_ROOT=${{ github.workspace }}/vcpkg
+          cargo chef cook --release --recipe-path recipe.json --features libtorrent --no-default-features
         env:
-           VCPKG_ROOT: ${{ github.workspace }}/vcpkg
-           VCPKG_INSTALLED_DIR: ${{ github.workspace }}/vcpkg_installed
-           PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed/x64-linux/lib/pkgconfig
+          VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+          VCPKG_INSTALLED_DIR: ${{ github.workspace }}/vcpkg_installed
+          PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed/x64-linux-release/lib/pkgconfig
 
       - name: Restore Source Code
         run: git restore server enginefs libtorrent-sys
@@ -180,7 +180,7 @@ jobs:
         env:
           VCPKG_ROOT: ${{ github.workspace }}/vcpkg
           VCPKG_INSTALLED_DIR: ${{ github.workspace }}/vcpkg_installed
-          PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed/x64-linux/lib/pkgconfig
+          PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed/x64-linux-release/lib/pkgconfig
 
       - name: Build DEB Package
         run: cargo deb --package server --no-build

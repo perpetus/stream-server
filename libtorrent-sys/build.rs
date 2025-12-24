@@ -1,5 +1,5 @@
 fn main() {
-    let include_paths = find_libtorrent();
+    let (include_paths, using_vcpkg) = find_libtorrent();
 
     // Build the cxx bridge
     let mut build = cxx_build::bridge("src/lib.rs");
@@ -16,9 +16,11 @@ fn main() {
         .flag_if_supported("-Wno-unused-parameter")
         .flag_if_supported("-Wno-missing-field-initializers");
 
-    // Set TORRENT_ABI_VERSION for ALL platforms to match vcpkg-built libtorrent
-    // This is critical - without it, C++ name mangling differs and linking fails
-    build.define("TORRENT_ABI_VERSION", "3");
+    // Only set TORRENT_ABI_VERSION when using vcpkg-built libtorrent
+    // System packages (e.g., Arch Linux) use their own ABI version and don't need this
+    if using_vcpkg {
+        build.define("TORRENT_ABI_VERSION", "3");
+    }
     build.define("TORRENT_USE_OPENSSL", None);
 
     if cfg!(target_os = "windows") {
@@ -40,15 +42,17 @@ fn main() {
     println!("cargo:rerun-if-changed=cpp/wrapper.h");
 }
 
-fn find_libtorrent() -> Vec<std::path::PathBuf> {
+/// Returns (include_paths, using_vcpkg)
+/// using_vcpkg is true when vcpkg was used to find the library
+fn find_libtorrent() -> (Vec<std::path::PathBuf>, bool) {
     let mut errors = String::new();
 
-    // Try pkg-config first
+    // Try pkg-config first (system packages like on Arch Linux)
     match pkg_config::Config::new()
         .atleast_version("2.0")
         .probe("libtorrent-rasterbar")
     {
-        Ok(lib) => return lib.include_paths,
+        Ok(lib) => return (lib.include_paths, false), // NOT vcpkg
         Err(e) => {
             errors.push_str(&format!("pkg-config: {}\n", e));
         }
@@ -58,7 +62,7 @@ fn find_libtorrent() -> Vec<std::path::PathBuf> {
     if cfg!(target_os = "windows") {
         unsafe {
             std::env::set_var("VCPKGRS_DYNAMIC", "0");
-            std::env::set_var("VCPKGRS_TRIPLET", "x64-windows-static");
+            std::env::set_var("VCPKGRS_TRIPLET", "x64-windows-static-release");
         }
     }
 
@@ -67,7 +71,7 @@ fn find_libtorrent() -> Vec<std::path::PathBuf> {
         .emit_includes(true)
         .find_package("libtorrent")
     {
-        Ok(lib) => return lib.include_paths,
+        Ok(lib) => return (lib.include_paths, true), // IS vcpkg
         Err(e) => {
             errors.push_str(&format!("vcpkg (libtorrent): {}\n", e));
         }
@@ -78,7 +82,7 @@ fn find_libtorrent() -> Vec<std::path::PathBuf> {
         .emit_includes(true)
         .find_package("libtorrent-rasterbar")
     {
-        Ok(lib) => return lib.include_paths,
+        Ok(lib) => return (lib.include_paths, true), // IS vcpkg
         Err(e) => {
             errors.push_str(&format!("vcpkg (libtorrent-rasterbar): {}\n", e));
         }
