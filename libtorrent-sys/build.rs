@@ -66,15 +66,18 @@ fn find_libtorrent() -> (Vec<std::path::PathBuf>, bool) {
     }
 
     // Configure vcpkg crate
-    let triplet = if cfg!(target_os = "windows") {
-        "x64-windows-static-release"
-    } else {
-        "x64-linux-release"
-    };
+    let triplet_env = std::env::var("VCPKGRS_TRIPLET").ok();
+    let triplet_ref = triplet_env.as_deref().unwrap_or_else(|| {
+        if cfg!(target_os = "windows") {
+            "x64-windows-static"
+        } else {
+            "x64-linux"
+        }
+    });
 
     unsafe {
         std::env::set_var("VCPKGRS_DYNAMIC", "0");
-        std::env::set_var("VCPKGRS_TRIPLET", triplet);
+        std::env::set_var("VCPKGRS_TRIPLET", triplet_ref);
     }
 
     // Fallback to vcpkg crate
@@ -94,7 +97,7 @@ fn find_libtorrent() -> (Vec<std::path::PathBuf>, bool) {
     // Last resort: Manual discovery if VCPKG_INSTALLED_DIR is set (common in CI)
     if let Ok(installed_dir) = std::env::var("VCPKG_INSTALLED_DIR") {
         let include_path = std::path::PathBuf::from(installed_dir)
-            .join(triplet)
+            .join(triplet_ref)
             .join("include");
         
         if include_path.exists() {
@@ -105,6 +108,12 @@ fn find_libtorrent() -> (Vec<std::path::PathBuf>, bool) {
                 println!("cargo:rustc-link-lib=static=torrent-rasterbar");
                 // On Windows, we also need to link with some system libs for boost/vcpkg
                 if cfg!(target_os = "windows") {
+                    println!("cargo:rustc-link-lib=static=libssl");
+                    println!("cargo:rustc-link-lib=static=libcrypto");
+                    println!("cargo:rustc-link-lib=crypt32");
+                    println!("cargo:rustc-link-lib=user32");
+                    println!("cargo:rustc-link-lib=gdi32");
+                    println!("cargo:rustc-link-lib=advapi32");
                     println!("cargo:rustc-link-lib=iphlpapi");
                     println!("cargo:rustc-link-lib=dbghelp");
                 }
