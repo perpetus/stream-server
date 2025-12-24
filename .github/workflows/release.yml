@@ -2,17 +2,19 @@ name: Release Build
 
 on:
   push:
+    branches: [ "master" ]
     tags: [ "v*" ]
   workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
-  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
 
 jobs:
   build-windows:
     name: Build Windows
     runs-on: windows-latest
+    env:
+      VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
     steps:
       - uses: actions/checkout@v6
 
@@ -117,7 +119,7 @@ jobs:
 
   build-linux:
     name: Build Linux
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
 
@@ -132,27 +134,7 @@ jobs:
       - name: Install System Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential pkg-config libssl-dev libfuse2
-
-      - name: Cache vcpkg installed packages
-        uses: actions/cache@v4
-        with:
-          path: vcpkg_installed
-          key: ${{ runner.os }}-vcpkg-release-${{ hashFiles('vcpkg.json') }}
-          restore-keys: |
-            ${{ runner.os }}-vcpkg-release-
-
-      - name: Setup vcpkg
-        uses: lukka/run-vcpkg@v11
-        with:
-          vcpkgGitCommitId: '84bab45d415d22042bd0b9081aea57f362da3f35'
-          vcpkgDirectory: '${{ github.workspace }}/vcpkg'
-          vcpkgJsonGlob: 'vcpkg.json'
-          runVcpkgInstall: true
-        env:
-          VCPKG_INSTALLED_DIR: ${{ github.workspace }}/vcpkg_installed
-          VCPKG_DEFAULT_TRIPLET: x64-linux-release
-          VCPKG_OVERLAY_TRIPLETS: ${{ github.workspace }}/triplets
+          sudo apt-get install -y build-essential pkg-config libssl-dev libfuse2 libtorrent-rasterbar-dev libboost-dev
 
       - name: Cargo Chef Prepare
         run: cargo chef prepare --recipe-path recipe.json
@@ -165,27 +147,16 @@ jobs:
 
       - name: Cargo Chef Cook
         run: |
-          export VCPKG_ROOT=${{ github.workspace }}/vcpkg
           cargo chef cook --release --recipe-path recipe.json --features libtorrent --no-default-features
-        env:
-          VCPKG_ROOT: ${{ github.workspace }}/vcpkg
-          VCPKG_INSTALLED_DIR: ${{ github.workspace }}/vcpkg_installed
-          PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed/x64-linux-release/lib/pkgconfig
 
       - name: Restore Source Code
         run: git restore server enginefs libtorrent-sys
 
       - name: Build Release
         run: cargo build --release --features libtorrent --no-default-features
-        env:
-          VCPKG_ROOT: ${{ github.workspace }}/vcpkg
-          VCPKG_INSTALLED_DIR: ${{ github.workspace }}/vcpkg_installed
-          PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed/x64-linux-release/lib/pkgconfig
 
       - name: Build DEB Package
         run: cargo deb --package server --no-build
-        env:
-          VCPKG_ROOT: ${{ github.workspace }}/vcpkg
 
       - name: Build AppImage
         run: |
@@ -259,8 +230,6 @@ jobs:
 
       - name: Build binary
         run: cargo build --release --features libtorrent --no-default-features
-        env:
-          VCPKG_ROOT: ""
 
       - name: Create PKGBUILD
         run: |
