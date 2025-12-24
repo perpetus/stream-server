@@ -73,6 +73,7 @@ pub struct StatsFile {
     pub path: String,
     pub length: u64,
     pub offset: u64,
+    pub downloaded: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -148,14 +149,15 @@ pub struct TorrentSpeedProfile {
 
 impl Default for TorrentSpeedProfile {
     fn default() -> Self {
-        // "MAXIMUM PERFORMANCE" - even more aggressive than "ultra fast"
+        // "MAXIMUM PERFORMANCE" - Remove arbitrary limits
         Self {
             bt_download_speed_hard_limit: 0.0, // 0 = unlimited
             bt_download_speed_soft_limit: 0.0, // 0 = unlimited
-            bt_handshake_timeout: 30000, // 30s - more forgiving for slow peers
-            bt_max_connections: 1000, // Very high for maximum throughput
-            bt_min_peers_for_stable: 15, // More peers = faster
-            bt_request_timeout: 8000, // 8s - more forgiving
+            bt_handshake_timeout: 20000, // 20s - faster failure for dead peers
+            // 65535 is a safe high number for "unlimited" without overflowing i32 when cast or causing OS issues.
+            bt_max_connections: 65535, 
+            bt_min_peers_for_stable: 5, // Lower barrier to entry
+            bt_request_timeout: 10000, // 10s
         }
     }
 }

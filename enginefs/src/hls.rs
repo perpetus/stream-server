@@ -331,8 +331,8 @@ impl HlsEngine {
 
     pub fn get_segments(duration: f64) -> Vec<(f64, f64)> {
         // Shorter segments = faster initial load and seeking
-        // 4.0s is a good balance for efficiency vs latency
-        let segment_duration = 4.0;
+        // 2.0s is a good balance for efficiency vs latency
+        let segment_duration = 2.0;
         let count = (duration / segment_duration).ceil() as usize;
         let mut segments = Vec::new();
         for i in 0..count {
@@ -384,7 +384,7 @@ impl HlsEngine {
         }
 
         // Video stream with audio group reference
-        let bandwidth = 5_000_000;
+        let bandwidth = 20_000_000;
         if !audio_streams.is_empty() {
             m3u.push_str(&format!(
                 "#EXT-X-STREAM-INF:BANDWIDTH={},CODECS=\"avc1.640033,mp4a.40.2\",AUDIO=\"{}\"\n",
@@ -414,7 +414,7 @@ impl HlsEngine {
         let segments = Self::get_segments(probe.duration);
 
         let mut m3u = String::from("#EXTM3U\n#EXT-X-VERSION:4\n");
-        m3u.push_str("#EXT-X-TARGETDURATION:4\n");
+        m3u.push_str("#EXT-X-TARGETDURATION:2\n");
         m3u.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
         m3u.push_str("#EXT-X-PLAYLIST-TYPE:VOD\n");
 
@@ -483,12 +483,13 @@ impl HlsEngine {
         target_audio_codec: &str,
         target_video_codec: &str,
         audio_stream_index: Option<usize>,
-    ) -> Result<tokio::process::Child> {
+        is_hdr: bool,
+    ) -> anyhow::Result<tokio::process::Child> {
         let profile_key = Self::probe_hwaccel().await;
         let profiles = Self::get_hw_profiles();
         let profile = profiles.get(profile_key);
 
-        let mut cmd = Command::new("ffmpeg");
+        let mut cmd = tokio::process::Command::new("ffmpeg");
 
         // Input Args (from profile or default)
         if let Some(p) = profile {
@@ -568,9 +569,9 @@ impl HlsEngine {
             cmd.args(["-c:v", encoder]);
 
             // 2. Add Profile Output Args (bitrate, bufsize, etc)
-            // Replace placeholders: {bitrate} -> 4M, {bufsize} -> 8M
+            // Replace placeholders: {bitrate} -> 20M, {bufsize} -> 40M
             for arg in &p.extra_output_args {
-                let val = arg.replace("{bitrate}", "4M").replace("{bufsize}", "8M");
+                let val = arg.replace("{bitrate}", "20M").replace("{bufsize}", "40M");
                 cmd.arg(val);
             }
 
@@ -594,6 +595,15 @@ impl HlsEngine {
             // 5. Scaling / Filters
             // Construct -vf: "format=nv12,hwupload" or "scale_cuda..."
             let mut filters = Vec::new();
+
+            // HDR Tone Mapping (if source is HDR/10-bit)
+            // MUST happen before format conversion if possible, or part of it
+            if is_hdr {
+                tracing::info!("Applying HDR Tone Mapping (BT.2020 -> BT.709)");
+                // zscale is better but often missing. colorspace is standard.
+                // We use a complex filter chain usually, but for simple transcoding:
+                filters.push("colorspace=all=bt709:trc=bt709:format=yuv420p".to_string());
+            }
             
             // VAAPI speciial handling
             if p.name == "vaapi" {
@@ -607,9 +617,9 @@ impl HlsEngine {
             }
 
             // Add standard HLS flags
-            cmd.args(["-g", "120", "-sc_threshold", "0"]);
+            cmd.args(["-g", "60", "-sc_threshold", "0"]);
             if p.name.contains("vaapi") || p.name.contains("qsv") {
-                 cmd.args(["-keyint_min", "120"]);
+                 cmd.args(["-keyint_min", "60"]);
             }
 
              if !filters.is_empty() {
@@ -623,8 +633,8 @@ impl HlsEngine {
                 "-pix_fmt", "yuv420p",
                 "-preset", "ultrafast",
                 "-tune", "zerolatency",
-                "-g", "120",
-                "-keyint_min", "120",
+                "-g", "60",
+                "-keyint_min", "60",
                 "-sc_threshold", "0",
                 "-profile:v", "high",
                 "-level", "4.1",

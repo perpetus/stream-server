@@ -44,6 +44,8 @@ impl LibtorrentBackend {
             proxy_host: String::new(),
             proxy_port: 0,
             proxy_type: 0,
+            announce_to_all_trackers: true,
+            announce_to_all_tiers: true,
         };
 
         tracing::info!(
@@ -116,6 +118,8 @@ impl LibtorrentBackend {
             proxy_host: String::new(),
             proxy_port: 0,
             proxy_type: 0,
+            announce_to_all_trackers: true,
+            announce_to_all_tiers: true,
         };
         
         if let Err(e) = session.apply_settings(&new_settings) {
@@ -165,7 +169,8 @@ impl LibtorrentBackend {
                         // Rule 2: Periodic Re-announce (every 5 minutes)
                         let now = std::time::Instant::now();
                         let last_announce = last_reannounce.entry(handle.info_hash()).or_insert(now);
-                        if now.duration_since(*last_announce) > std::time::Duration::from_secs(300) {
+                        // Aggressive re-announce: every 60 seconds (was 300)
+                        if now.duration_since(*last_announce) > std::time::Duration::from_secs(60) {
                             force = true;
                             *last_announce = now;
                         }
@@ -358,6 +363,7 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
                     path: f.path.to_string(),
                     length: f.size as u64,
                     offset: file_offset,
+                    downloaded: f.downloaded as u64,
                 }
             })
             .collect();
@@ -585,9 +591,6 @@ impl LibtorrentFileStream {
             return;
         }
 
-        // AGGRESSIVE DE-PRIORITIZATION of old window
-        // If we moved to a new piece (seek or playback), cancel urgency for the old window.
-        // This is the manual, safe alternative to `clear_piece_deadlines()`.
         if self.last_priorities_piece != -1 {
              let old_start = self.last_priorities_piece;
              // Increase cleanup range to cover max possible window (urgent + strict buffer = ~130)
@@ -665,16 +668,15 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
                     tracing::debug!("poll_read: blocking for piece {} (pos={})", piece, pos);
                 }
 
-                // Ensure we prioritize this piece (redundant with set_priorities but safe)
-                // Deadline 0 is usually interpreted as "no deadline" (infinite) by libtorrent
-                // We want ASAP, so we use a small value like 1ms (was 10ms)
-                self.handle.set_piece_deadline(piece, 1);
+                // REMOVED: Do NOT reset deadline here. It resets the timer in libtorrent.
+                // set_priorities() already set the deadline for this piece.
+                // Letting libtorrent manage the existing deadline is correct.
 
                 // Schedule a wakeup to check again
-                // Using 10ms for highly responsive polling during buffering
+                // Using 50ms for slightly less aggressive polling
                 let waker = cx.waker().clone();
                 tokio::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     waker.wake();
                 });
                 return std::task::Poll::Pending;

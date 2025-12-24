@@ -45,6 +45,10 @@ mod ffi {
         proxy_port: i32,
         /// Proxy type (0=none, 1=socks4, 2=socks5, 3=http, 4=i2p)
         proxy_type: i32,
+        /// Announce to all trackers in a tier
+        announce_to_all_trackers: bool,
+        /// Announce to all tiers
+        announce_to_all_tiers: bool,
     }
 
     /// Torrent addition parameters

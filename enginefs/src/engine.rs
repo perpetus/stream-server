@@ -138,8 +138,12 @@ impl<H: TorrentHandle> Engine<H> {
 
         // Get stream info for the guessed file
         if guessed_file_idx < stats.files.len() {
-            stats.stream_name = stats.files[guessed_file_idx].name.clone();
-            stats.stream_len = stats.files[guessed_file_idx].length;
+            let file = &stats.files[guessed_file_idx];
+            stats.stream_name = file.name.clone();
+            stats.stream_len = file.length;
+            if file.length > 0 {
+                stats.stream_progress = (file.downloaded as f64) / (file.length as f64);
+            }
         }
 
         stats

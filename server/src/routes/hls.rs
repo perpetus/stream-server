@@ -551,6 +551,7 @@ async fn get_segment(
         target_audio_codec,
         target_video_codec,
         audio_track_idx, // Use scraped audio stream index if available, otherwise default (None)
+        is_10bit,        // Use 10-bit detection as proxy for HDR
     )
     .await
     {

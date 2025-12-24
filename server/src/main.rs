@@ -240,6 +240,16 @@ async fn main() -> anyhow::Result<()> {
                 tracing::info!("Shutdown signal received from TUI, shutting down");
             }
         }
+        
+        // FORCE EXIT TIMER
+        // Libtorrent often hangs on shutdown trying to contact trackers.
+        // We give the graceful shutdown 1 second to finish, otherwise we pull the plug.
+        // This stops the "hanging terminal" experience.
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            tracing::warn!("Shutdown taking too long, forcing exit...");
+            std::process::exit(0);
+        });
     };
 
     // HTTPS Server (Port 12470)

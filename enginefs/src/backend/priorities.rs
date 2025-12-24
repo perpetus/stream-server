@@ -60,8 +60,8 @@ pub fn calculate_priorities(
     // Parameters for window sizing
     let (urgent_window, buffer_window, max_buffer_pieces) = if config.enabled {
         let max_pieces = (config.size / piece_length) as i32;
-        // Urgent: 30 pieces (~30-100MB depending on piece size). Enough for 30s-1m of video.
-        let urgent = 30;
+        // Urgent: 60 pieces (~60-200MB depending on piece size). Increased for buffer health.
+        let urgent = 60;
         // Buffer: Up to 100 extra pieces, but clamped by cache size
         // We ensure we don't use more than `max_pieces` total in the window
         let remaining_for_buffer = max_pieces.saturating_sub(urgent);
@@ -76,7 +76,18 @@ pub fn calculate_priorities(
     };
 
     let start_piece = current_piece;
-    let total_window = urgent_window + buffer_window;
+    
+    // Dynamic Head Window Calculation
+    // Target 100MB Buffer (conservative 10Mbps stream = ~80s, high bitrate = ~20s)
+    let target_head_bytes = 100 * 1024 * 1024; // 100 MB
+    let mut head_window = (target_head_bytes / piece_length) as i32;
+    if head_window < 5 { head_window = 5; } // Minimum safety defaults
+    if head_window > 200 { head_window = 200; } // Cap to proper sanity limit (was 30)
+    
+    // Urgent window must be at least head window + some body
+    let effective_urgent = urgent_window.max(head_window + 10);
+    
+    let total_window = effective_urgent + buffer_window;
     if total_window == 0 {
         return priorities;
     }
@@ -101,24 +112,29 @@ pub fn calculate_priorities(
         
         let deadline = if priority > 1 {
             // High Priority: aggressively low deadlines
-            // 1ms for the first few pieces, then 10ms
-            if distance < 5 { 1 } else { 10 }
+            // 200ms
+            200
         } else {
             // Normal Priority
-            if distance < 5 {
-                // HEAD (Urgent): Strict Gradient
-                // Forces sequential download for instant seeking
-                // 0->1ms, 1->5ms, 2->10ms, 3->15ms, 4->20ms
-                if distance == 0 { 1 } else { distance * 5 }
-            } else if distance < urgent_window {
-                // BODY (Urgent): Fast (10ms)
-                // Keeps the pipe full
-                10
+            if distance < 3 {
+                // CRITICAL HEAD (First ~5MB): Absolute Priority
+                // Forces strict sequential ordering for the very first pieces.
+                // 100ms base. This must win against everything else.
+                100 + (distance * 100)
+            } else if distance < head_window {
+                // HEAD WINDOW (~100MB): High but Non-Blocking Priority
+                // We want this fast, but NOT at the expense of the critical head.
+                // Base: 2000ms (2 seconds). This allows the first pieces to saturate the link.
+                // Gradient: +20ms per piece to keep order.
+                2000 + (distance * 20)
+            } else if distance < effective_urgent {
+                // BODY (Urgent): Background Fill
+                // 5000ms (5 seconds). Keeps the pipe full but yields to head.
+                5000
             } else {
-                // TAIL (Buffer): Background (Stepped)
-                // Only applies if buffering is enabled
-                // 50ms base + gradient to allow aggregation
-                50 + (distance - urgent_window) * 10
+                // TAIL (Buffer): Background Aggregation
+                // 10s+
+                10000 + (distance - urgent_window) * 100
             }
         };
 

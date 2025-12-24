@@ -195,6 +195,7 @@ impl TorrentHandle for LibrqbitHandle {
                         path: filename,
                         length: f.len,
                         offset,
+                        downloaded: 0, // TODO: Implement per-file progress for librqbit if needed
                     });
                     total_size += f.len;
                     offset += f.len;

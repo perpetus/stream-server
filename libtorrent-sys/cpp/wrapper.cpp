@@ -115,6 +115,8 @@ std::unique_ptr<Session> create_session(SessionSettings const& settings) {
     pack.set_bool(lt::settings_pack::enable_upnp, settings.enable_upnp);
     pack.set_bool(lt::settings_pack::enable_natpmp, settings.enable_natpmp);
     pack.set_bool(lt::settings_pack::anonymous_mode, settings.anonymous_mode);
+    pack.set_bool(lt::settings_pack::announce_to_all_trackers, settings.announce_to_all_trackers);
+    pack.set_bool(lt::settings_pack::announce_to_all_tiers, settings.announce_to_all_tiers);
     
     // Connection limits
     if (settings.max_connections > 0)
@@ -206,6 +208,8 @@ void session_apply_settings(Session& session, SessionSettings const& settings) {
     pack.set_bool(lt::settings_pack::enable_lsd, settings.enable_lsd);
     pack.set_bool(lt::settings_pack::enable_upnp, settings.enable_upnp);
     pack.set_bool(lt::settings_pack::enable_natpmp, settings.enable_natpmp);
+    pack.set_bool(lt::settings_pack::announce_to_all_trackers, settings.announce_to_all_trackers);
+    pack.set_bool(lt::settings_pack::announce_to_all_tiers, settings.announce_to_all_tiers);
     if (settings.download_rate_limit >= 0)
         pack.set_int(lt::settings_pack::download_rate_limit, settings.download_rate_limit);
     if (settings.upload_rate_limit >= 0)
