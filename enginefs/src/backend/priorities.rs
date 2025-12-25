@@ -25,20 +25,10 @@ pub struct PriorityItem {
 /// # Arguments
 /// * `current_piece` - The piece index corresponding to the current playback position.
 /// * `total_pieces` - Total number of pieces in the torrent.
-/// // * `piece_length` - Size of one piece in bytes.
-/// * `config` - Cache configuration (size and enabled status).
-/// 
-/// # Returns
-/// A vector of `PriorityItem` containing (piece_idx, deadline). 
-/// Deadlines are in milliseconds. 0 means no deadline (normal priority).
-/// Calculates piece priorities based on current position and cache configuration.
-/// 
-/// # Arguments
-/// * `current_piece` - The piece index corresponding to the current playback position.
-/// * `total_pieces` - Total number of pieces in the torrent.
-/// // * `piece_length` - Size of one piece in bytes.
+/// * `piece_length` - Size of one piece in bytes.
 /// * `config` - Cache configuration (size and enabled status).
 /// * `priority` - Priority level (0-255). 0 or 1 is normal, >1 is high priority.
+/// * `download_speed` - Current download speed in bytes/sec (used for dynamic buffering).
 /// 
 /// # Returns
 /// A vector of `PriorityItem` containing (piece_idx, deadline). 
@@ -49,6 +39,7 @@ pub fn calculate_priorities(
     piece_length: u64,
     config: &EngineCacheConfig,
     priority: u8,
+    download_speed: u64,
 ) -> Vec<PriorityItem> {
     let mut priorities = Vec::new();
 
@@ -77,12 +68,21 @@ pub fn calculate_priorities(
 
     let start_piece = current_piece;
     
-    // Dynamic Head Window Calculation
-    // Target 100MB Buffer (conservative 10Mbps stream = ~80s, high bitrate = ~20s)
-    let target_head_bytes = 100 * 1024 * 1024; // 100 MB
+    // Dynamic Head Window Calculation based on download speed
+    // Target: Buffer enough data for N seconds of playback startup
+    // Formula: target_bytes = max(speed * target_seconds, minimum_bytes)
+    let target_buffer_seconds = 10; // Target 10 seconds of buffer for smooth startup
+    let minimum_buffer_bytes = 50 * 1024 * 1024u64; // Minimum 50MB regardless of speed
+    let maximum_buffer_bytes = 200 * 1024 * 1024u64; // Maximum 200MB to avoid over-buffering
+    
+    let speed_based_bytes = download_speed.saturating_mul(target_buffer_seconds);
+    let target_head_bytes = speed_based_bytes
+        .max(minimum_buffer_bytes)
+        .min(maximum_buffer_bytes);
+    
     let mut head_window = (target_head_bytes / piece_length) as i32;
     if head_window < 5 { head_window = 5; } // Minimum safety defaults
-    if head_window > 200 { head_window = 200; } // Cap to proper sanity limit (was 30)
+    if head_window > 200 { head_window = 200; } // Cap to proper sanity limit
     
     // Urgent window must be at least head window + some body
     let effective_urgent = urgent_window.max(head_window + 10);
@@ -122,7 +122,7 @@ pub fn calculate_priorities(
                 // 100ms base. This must win against everything else.
                 100 + (distance * 100)
             } else if distance < head_window {
-                // HEAD WINDOW (~100MB): High but Non-Blocking Priority
+                // HEAD WINDOW (dynamic based on speed): High but Non-Blocking Priority
                 // We want this fast, but NOT at the expense of the critical head.
                 // Base: 2000ms (2 seconds). This allows the first pieces to saturate the link.
                 // Gradient: +20ms per piece to keep order.
@@ -147,6 +147,7 @@ pub fn calculate_priorities(
     priorities
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,7 +159,7 @@ mod tests {
             enabled: false,
         };
         let piece_len = 1024 * 1024; // 1MB
-        let priorities = calculate_priorities(100, 1000, piece_len, &config, 1);
+        let priorities = calculate_priorities(100, 1000, piece_len, &config, 1, 10 * 1024 * 1024);
 
         // Window size 10 (urgent) + 0 (buffer) = 10.
         // Indices 100..109. Count 10.
@@ -177,7 +178,7 @@ mod tests {
             enabled: true,
         };
         let piece_len = 1024 * 1024; // 1MB
-        let priorities = calculate_priorities(0, 1000, piece_len, &config, 1);
+        let priorities = calculate_priorities(0, 1000, piece_len, &config, 1, 10 * 1024 * 1024);
 
         // Window = 30 urgent + 100 buffer = 130 pieces total
         // 1GB cache >>> 130MB, so no clamping
@@ -206,7 +207,7 @@ mod tests {
         // prioritized logic: urgent=30, buffer=0. 
         // Max allow = 20.
         
-        let priorities = calculate_priorities(0, 1000, piece_len, &config, 1);
+        let priorities = calculate_priorities(0, 1000, piece_len, &config, 1, 10 * 1024 * 1024);
         
         // Should be clamped to 20 items
         assert_eq!(priorities.len(), 20);

@@ -74,7 +74,10 @@ pub struct StatsFile {
     pub length: u64,
     pub offset: u64,
     pub downloaded: u64,
+    /// Progress 0.0 to 1.0 (from C++ file_progress)
+    pub progress: f64,
 }
+
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]

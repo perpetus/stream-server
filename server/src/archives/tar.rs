@@ -1,9 +1,10 @@
-use super::{ArchiveEntry, ArchiveReader};
+use super::{ArchiveEntry, ArchiveReader, AsyncSeekableReader};
 use anyhow::{anyhow, Result};
-use std::fs::File;
-use std::io::{Read, Seek};
 use std::path::PathBuf;
-use tar::Archive;
+use tokio::fs::File;
+use tokio::io::{AsyncRead, AsyncSeek, AsyncSeekExt};
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 pub struct TarHandler {
     path: PathBuf,
@@ -15,110 +16,162 @@ impl TarHandler {
     }
 }
 
+#[async_trait::async_trait]
 impl ArchiveReader for TarHandler {
-    fn list_files(&self) -> Result<Vec<ArchiveEntry>> {
-        let file = File::open(&self.path)?;
-        let mut archive = Archive::new(file);
-        let mut entries = Vec::new();
-
-        for file in archive.entries()? {
-            let file = file?;
-            let path = file.path()?.to_string_lossy().to_string();
-            let size = file.size();
-            let is_dir = file.header().entry_type().is_dir();
-
-            entries.push(ArchiveEntry {
-                path,
-                size,
-                is_dir,
-            });
-        }
-        Ok(entries)
+    async fn list_files(&self) -> Result<Vec<ArchiveEntry>> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let file = std::fs::File::open(&path)?;
+            let mut archive = tar::Archive::new(file);
+            let mut entries = Vec::new();
+            
+            for file in archive.entries()? {
+                let file = file?;
+                entries.push(ArchiveEntry {
+                    path: file.path()?.to_string_lossy().to_string(),
+                    size: file.size(),
+                    is_dir: file.header().entry_type().is_dir(),
+                });
+            }
+            Ok(entries)
+        }).await?
     }
 
-    fn open_file(&self, path: &str) -> Result<Box<dyn super::SeekableReader>> {
-        let file = File::open(&self.path)?;
-        let mut archive = Archive::new(file);
+    async fn open_file(&self, path: &str) -> Result<Box<dyn AsyncSeekableReader>> {
+        // For TAR, we need to find the offset and size.
+        // We can't jump directly without index.
+        // Linear scan is needed (unfortunately, typical for TAR).
+        // Optimization: Cache index? For now, scan.
         
-        for entry in archive.entries()? {
-            let entry = entry?;
-            if entry.path()?.to_string_lossy() == path {
-                let offset = entry.raw_file_position();
-                let size = entry.size();
-                return Ok(Box::new(RawFileSlice::new(self.path.clone(), offset, size)?));
+        let path_clone = self.path.clone();
+        let target_path = path.to_string();
+        
+        // Use spawn_blocking to scan because `tar` crate is sync
+        let (offset, size) = tokio::task::spawn_blocking(move || -> Result<(u64, u64)> {
+            let file = std::fs::File::open(&path_clone)?;
+            let mut archive = tar::Archive::new(file);
+             for file in archive.entries()? {
+                let file = file?;
+                if file.path()?.to_string_lossy() == target_path {
+                     return Ok((file.raw_file_position(), file.size()));
+                }
             }
-        }
-        
-        Err(anyhow!("File not found in TAR archive"))
+            Err(anyhow!("File not found in TAR archive"))
+        }).await??;
+
+        let slice = AsyncRawFileSlice::new(self.path.clone(), offset, size).await?;
+        Ok(Box::new(slice))
     }
 }
 
-struct RawFileSlice {
+pub struct AsyncRawFileSlice {
     file: File,
     offset: u64,
     size: u64,
     pos: u64,
 }
 
-impl RawFileSlice {
-    fn new(path: PathBuf, offset: u64, size: u64) -> Result<Self> {
-        let mut file = File::open(path)?;
-        use std::io::Seek;
-        file.seek(std::io::SeekFrom::Start(offset))?;
+impl AsyncRawFileSlice {
+    pub async fn new(path: PathBuf, offset: u64, size: u64) -> Result<Self> {
+        let mut file = File::open(path).await?;
+        file.seek(tokio::io::SeekFrom::Start(offset)).await?;
         Ok(Self { file, offset, size, pos: 0 })
     }
 }
 
-impl Read for RawFileSlice {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+impl AsyncRead for AsyncRawFileSlice {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
         if self.pos >= self.size {
-            return Ok(0);
+            return Poll::Ready(Ok(()));
         }
-        let max_read = (self.size - self.pos) as usize;
-        let buf_len = buf.len().min(max_read);
         
-        // Ensure we are reading from the correct physical position
-        // Since we share the file handle (or if seek moved it), we should seek before read if we want to be safe,
-        // or assume we own the cursor.
-        // But since we impl Seek, we might have moved the cursor.
-        // Actually, let's just make sure.
-        use std::io::Seek;
-        self.file.seek(std::io::SeekFrom::Start(self.offset + self.pos))?;
+        let remaining = (self.size - self.pos) as usize;
+        let want = buf.remaining().min(remaining);
         
-        let read_bytes = self.file.read(&mut buf[0..buf_len])?;
-        self.pos += read_bytes as u64;
-        Ok(read_bytes)
+        if want == 0 {
+             return Poll::Ready(Ok(()));
+        }
+        
+        // We need to limit the read.
+        // ReadBuf doesn't support `take` easily in poll without wrapper.
+        // We can assume file won't read past EOF if we seeked correctly?
+        // But the underlying file is larger than our slice.
+        // So we MUST limit.
+        
+        let mut sub_buf = buf.take(want);
+        let start_filled = sub_buf.filled().len();
+        
+        let poll = Pin::new(&mut self.file).poll_read(cx, &mut sub_buf);
+        
+        match poll {
+            Poll::Ready(Ok(())) => {
+                let n = sub_buf.filled().len() - start_filled;
+                self.pos += n as u64;
+                Poll::Ready(Ok(()))
+            }
+            other => other,
+        }
     }
 }
 
-impl Seek for RawFileSlice {
-    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
-        use std::io::SeekFrom;
-        let new_pos = match pos {
-            SeekFrom::Start(p) => p,
-            SeekFrom::End(p) => {
-                if p < 0 {
-                    self.size.saturating_sub(p.abs() as u64)
-                } else {
-                    self.size + p as u64
-                }
-            },
-            SeekFrom::Current(p) => {
-                 let current = self.pos as i64;
-                 if current + p < 0 {
-                     return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid seek"));
+impl AsyncSeek for AsyncRawFileSlice {
+    fn start_seek(mut self: Pin<&mut Self>, position: std::io::SeekFrom) -> std::io::Result<()> {
+        let new_pos = match position {
+            std::io::SeekFrom::Start(p) => p,
+            std::io::SeekFrom::End(p) => {
+                 if p < 0 {
+                     self.size.saturating_sub(p.abs() as u64)
+                 } else {
+                     self.size + p as u64
                  }
-                 (current + p) as u64
+            },
+            std::io::SeekFrom::Current(p) => {
+                 let current = self.pos as i64;
+                 let new_p = current + p;
+                 if new_p < 0 { return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Negative seek")); }
+                 new_p as u64
             }
         };
-
-        if new_pos > self.size {
-             // Clamping? Or allow? Standard files allow holes.
-             // We'll just allow it, read will return 0.
+        
+        // Check bounds (optional, but good)
+        // Set pos.
+        // We need to seek the underlying file to offset + new_pos
+        
+        // AsyncSeek works with `start_seek` then `poll_complete`.
+        // We calculate target absolute position.
+        let target = self.offset + new_pos;
+        match Pin::new(&mut self.file).start_seek(std::io::SeekFrom::Start(target)) {
+            Ok(()) => {
+                // If successful, we update local pos? 
+                // Wait, logic: `start_seek` prepares. `poll_complete` confirms.
+                // We shouldn't update `pos` until `poll_complete` returns `Ready`.
+                // But `start_seek` requires we calculated `target` from `position`.
+                // `File::start_seek` doesn't know about our "virtual" pos if we used `Current` or `End`.
+                // EXCEPT we mapped everything to `Start` above!
+                Ok(())
+            }
+            Err(e) => Err(e)
         }
+    }
 
-        self.pos = new_pos;
-        Ok(new_pos)
+    fn poll_complete(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<u64>> {
+        match Pin::new(&mut self.file).poll_complete(cx) {
+            Poll::Ready(Ok(actual_abs_pos)) => {
+                // actual_abs_pos is relative to physical file start.
+                // We map back to slice relative.
+                if actual_abs_pos < self.offset {
+                    // This creates a weird state, but ok.
+                    self.pos = 0; 
+                } else {
+                    self.pos = actual_abs_pos - self.offset;
+                }
+                Poll::Ready(Ok(self.pos))
+            }
+            other => other,
+        }
     }
 }
-

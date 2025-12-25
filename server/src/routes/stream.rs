@@ -140,6 +140,8 @@ pub async fn stream_video(
         let content_length = end - start + 1;
 
         let mut res_headers = header::HeaderMap::new();
+        
+        // Detect file type
         let mime = if name.ends_with(".mp4") {
             "video/mp4"
         } else if name.ends_with(".mkv") {
@@ -175,7 +177,12 @@ pub async fn stream_video(
         } else {
             "application/octet-stream"
         };
+        
+        // Log detected file type
+        tracing::info!("Media file detected: {} ({})", name, mime);
+        
         res_headers.insert(header::CONTENT_TYPE, mime.parse().unwrap());
+
         res_headers.insert(header::CONTENT_LENGTH, content_length.into());
         res_headers.insert(header::ACCEPT_RANGES, "bytes".parse().unwrap());
         res_headers.insert(

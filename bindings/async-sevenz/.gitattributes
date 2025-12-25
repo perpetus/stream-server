@@ -1,0 +1,4 @@
+vendor/** linguist-vendored
+vendor/7zip/** linguist-vendored
+src/cpp/guids.cpp linguist-vendored
+src/cpp/stream.cpp linguist-vendored

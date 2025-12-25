@@ -1,0 +1,18 @@
+# Build artifacts
+/target
+Cargo.lock
+
+# Logs
+*.log
+*_log.txt
+*_log_verify.txt
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

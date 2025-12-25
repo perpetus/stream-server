@@ -16,7 +16,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1.0.216", features = ["derive"] }
 serde_json = "1.0.133"
 anyhow = "1.0"
-tokio-util = { version = "0.7.17", features = ["io"] }
+tokio-util = { version = "0.7.17", features = ["io", "compat"] }
 hex = "0.4"
 librqbit = { version = "8.1.1", optional = true }
 if-addrs = "0.14.0"
@@ -24,13 +24,14 @@ urlencoding = "2.1"
 regex = "1.11"
 reqwest = { version = "0.12.26", features = ["json", "stream"] }
 futures-util = "0.3.31"
-zip = "2.0"
+async-trait = "0.1.89"
+async_zip = { version = "0.0.18", features = ["deflate", "tokio"] }
 base64 = "0.22.1"
 walkdir = "2.5.0"
 url = "2.5.7"
 rusty_ytdl = "0.7.4"
 mime_guess = "2.0.5"
-unrar = "0.5.8"
+async-rar = { path = "../bindings/async-rar" }
 lz-str = "0.2.1"
 tempfile = "3.23.0"
 mimalloc = { version = "0.1.48", default-features = false }
@@ -42,7 +43,7 @@ crossbeam-channel = "0.5.13"
 notify = { version = "8.2.0", default-features = false, features = [
     "macos_kqueue",
 ] }
-sevenz-rust = "0.6"
+
 dirs = "6.0"
 dashmap = "6.1.0"
 tar = "0.4.44"
@@ -56,6 +57,17 @@ async-channel = "2.5.0"
 bytes = "1.11.0"
 axum-server = { version = "0.8.0", features = ["tls-rustls"] }
 ssdp-client = "2.1.0"
+tao = "0.34.5"
+tray-icon = "0.21.2"
+fslock = "0.2.1"
+open = "5.3.3"
+image = "0.25.9"
+zip = "7.0.0"
+async-sevenz = { path = "../bindings/async-sevenz" }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = ["Win32_System_Console"] }
+
 
 [features]
 default = ["libtorrent"]

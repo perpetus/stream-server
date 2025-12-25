@@ -2,7 +2,9 @@ use anyhow::{Context, Result};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::process::Stdio;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use std::pin::Pin;
+use std::task::Poll;
+use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Command;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -95,6 +97,47 @@ pub struct TranscodeProfile {
     pub preset: Option<&'static str>,
     pub pixel_format: Option<&'static str>, // e.g., nv12, yuv420p
     pub scale_filter: Option<&'static str>, // e.g., scale_cuda, scale_vaapi
+}
+
+#[derive(Debug)]
+pub struct TranscodeProcess {
+    pub inner: tokio::process::Child,
+}
+
+impl Drop for TranscodeProcess {
+    fn drop(&mut self) {
+        // Kill the ffmpeg process when the handle is dropped
+        let _ = self.inner.start_kill();
+        tracing::debug!("TranscodeProcess dropped, killed ffmpeg process");
+    }
+}
+
+impl TranscodeProcess {
+    pub async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.inner.wait().await
+    }
+}
+
+pub struct TranscodeStream {
+    _process: TranscodeProcess,
+    stdout: tokio::process::ChildStdout,
+}
+
+impl TranscodeStream {
+    pub fn new(mut process: TranscodeProcess) -> Option<Self> {
+        let stdout = process.inner.stdout.take()?;
+        Some(Self { _process: process, stdout })
+    }
+}
+
+impl AsyncRead for TranscodeStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stdout).poll_read(cx, buf)
+    }
 }
 
 impl HlsEngine {
@@ -597,7 +640,7 @@ impl HlsEngine {
         is_hdr: bool,
         is_browser: bool,  // Use fMP4 for browser, MPEG-TS for native
         config: &TranscodeConfig, 
-    ) -> anyhow::Result<tokio::process::Child> {
+    ) -> anyhow::Result<TranscodeProcess> {
         let profile_key = Self::probe_hwaccel().await;
         let profiles = Self::get_hw_profiles();
         let profile = profiles.get(profile_key);
@@ -782,7 +825,6 @@ impl HlsEngine {
                  }
             }
 
-            // 3. Add Config Specific Flags (Output flags)
             if !config.ffmpeg_flags.is_empty() {
                 cmd.args(&config.ffmpeg_flags);
             }
@@ -797,7 +839,9 @@ impl HlsEngine {
             // 5. Scaling / Filters
             let mut filters = Vec::new();
 
-            // HDR Tone Mapping
+
+
+
             if is_hdr {
                 tracing::info!("Applying HDR Tone Mapping (BT.2020 -> BT.709)");
                 filters.push("colorspace=all=bt709:trc=bt709:format=yuv420p".to_string());
@@ -887,6 +931,6 @@ impl HlsEngine {
         tracing::info!("Running ffmpeg command: ffmpeg {}", args.join(" "));
 
         let child = cmd.spawn().context("Failed to spawn ffmpeg transcoder")?;
-        Ok(child)
+        Ok(TranscodeProcess { inner: child })
     }
 }

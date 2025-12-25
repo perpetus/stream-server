@@ -634,7 +634,7 @@ async fn get_segment(
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
 
-    let stdout = match child.stdout {
+    let stdout = match enginefs::hls::TranscodeStream::new(child) {
         Some(s) => s,
         None => return (StatusCode::INTERNAL_SERVER_ERROR, "No stdout").into_response(),
     };

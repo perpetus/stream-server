@@ -1,0 +1,16 @@
+{
+	"folders": [
+		{
+			"path": "../../../../stremio-core-development"
+		},
+		{
+			"path": "../../../../stremio-web-development"
+		},
+		{
+			"path": "../../.."
+		},
+		{
+			"path": "../../../../server"
+		}
+	]
+}

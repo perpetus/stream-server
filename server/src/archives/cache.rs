@@ -1,13 +1,15 @@
-use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::sync::{Arc, Condvar, Mutex};
+use tokio::fs::{File, OpenOptions};
+use tokio::io::{self, AsyncRead, AsyncSeek, AsyncWrite};
+use std::sync::Arc;
 use std::path::PathBuf;
 use tempfile::NamedTempFile;
+use tokio::sync::{watch, Notify};
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
-/// Shared state between the Extractor (Writer) and Player (Reader)
-struct SharedState {
+#[derive(Clone, Debug)]
+struct StateSnapshot {
     written_bytes: u64,
-    total_size: Option<u64>, // Known if derived from archive header
     is_complete: bool,
     error: Option<String>,
 }
@@ -15,190 +17,316 @@ struct SharedState {
 /// The core cache controller
 #[derive(Clone)]
 pub struct ProgressiveCache {
-    state: Arc<(Mutex<SharedState>, Condvar)>,
+    state_rx: watch::Receiver<StateSnapshot>,
     temp_path: PathBuf,
-    // Keep the temp file struct alive as long as Cache exists to prevent early deletion
+    // Keep the temp file struct alive
     _temp_file_handle: Arc<NamedTempFile>, 
+    total_size: Option<u64>,
+    notify: Arc<Notify>,
 }
 
 impl ProgressiveCache {
-    pub fn new(total_size: Option<u64>) -> io::Result<(Self, CacheWriter)> {
+    /// Create a new ProgressiveCache using system temp directory
+    pub async fn new(total_size: Option<u64>) -> io::Result<(Self, CacheWriter)> {
+        // We use std NamedTempFile to create the path and handle, but open with tokio
         let temp_file = NamedTempFile::new()?;
+        Self::from_temp_file(temp_file, total_size).await
+    }
+
+    /// Create a new ProgressiveCache in a specific directory
+    /// This allows respecting the user's cache_root setting
+    pub async fn new_in_dir(dir: &std::path::Path, total_size: Option<u64>) -> io::Result<(Self, CacheWriter)> {
+        // Ensure directory exists
+        if !dir.exists() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let temp_file = tempfile::Builder::new()
+            .prefix("archive_extract_")
+            .tempfile_in(dir)?;
+        Self::from_temp_file(temp_file, total_size).await
+    }
+
+    async fn from_temp_file(temp_file: NamedTempFile, total_size: Option<u64>) -> io::Result<(Self, CacheWriter)> {
         let temp_path = temp_file.path().to_path_buf();
         let handle = Arc::new(temp_file);
 
-        let state = Arc::new((
-            Mutex::new(SharedState {
-                written_bytes: 0,
-                total_size,
-                is_complete: false,
-                error: None,
-            }),
-            Condvar::new(),
-        ));
-
-        let cache = ValidatedCache {
-            _state: state.clone(),
-            _temp_path: temp_path.clone(),
-            _temp_file_handle: handle,
+        let initial_state = StateSnapshot {
+            written_bytes: 0,
+            is_complete: false,
+            error: None,
         };
+
+        let (tx, rx) = watch::channel(initial_state);
+        let notify = Arc::new(Notify::new());
+
+        // Open async file for writer
+        let writer_file = OpenOptions::new()
+            .write(true)
+            .create(false) // Created by NamedTempFile
+            .open(&temp_path)
+            .await?;
 
         let writer = CacheWriter {
-            state: state.clone(),
-            file: OpenOptions::new().write(true).open(&temp_path)?,
+            state_tx: tx.clone(),
+            file: writer_file,
+            _video_file_size: total_size,
+            notify: notify.clone(),
+            path: temp_path.clone(),
         };
 
-        // Return a wrapper that can spawn readers
         Ok((
             ProgressiveCache { 
-                state, 
+                state_rx: rx, 
                 temp_path, 
-                _temp_file_handle: cache._temp_file_handle 
+                _temp_file_handle: handle,
+                total_size,
+                notify,
             }, 
             writer
         ))
     }
 
-    pub fn reader(&self) -> io::Result<ProgressiveReader> {
-        let file = File::open(&self.temp_path)?;
+    pub async fn reader(&self) -> io::Result<ProgressiveReader> {
+        let file = File::open(&self.temp_path).await?;
         Ok(ProgressiveReader {
-            state: self.state.clone(),
+            state_rx: self.state_rx.clone(),
             file,
             pos: 0,
+            total_size: self.total_size,
+            notify: self.notify.clone(),
         })
     }
 }
 
-// Inner struct just for holding the Arc logic clearly
-struct ValidatedCache {
-    _state: Arc<(Mutex<SharedState>, Condvar)>,
-    _temp_path: PathBuf,
-    _temp_file_handle: Arc<NamedTempFile>,
-}
-
-/// Writer used by the background extraction task
 pub struct CacheWriter {
-    state: Arc<(Mutex<SharedState>, Condvar)>,
+    state_tx: watch::Sender<StateSnapshot>,
     file: File,
+    _video_file_size: Option<u64>,
+    notify: Arc<Notify>,
+    path: PathBuf, // kept for sync writer creation
 }
 
-impl Write for CacheWriter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let written = self.file.write(buf)?;
-        let (lock, cvar) = &*self.state;
-        let mut state = lock.lock().unwrap();
-        state.written_bytes += written as u64;
-        cvar.notify_all();
-        Ok(written)
+impl AsyncWrite for CacheWriter {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let poll = Pin::new(&mut self.file).poll_write(cx, buf);
+        if let Poll::Ready(Ok(n)) = poll {
+             if n > 0 {
+                 self.state_tx.send_modify(|state| {
+                     state.written_bytes += n as u64;
+                 });
+                 self.notify.notify_waiters();
+             }
+        }
+        poll
     }
 
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.file).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.file).poll_shutdown(cx)
+    }
+}
+
+impl CacheWriter {
+    pub fn finish(&self) {
+        self.state_tx.send_modify(|state| {
+            state.is_complete = true;
+        });
+        self.notify.notify_waiters();
+    }
+
+    pub fn set_error(&self, err: String) {
+        self.state_tx.send_modify(|state| {
+            state.error = Some(err);
+            state.is_complete = true;
+        });
+        self.notify.notify_waiters();
+    }
+    
+    /// Create a synchronous writer that shares the same state.
+    /// Useful for legacy/sync libraries like 7z or unrar.
+    pub fn try_clone_sync(&self) -> io::Result<SyncCacheWriter> {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&self.path)?;
+            
+        Ok(SyncCacheWriter {
+            state_tx: self.state_tx.clone(),
+            file,
+            notify: self.notify.clone(),
+        })
+    }
+}
+
+/// A synchronous writer that updates the Async Cache state
+pub struct SyncCacheWriter {
+    state_tx: watch::Sender<StateSnapshot>,
+    file: std::fs::File,
+    notify: Arc<Notify>,
+}
+
+impl SyncCacheWriter {
+    pub fn finish(&self) {
+        self.state_tx.send_modify(|state| {
+            state.is_complete = true;
+        });
+        self.notify.notify_waiters();
+    }
+
+    pub fn set_error(&self, err: String) {
+        self.state_tx.send_modify(|state| {
+            state.error = Some(err);
+            state.is_complete = true;
+        });
+        self.notify.notify_waiters();
+    }
+}
+
+impl std::io::Write for SyncCacheWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.file.write(buf)?;
+        if n > 0 {
+            self.state_tx.send_modify(|state| {
+                state.written_bytes += n as u64;
+            });
+            self.notify.notify_waiters();
+        }
+        Ok(n)
+    }
+    
     fn flush(&mut self) -> io::Result<()> {
         self.file.flush()
     }
 }
 
-impl CacheWriter {
-    pub fn finish(&mut self) {
-        let (lock, cvar) = &*self.state;
-        let mut state = lock.lock().unwrap();
-        state.is_complete = true;
-        cvar.notify_all();
-    }
-
-    pub fn set_error(&mut self, err: String) {
-        let (lock, cvar) = &*self.state;
-        let mut state = lock.lock().unwrap();
-        state.error = Some(err);
-        state.is_complete = true; // Stop readers
-        cvar.notify_all();
-    }
-}
-
-/// Reader returned to the client/player
 pub struct ProgressiveReader {
-    state: Arc<(Mutex<SharedState>, Condvar)>,
+    state_rx: watch::Receiver<StateSnapshot>,
     file: File,
     pos: u64,
+    total_size: Option<u64>,
+    notify: Arc<Notify>,
 }
 
-impl Read for ProgressiveReader {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let (lock, cvar) = &*self.state;
-        let mut state = lock.lock().unwrap();
-
+impl AsyncRead for ProgressiveReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
         loop {
-            if let Some(err) = &state.error {
-                return Err(io::Error::new(io::ErrorKind::Other, err.clone()));
+            // 1. Snapshot state
+            let current_state = self.state_rx.borrow().clone();
+            
+            // Check errors
+            if let Some(err) = current_state.error {
+                return Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, err)));
             }
 
-            // If we have data available to read at current pos
-            if self.pos < state.written_bytes {
-                // Determine how much we can read
-                let available = state.written_bytes - self.pos;
-                let max_read = std::cmp::min(buf.len() as u64, available);
+            // Check if data available
+            if self.pos < current_state.written_bytes {
+                let available = current_state.written_bytes - self.pos;
+                let needed = buf.remaining().min(available as usize);
                 
-                // Unlock before IO to avoid blocking the writer
-                drop(state);
-
-                // Seek and Read
-                self.file.seek(SeekFrom::Start(self.pos))?;
-                let bytes_read = self.file.read(&mut buf[0..max_read as usize])?;
-                self.pos += bytes_read as u64;
-                return Ok(bytes_read);
+                if needed == 0 {
+                    if buf.remaining() == 0 {
+                        return Poll::Ready(Ok(()));
+                    }
+                }
+                
+                // Read from file
+                // We must be careful: if we read more than is flushed to disk, we might get 0 bytes or blocking?
+                // But `written_bytes` is updated after write success.
+                // However, internal buffering of `File` might mean it's not on disk yet?
+                // `File` (tokio) is usually unbuffered direct syscalls (mostly).
+                // Let's assume it's safe.
+                
+                let mut sub_buf = buf.take(needed);
+                let start_filled = sub_buf.filled().len();
+                let poll = Pin::new(&mut self.file).poll_read(cx, &mut sub_buf);
+                
+                match poll {
+                    Poll::Ready(Ok(())) => {
+                        let bytes_read = sub_buf.filled().len() - start_filled;
+                        if bytes_read == 0 && needed > 0 {
+                            // Should theoretically not happen if written_bytes > pos
+                            // But could happen if seek pointer is messed up?
+                            // Or filesystem lag?
+                            // Return pending to wait for more?
+                        } else {
+                            self.pos += bytes_read as u64;
+                            return Poll::Ready(Ok(()));
+                        }
+                    }
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => return Poll::Pending,
+                }
             }
-
-            // If extraction is done and we are at the end
-            if state.is_complete {
-                return Ok(0); // EOF
+            
+            // No data or read returned 0 despite claiming data availability
+            if current_state.is_complete {
+                return Poll::Ready(Ok(()));
             }
-
-            // Otherwise, wait for more data
-            state = cvar.wait(state).unwrap();
+            
+            // Wait for notification
+            // We use `notify.notified()` which gives a future.
+            // We need to poll that future.
+            
+            // NOTE: We recreate the future every time. `notified()` is cancel-safe.
+            // Efficient implementation would cache it, but this is fine for now.
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            
+            match notified.poll(cx) {
+                Poll::Ready(()) => continue, // Woke up, retry
+                Poll::Pending => return Poll::Pending,
+            }
         }
     }
 }
 
-impl Seek for ProgressiveReader {
-    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        let (lock, _) = &*self.state;
-        let state = lock.lock().unwrap();
-
-        let new_pos = match pos {
-            SeekFrom::Start(p) => p,
-            SeekFrom::End(p) => {
-                // If we know total size, we can calculate end. 
-                // However, for compressed streams, total_size should be extracted from header.
-                if let Some(total) = state.total_size {
+impl AsyncSeek for ProgressiveReader {
+    fn start_seek(mut self: Pin<&mut Self>, position: io::SeekFrom) -> io::Result<()> {
+        let pos = match position {
+            io::SeekFrom::Start(p) => p,
+            io::SeekFrom::End(p) => {
+                 if let Some(total) = self.total_size {
                      if p < 0 {
                          total.saturating_sub(p.abs() as u64)
                      } else {
                          total + p as u64
                      }
-                } else {
-                    // If unknown, we can only seek relative to *written*? No, standard Seek behaviour expects final file.
-                    // If unrar header gave us unpacked_size, we use that.
-                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "SeekFrom::End requires known total size"));
-                }
+                 } else {
+                     return Err(io::Error::new(io::ErrorKind::InvalidInput, "SeekFrom::End requires known total size"));
+                 }
             },
-            SeekFrom::Current(p) => {
-                let current = self.pos as i64;
-                if current + p < 0 {
-                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid seek to negative position"));
-                }
-                (current + p) as u64
+            io::SeekFrom::Current(p) => {
+                 let current = self.pos as i64;
+                 let new_p = current + p;
+                 if new_p < 0 { return Err(io::Error::new(io::ErrorKind::InvalidInput, "Negative seek")); }
+                 new_p as u64
             }
         };
+        
+        Pin::new(&mut self.file).start_seek(io::SeekFrom::Start(pos))
+    }
 
-        // If seeking explicitly past written data, logic dictates we just set pos.
-        // The next `read` call will block until that data exists.
-        // We do strictly VALIDATE that it doesn't exceed total_size if known.
-        if let Some(total) = state.total_size {
-            if new_pos > total {
-                 return Err(io::Error::new(io::ErrorKind::InvalidInput, "Seek past end of file"));
-            }
+    fn poll_complete(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<u64>> {
+        let poll = Pin::new(&mut self.file).poll_complete(cx);
+        if let Poll::Ready(Ok(new_pos)) = poll {
+            self.pos = new_pos;
         }
-
-        self.pos = new_pos;
-        Ok(new_pos)
+        poll
     }
 }

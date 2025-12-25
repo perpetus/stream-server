@@ -49,8 +49,8 @@ pub async fn scan_background(root: String, index: LocalIndex) {
                      }
                 } else if crate::archives::is_archive(path) {
                      // Archive handling
-                     if let Ok(reader) = crate::archives::get_archive_reader(path) {
-                         if let Ok(entries) = reader.list_files() {
+                     if let Ok(reader) = crate::archives::get_archive_reader(path).await {
+                         if let Ok(entries) = reader.list_files().await {
                              for entry in entries {
                                  // Skip directories
                                  if entry.is_dir { continue; }

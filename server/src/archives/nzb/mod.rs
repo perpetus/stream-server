@@ -3,7 +3,7 @@ pub mod nntp;
 pub mod session;
 pub mod stream;
 
-use crate::archives::{ArchiveEntry, ArchiveReader};
+use crate::archives::{ArchiveEntry, ArchiveReader, AsyncSeekableReader};
 use anyhow::{anyhow, Result};
 use std::path::PathBuf;
 
@@ -21,10 +21,11 @@ impl NzbHandler {
 // The HTTP payload creates a "virtual" session which might use a different struct.
 // But for consistency, `get_archive_reader` returns this.
 
+#[async_trait::async_trait]
 impl ArchiveReader for NzbHandler {
-    fn list_files(&self) -> Result<Vec<ArchiveEntry>> {
+    async fn list_files(&self) -> Result<Vec<ArchiveEntry>> {
         // Read file content
-        let content = std::fs::read_to_string(&self.path)?;
+        let content = tokio::fs::read_to_string(&self.path).await?;
         let nzb = parser::parse_nzb_xml(&content)?;
         
         // Convert nzb files to archive entries
@@ -42,7 +43,7 @@ impl ArchiveReader for NzbHandler {
         Ok(entries)
     }
 
-    fn open_file(&self, _path: &str) -> Result<Box<dyn crate::archives::SeekableReader>> {
+    async fn open_file(&self, _path: &str) -> Result<Box<dyn AsyncSeekableReader>> {
         Err(anyhow!("Direct NZB file streaming from disk not fully implemented (requires NNTP connection details)"))
     }
 }

@@ -1,161 +1,121 @@
-use super::{ArchiveEntry, ArchiveReader};
+use tokio_util::compat::TokioAsyncReadCompatExt;
+use tokio::io::BufReader;
+use super::{ArchiveEntry, ArchiveReader, AsyncSeekableReader, cache::ProgressiveCache};
 use anyhow::{anyhow, Result};
-use std::fs::File;
-use std::io::{Read, BufReader};
 use std::path::PathBuf;
-use zip::ZipArchive;
+use async_zip::tokio::read::seek::ZipFileReader;
+use tokio::fs::File;
+
+use tokio::sync::Mutex;
+use std::sync::Arc;
 
 pub struct ZipHandler {
-    path: PathBuf,
+    path: Option<PathBuf>,
+    // Wrap in Arc<Mutex<Option>> to allow taking it out in `open_file` (one-shot)
+    reader: Arc<Mutex<Option<Box<dyn AsyncSeekableReader>>>>, 
 }
 
 impl ZipHandler {
     pub fn new(path: PathBuf) -> Self {
-        Self { path }
+        Self { 
+            path: Some(path), 
+            reader: Arc::new(Mutex::new(None)) 
+        }
+    }
+    
+    pub fn new_with_reader(reader: Box<dyn AsyncSeekableReader>) -> Self {
+        Self { 
+            path: None, 
+            reader: Arc::new(Mutex::new(Some(reader))) 
+        }
     }
 }
 
+#[async_trait::async_trait]
 impl ArchiveReader for ZipHandler {
-    fn list_files(&self) -> Result<Vec<ArchiveEntry>> {
-        let file = File::open(&self.path)?;
-        let reader = BufReader::new(file);
-        let mut archive = ZipArchive::new(reader)?;
-
-        let mut entries = Vec::new();
-        for i in 0..archive.len() {
-            let file = archive.by_index(i)?;
-            entries.push(ArchiveEntry {
-                path: file.name().to_string(),
-                size: file.size(),
-                is_dir: file.is_dir(),
-            });
+    async fn list_files(&self) -> Result<Vec<ArchiveEntry>> {
+        // Limitation: list_files destroys the reader if we use `with_ident`?
+        // `with_ident` takes ownership of reader.
+        // We can't list files then open file with the same reader if it's a stream that can't be cloned.
+        // BUT `stream_file` in `routes/archive.rs` calls `get_archive_reader` then `open_file`. It does NOT call `list_files`.
+        // `list_files` is used by `list_archive_content` route which opens a NEW reader.
+        
+        let mut reader_guard = self.reader.lock().await;
+        
+        if let Some(path) = &self.path {
+            // Local file: Open fresh
+            let file = File::open(path).await?;
+            let archive = ZipFileReader::new(BufReader::new(file).compat()).await?;
+            let entries = archive.file().entries().iter().map(|e| ArchiveEntry {
+                path: e.filename().as_str().unwrap_or_default().to_string(),
+                size: e.uncompressed_size(),
+                is_dir: e.dir().unwrap_or(false),
+            }).collect();
+            Ok(entries)
+        } else if let Some(reader) = reader_guard.take() {
+             // We TAKE the reader. It is consumed.
+             // This works for "One Shot" listing.
+             // But if we want to list then open? 
+             // We can't put it back easily because `ZipFileReader` consumes it.
+             // unless we use `into_inner()`?
+             
+             let archive = ZipFileReader::new(BufReader::new(reader).compat()).await?;
+             let entries = archive.file().entries().iter().map(|e| ArchiveEntry {
+                 path: e.filename().as_str().unwrap_or_default().to_string(),
+                 size: e.uncompressed_size(),
+                 is_dir: e.dir().unwrap_or(false),
+             }).collect();
+             
+             // Put reader back? 
+             // `archive.into_inner()`             // Recover reader
+             let returned_reader = archive.into_inner().into_inner().into_inner();
+             *reader_guard = Some(returned_reader);
+             
+             Ok(entries)
+        } else {
+             Err(anyhow!("No source available or already consumed"))
         }
-        Ok(entries)
     }
 
-    fn open_file(&self, path: &str) -> Result<Box<dyn super::SeekableReader>> {
-        let file = File::open(&self.path)?;
-        let reader = BufReader::new(file);
-        let mut archive = ZipArchive::new(reader)?;
-
-        // Find the file by name to check compression and offsets
-        let zip_file = archive.by_name(path)?;
+    async fn open_file(&self, path: &str) -> Result<Box<dyn AsyncSeekableReader>> {
+        let mut reader_guard = self.reader.lock().await;
         
-        // 1. Uncompressed (Stored) - Use RawFileSlice for zero-copy streaming
-        if zip_file.compression() == zip::CompressionMethod::Stored {
-             let offset = zip_file.data_start();
-             let size = zip_file.size();
-             drop(zip_file); // release borrow
-             drop(archive); // release file
-             
-             return Ok(Box::new(RawFileSlice::new(self.path.clone(), offset, size)?));
-        }
+        let reader_box: Box<dyn AsyncSeekableReader> = if let Some(p) = &self.path {
+            Box::new(File::open(p).await?)
+        } else if let Some(r) = reader_guard.take() {
+            r
+        } else {
+            return Err(anyhow!("Archive source already consumed"));
+        };
+
+        let mut archive = ZipFileReader::new(BufReader::new(reader_box).compat()).await?;
         
-        // 2. Compressed (Deflated) - Use Progressive Extraction Cache
-        if zip_file.compression() == zip::CompressionMethod::Deflated {
-             let size = zip_file.size();
-             drop(zip_file); // Release borrow so we can move archive to thread
-             drop(archive);  // Drop validation handle
-
-             // Create Cache
-             let (cache, mut writer) = super::cache::ProgressiveCache::new(Some(size))?;
-             let path_string = path.to_string();
-             let msg_path = self.path.clone();
-
-             // Spawn Extraction Thread
-             // We need to re-open the archive in the thread because we can't easily move the ZipArchive 
-             // with the borrow checker unless we handle it very carefully.
-             // Simpler to just pass the path and look up again.
-             let archive_path = self.path.clone();
-             
-             std::thread::spawn(move || {
-                 // Re-open archive
-                 let open_res = (|| -> Result<()> {
-                     let file = File::open(&archive_path)?;
-                     let reader = BufReader::new(file);
-                     let mut archive = ZipArchive::new(reader)?;
-                     let mut zip_file = archive.by_name(&path_string)?;
-                     
-                     // Stream extraction to cache writer
-                     std::io::copy(&mut zip_file, &mut writer)?;
-                     Ok(())
-                 })();
-
-                 if let Err(e) = open_res {
-                     tracing::error!("ZIP extraction failed for {:?}: {}", msg_path, e);
+        let index = archive.file().entries().iter().position(|e| 
+            e.filename().as_str().unwrap_or_default() == path
+        ).ok_or(anyhow!("File not found in archive"))?;
+        
+        let entry = archive.file().entries().get(index).unwrap();
+        let size = entry.uncompressed_size();
+        
+        // Use ProgressiveCache for robust seeking
+        let (cache, mut writer) = ProgressiveCache::new(Some(size)).await?;
+        
+        tokio::spawn(async move {
+            let entry_reader = archive.reader_with_entry(index).await;
+            if let Ok(r) = entry_reader {
+                 use tokio_util::compat::FuturesAsyncReadCompatExt;
+                 let mut r = r.compat(); 
+                 let copy_res = tokio::io::copy(&mut r, &mut writer).await;
+                 if let Err(e) = copy_res {
                      writer.set_error(e.to_string());
                  } else {
                      writer.finish();
                  }
-             });
+             } else {
+                 writer.set_error("Failed to open entry".to_string());
+             }
+        });
 
-             // Return the reader handle immediately
-             return Ok(Box::new(cache.reader()?));
-        }
-
-        Err(anyhow!("Unsupported compression method (only Stored and Deflated supported)"))
-    }
-}
-
-struct RawFileSlice {
-    file: File,
-    offset: u64,
-    size: u64,
-    pos: u64,
-}
-
-impl RawFileSlice {
-    fn new(path: PathBuf, offset: u64, size: u64) -> Result<Self> {
-        let mut file = File::open(path)?;
-        use std::io::Seek;
-        file.seek(std::io::SeekFrom::Start(offset))?;
-        Ok(Self { file, offset, size, pos: 0 })
-    }
-}
-
-impl Read for RawFileSlice {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if self.pos >= self.size {
-            return Ok(0);
-        }
-        let max_read = (self.size - self.pos) as usize;
-        let buf_len = buf.len().min(max_read);
-        let read_bytes = self.file.read(&mut buf[0..buf_len])?;
-        self.pos += read_bytes as u64;
-        Ok(read_bytes)
-    }
-}
-
-impl std::io::Seek for RawFileSlice {
-    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
-        use std::io::SeekFrom;
-        let new_pos = match pos {
-            SeekFrom::Start(p) => p,
-            SeekFrom::End(p) => {
-                if p < 0 {
-                    self.size.saturating_sub(p.abs() as u64)
-                } else {
-                    self.size + p as u64
-                }
-            },
-            SeekFrom::Current(p) => {
-                 let current = self.pos as i64;
-                 if current + p < 0 {
-                     return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid seek"));
-                 }
-                 (current + p) as u64
-            }
-        };
-
-        if new_pos > self.size {
-             // Clamping is safer for slice reading or erroring? 
-             // Standard behavior usually allows seeking past end, but reading returns 0.
-             // We'll allow it but read will handle EOF.
-        }
-
-        // Physical seek
-        self.file.seek(SeekFrom::Start(self.offset + new_pos))?;
-        self.pos = new_pos;
-        Ok(new_pos)
+        Ok(Box::new(cache.reader().await?))
     }
 }

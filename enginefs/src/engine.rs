@@ -141,13 +141,33 @@ impl<H: TorrentHandle> Engine<H> {
             let file = &stats.files[guessed_file_idx];
             stats.stream_name = file.name.clone();
             stats.stream_len = file.length;
-            if file.length > 0 {
-                stats.stream_progress = (file.downloaded as f64) / (file.length as f64);
-            }
+            
+            // Note: stats.stream_progress is already populated by the backend 
+            // using total_wanted_done / total_wanted, which is accurate for 
+            // multi-file torrents where only the streaming file is "wanted".
+            
+            tracing::debug!(
+                "get_statistics: file_idx={} file.progress={:.2}% total_done={} stream_progress={:.2}%",
+                guessed_file_idx,
+                file.progress * 100.0,
+                stats.downloaded,
+                stats.stream_progress * 100.0
+            );
+        } else {
+
+            tracing::debug!(
+                "get_statistics: guessed_file_idx {} >= stats.files.len() {}",
+                guessed_file_idx,
+                stats.files.len()
+            );
         }
 
         stats
     }
+
+
+
+
 
     pub async fn get_file(self: &Arc<Self>, file_idx: usize, start_offset: u64, priority: u8) -> Option<FileHandle<H>> {
         self.last_accessed

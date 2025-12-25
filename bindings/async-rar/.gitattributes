@@ -1,0 +1,3 @@
+vendor/** linguist-vendored
+vendor/unrar/** linguist-vendored
+src/cpp/stubs.cpp linguist-vendored

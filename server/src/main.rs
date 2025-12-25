@@ -1,3 +1,5 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 use axum::{
     http::StatusCode,
     response::Redirect,
@@ -9,6 +11,9 @@ use state::AppState;
 use std::{net::SocketAddr, sync::Arc};
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use tao::event_loop::{ControlFlow, EventLoopBuilder};
+use tao::event::Event;
+use fslock::LockFile;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -21,10 +26,10 @@ mod tui;
 mod local_addon;
 mod archives;
 mod ssdp;
+mod tray;
 
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn run_server(mut external_shutdown_rx: tokio::sync::mpsc::Receiver<()>) -> anyhow::Result<()> {
     // Check for --tui flag
     let use_tui = std::env::args().any(|arg| arg == "--tui");
 
@@ -43,7 +48,12 @@ async fn main() -> anyhow::Result<()> {
     if let Some(layer) = tui_log_layer {
         registry.with(layer).init();
     } else {
-        registry.with(tracing_subscriber::fmt::layer()).init();
+        // Only enable console logging if we are actually in a terminal (shell environment)
+        if std::io::stdout().is_terminal() {
+             registry.with(tracing_subscriber::fmt::layer()).init();
+        } else {
+             registry.init();
+        }
     }
 
     // Check/Install FFmpeg on Windows
@@ -239,6 +249,9 @@ async fn main() -> anyhow::Result<()> {
             _ = shutdown_rx.recv() => {
                 tracing::info!("Shutdown signal received from TUI, shutting down");
             }
+            _ = external_shutdown_rx.recv() => {
+                tracing::info!("Shutdown signal received from Tray, shutting down");
+            }
         }
         
         // FORCE EXIT TIMER
@@ -282,6 +295,120 @@ async fn main() -> anyhow::Result<()> {
         .with_graceful_shutdown(shutdown)
         .await?;
 
+    Ok(())
+}
+
+use std::io::IsTerminal;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+fn main() -> anyhow::Result<()> {
+    // Try to attach to parent console (if any), so proper CLI usage still works
+    // even though we are a windows subsystem app.
+    #[cfg(windows)]
+    let attached_console = unsafe {
+        use windows::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
+        AttachConsole(ATTACH_PARENT_PROCESS).is_ok()
+    };
+    #[cfg(not(windows))]
+    let attached_console = true;
+
+    // Determine lockfile path before we start anything
+    // We typically use the temp dir or config dir
+    let lock_path = std::env::temp_dir().join("stream-server.lock");
+    let mut lockfile = LockFile::open(&lock_path)?;
+
+    if !lockfile.try_lock()? {
+        if attached_console {
+             eprintln!("Exiting, another instance is running.");
+        }
+        return Ok(());
+    }
+
+    let args: Vec<String> = std::env::args().collect();
+    // Silent mode is true if:
+    // 1. Explicitly requested via --silent
+    // 2. OR if we failed to attach to a console (implies Explorer launch)
+    let silent_mode = args.iter().any(|a| a == "--silent") || !attached_console;
+
+    // Initialize Tokio Runtime
+    let rt = tokio::runtime::Runtime::new()?;
+
+    if silent_mode {
+        let event_loop = EventLoopBuilder::<tray::UserEvent>::with_user_event().build();
+        let (mut _tray_icon, _open_id, _quit_id) = match tray::create_system_tray(&event_loop) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("Failed to create tray icon: {}", e);
+                return Err(e);
+            }
+        };
+
+        // Shared state for controlling the server thread
+        // The server thread will put its current shutdown sender here
+        let server_control: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::Sender<()>>>> = Arc::new(std::sync::Mutex::new(None));
+        let keep_running = Arc::new(AtomicBool::new(true));
+
+        let server_control_clone = server_control.clone();
+        let keep_running_clone = keep_running.clone();
+
+        // Spawn server thread with restart loop
+        std::thread::spawn(move || {
+            loop {
+                if !keep_running_clone.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                // Channel for tray -> server shutdown for this iteration
+                let (tx, rx) = tokio::sync::mpsc::channel(1);
+                
+                // Publish the sender
+                *server_control_clone.lock().unwrap() = Some(tx);
+
+                // Run server (blocking on runtime)
+                // We unwrap here because if run_server fails fatally, we might want to log it and retry or exit.
+                // For now, let's log and retry after a delay to prevent busy loops.
+                if let Err(e) = rt.block_on(run_server(rx)) {
+                    eprintln!("Server crashed: {}", e);
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                }
+
+                // Clear the sender
+                *server_control_clone.lock().unwrap() = None;
+            }
+        });
+
+        event_loop.run(move |event, _, control_flow| {
+            *control_flow = ControlFlow::Wait;
+
+            match event {
+                Event::UserEvent(e) => match e {
+                    tray::UserEvent::OpenWeb => {
+                         tray::open_stremio_web();
+                    }
+                    tray::UserEvent::Restart => {
+                        // Signal shutdown to current instance; loop will restart it since keep_running is true
+                        if let Some(tx) = server_control.lock().unwrap().take() {
+                             let _ = tx.blocking_send(());
+                        }
+                    }
+                    tray::UserEvent::Quit => {
+                        keep_running.store(false, Ordering::Relaxed);
+                        if let Some(tx) = server_control.lock().unwrap().take() {
+                            let _ = tx.blocking_send(());
+                        }
+                        *control_flow = ControlFlow::Exit;
+                    }
+                },
+                _ => ()
+            }
+        });
+    } else {
+        // Normal mode: Run on main thread (blocking), no tray
+        // Create a dummy channel for external shutdown that we hold open but never send to
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        rt.block_on(run_server(rx))?;
+    }
+    
     Ok(())
 }
 

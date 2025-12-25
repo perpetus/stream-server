@@ -1,0 +1,24 @@
+[package]
+name = "async-rar"
+version = "0.1.0"
+edition = "2024"
+description = "Async Rust bindings for UnRAR"
+license = "MIT"
+repository = "https://github.com/user/async-rar"
+keywords = ["rar", "unrar", "archive", "async", "ffi"]
+categories = ["compression", "asynchronous"]
+
+[dependencies]
+autocxx = "0.30"
+cxx = "1.0"
+tokio = { version = "1.48", features = ["rt", "sync"] }
+thiserror = "2"
+
+[build-dependencies]
+autocxx-build = "0.30"
+cc = "1.2"
+glob = "0.3"
+
+[dev-dependencies]
+tokio = { version = "1.48", features = ["rt-multi-thread", "macros"] }
+tempfile = "3"

@@ -155,6 +155,26 @@ impl LibtorrentBackend {
                 for mut handle in handles {
                     let status = handle.status();
 
+                    // --- Metadata Initialization Logic ---
+                    // For magnets, files are not known until metadata is acquired.
+                    // Once metadata is available, libtorrent defaults all files to priority 4.
+                    // We catch this and set them to 0 (skip) so the user can then start streaming a specific file.
+                    if status.has_metadata {
+                        let priorities = handle.get_file_priorities();
+                        // 4 is the libtorrent default for "normal" priority.
+                        // If ALL files are at 4, it's highly likely they haven't been initialized by us yet.
+                        if !priorities.is_empty() && priorities.iter().all(|&p| p == 4) {
+                            tracing::info!(
+                                "Monitor: Metadata acquired for '{}' ({} files). Resetting all priorities to 0 (skip).",
+                                status.name,
+                                priorities.len()
+                            );
+                            for (i, _) in priorities.iter().enumerate() {
+                                handle.set_file_priority(i as i32, 0);
+                            }
+                        }
+                    }
+
                     // --- PeerSearch Logic ---
                     {
                         let mut force = false;
@@ -268,6 +288,18 @@ impl TorrentBackend for LibtorrentBackend {
             handle.add_tracker(tracker, idx as i32);
         }
 
+        // CRITICAL: Set ALL files to priority 0 (skip) immediately
+        // This prevents downloading all 366 episodes when user only wants 1
+        // The get_file_reader() will set priority 7 for the specific file being streamed
+        let files = handle.files();
+        tracing::info!(
+            "add_torrent: Setting all {} files to priority 0 (skip) to prevent unwanted downloads",
+            files.len()
+        );
+        for (idx, _f) in files.iter().enumerate() {
+            handle.set_file_priority(idx as i32, 0);
+        }
+
         Ok(LibtorrentTorrentHandle {
             session: self.session.clone(),
             info_hash: handle.info_hash(),
@@ -349,27 +381,54 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
 
         let status = handle.status();
         let mut stats = make_engine_stats(&status);
+        let piece_length = handle.piece_length() as u64;
 
         // Populate files from the handle
         let files = handle.files();
         let mut current_offset = 0u64;
+        
         stats.files = files
             .iter()
             .map(|f| {
                 let file_offset = current_offset;
                 current_offset += f.size as u64;
+                
+                // Calculate downloaded based on pieces we have (more accurate for streaming)
+                // file_progress() returns 0 for files with priority 0 or when streaming
+                let downloaded = if f.downloaded > 0 {
+                    f.downloaded as u64
+                } else if piece_length > 0 {
+                    // Count pieces we have in this file's range
+                    let mut piece_bytes = 0u64;
+                    for piece in f.first_piece..=f.last_piece {
+                        if handle.have_piece(piece) {
+                            piece_bytes += piece_length;
+                        }
+                    }
+                    // Cap at file size (last piece may be partial)
+                    piece_bytes.min(f.size as u64)
+                } else {
+                    0
+                };
+                
                 crate::backend::StatsFile {
                     name: f.path.to_string(),
                     path: f.path.to_string(),
                     length: f.size as u64,
                     offset: file_offset,
-                    downloaded: f.downloaded as u64,
+                    downloaded,
+                    // Use C++ calculated progress which comes from file_progress()
+                    progress: f.progress as f64,
                 }
+
             })
             .collect();
 
         stats
     }
+
+
+
 
     async fn add_trackers(&self, trackers: Vec<String>) -> Result<()> {
         let session = self.session.read().await;
@@ -630,14 +689,18 @@ impl LibtorrentFileStream {
 
         // Use centralized priorities calculation
         // This handles "streaming" mode (cache disabled) vs "download" mode (cache enabled)
-        let total_pieces = self.handle.status().num_pieces;
+        let status = self.handle.status();
+        let total_pieces = status.num_pieces;
+        let download_speed = status.download_rate as u64;
         let priorities = calculate_priorities(
             current_piece,
             total_pieces,
             self.piece_length,
             &self.cache_config,
             self.priority,
+            download_speed,
         );
+
 
         for item in priorities {
              if item.piece_idx <= self.last_piece && !self.handle.have_piece(item.piece_idx) {
@@ -854,7 +917,9 @@ fn make_engine_stats(status: &TorrentStatus) -> EngineStats {
         peer_search_running: !status.is_finished,
         stream_len: status.total_size as u64,
         stream_name: status.name.to_string(),
-        stream_progress: if status.total_size > 0 {
+        stream_progress: if status.total_wanted > 0 {
+            (status.total_wanted_done as f64) / (status.total_wanted as f64)
+        } else if status.total_size > 0 {
             (status.total_done as f64) / (status.total_size as f64)
         } else {
             0.0
