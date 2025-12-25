@@ -134,7 +134,7 @@ jobs:
       - name: Install System Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential pkg-config libssl-dev libfuse2 libtorrent-rasterbar-dev libboost-dev libclang-dev
+          sudo apt-get install -y build-essential pkg-config libssl-dev libfuse2 libtorrent-rasterbar-dev libboost-dev libclang-dev libgtk-3-dev libayatana-appindicator3-dev
 
       - name: Cargo Chef Prepare
         run: cargo chef prepare --recipe-path recipe.json
@@ -215,7 +215,7 @@ jobs:
       - name: Install dependencies
         run: |
           pacman -Syu --noconfirm
-          pacman -S --noconfirm base-devel rust git openssl pkg-config libtorrent-rasterbar boost clang
+          pacman -S --noconfirm base-devel rust git openssl pkg-config libtorrent-rasterbar boost clang gtk3 libayatana-appindicator
 
       - name: Cargo Cache
         uses: actions/cache@v4
