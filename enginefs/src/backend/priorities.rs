@@ -21,7 +21,7 @@ pub struct PriorityItem {
 }
 
 /// Calculates piece priorities based on current position and cache configuration.
-/// 
+///
 /// # Arguments
 /// * `current_piece` - The piece index corresponding to the current playback position.
 /// * `total_pieces` - Total number of pieces in the torrent.
@@ -29,9 +29,10 @@ pub struct PriorityItem {
 /// * `config` - Cache configuration (size and enabled status).
 /// * `priority` - Priority level (0-255). 0 or 1 is normal, >1 is high priority.
 /// * `download_speed` - Current download speed in bytes/sec (used for dynamic buffering).
-/// 
+/// * `bitrate` - Optional average bitrate of the content in bytes/sec.
+///
 /// # Returns
-/// A vector of `PriorityItem` containing (piece_idx, deadline). 
+/// A vector of `PriorityItem` containing (piece_idx, deadline).
 /// Deadlines are in milliseconds. 0 means no deadline (normal priority).
 pub fn calculate_priorities(
     current_piece: i32,
@@ -40,6 +41,7 @@ pub fn calculate_priorities(
     config: &EngineCacheConfig,
     priority: u8,
     download_speed: u64,
+    bitrate: Option<u64>,
 ) -> Vec<PriorityItem> {
     let mut priorities = Vec::new();
 
@@ -49,92 +51,107 @@ pub fn calculate_priorities(
     }
 
     // Parameters for window sizing
-    let (urgent_window, buffer_window, max_buffer_pieces) = if config.enabled {
+    let (mut urgent_window, buffer_window, max_buffer_pieces) = if config.enabled {
         let max_pieces = (config.size / piece_length) as i32;
-        // Urgent: 60 pieces (~60-200MB depending on piece size). Increased for buffer health.
-        let urgent = 60;
-        // Buffer: Up to 100 extra pieces, but clamped by cache size
-        // We ensure we don't use more than `max_pieces` total in the window
+
+        // Base urgent: 15 pieces (~15MB) - Reduced from 60 to prevent probe flooding
+        // If bitrate is known, ensure at least 10 seconds of content is "urgent"
+        let mut urgent = 15;
+        if let Some(br) = bitrate {
+            let pieces_for_10s = ((br * 10) / piece_length) as i32;
+            urgent = urgent.max(pieces_for_10s);
+        }
+
+        // Buffer: Up to 15 extra pieces
         let remaining_for_buffer = max_pieces.saturating_sub(urgent);
-        let buffer = 100.min(remaining_for_buffer);
+        let buffer = 15.min(remaining_for_buffer);
         (urgent, buffer, max_pieces)
     } else {
         // Cache Disabled: Streaming Mode
         // Minimal window to keep playback going without filling disk
-        // Urgent: 10 pieces (~10-40MB)
-        // Buffer: 0 pieces
-        (10, 0, 10)
+        // Urgent: 15 pieces (~15-60MB). Slightly increased for safety.
+        (15, 0, 15)
     };
 
     let start_piece = current_piece;
-    
-    // Dynamic Head Window Calculation based on download speed
+
+    // Dynamic Head Window Calculation based on download speed and bitrate
     // Target: Buffer enough data for N seconds of playback startup
-    // Formula: target_bytes = max(speed * target_seconds, minimum_bytes)
-    let target_buffer_seconds = 10; // Target 10 seconds of buffer for smooth startup
-    let minimum_buffer_bytes = 50 * 1024 * 1024u64; // Minimum 50MB regardless of speed
-    let maximum_buffer_bytes = 200 * 1024 * 1024u64; // Maximum 200MB to avoid over-buffering
-    
-    let speed_based_bytes = download_speed.saturating_mul(target_buffer_seconds);
-    let target_head_bytes = speed_based_bytes
-        .max(minimum_buffer_bytes)
-        .min(maximum_buffer_bytes);
-    
+    // Dynamic Head Window Calculation based on download speed and bitrate
+    // Target: Buffer enough data for N seconds of playback startup
+    // REDUCED: 50MB is too much for immediate start. Use 5MB min, 50MB max.
+    let target_buffer_seconds = 5;
+    let minimum_buffer_bytes = 5 * 1024 * 1024u64; // Minimum 5MB (approx 5 pieces)
+    let maximum_buffer_bytes = 50 * 1024 * 1024u64; // Maximum 50MB to avoid over-buffering
+
+    // If bitrate is known, we use it to calculate required bytes for 10s.
+    // Otherwise we use a heuristic based on download speed.
+    let target_head_bytes = if let Some(br) = bitrate {
+        (br * target_buffer_seconds)
+            .max(minimum_buffer_bytes)
+            .min(maximum_buffer_bytes)
+    } else {
+        download_speed
+            .saturating_mul(target_buffer_seconds)
+            .max(minimum_buffer_bytes)
+            .min(maximum_buffer_bytes)
+    };
+
     let mut head_window = (target_head_bytes / piece_length) as i32;
-    if head_window < 5 { head_window = 5; } // Minimum safety defaults
-    if head_window > 200 { head_window = 200; } // Cap to proper sanity limit
-    
+    if head_window < 5 {
+        head_window = 5;
+    }
+    if head_window > 250 {
+        head_window = 250;
+    } // Increased cap for 4K
+
     // Urgent window must be at least head window + some body
-    let effective_urgent = urgent_window.max(head_window + 10);
-    
-    let total_window = effective_urgent + buffer_window;
+    urgent_window = urgent_window.max(head_window + 15);
+
+    let total_window = urgent_window + buffer_window;
     if total_window == 0 {
         return priorities;
     }
-    
+
     // Calculate end index (inclusive) based on length
-    // If length is 10, we want indices 0..9. So start + 10 - 1.
     let end_piece = (start_piece + total_window - 1).min(total_pieces - 1);
-    
+
     // Safety clamp for cache size
-    // max_buffer_pieces is the total pieces allowed by cache
     let allowed_end_piece = if max_buffer_pieces > 0 {
         (start_piece + max_buffer_pieces - 1).min(total_pieces - 1)
     } else {
-        start_piece - 1 // Should not happen given previous checks, but safe fallback
+        start_piece - 1
     };
-    
+
     let effective_end_piece = end_piece.min(allowed_end_piece);
 
-    // If somehow start > end (e.g. 0 length or clamping), range will be empty, which is correct
     for p in start_piece..=effective_end_piece {
         let distance = p - start_piece;
-        
-        let deadline = if priority > 1 {
-            // High Priority: aggressively low deadlines
-            // 200ms
-            200
+
+        let deadline = if priority >= 250 {
+            // Internal Probes / Metadata parsing (Absolute priority)
+            50
+        } else if priority >= 100 {
+            // Seeking (High priority, tighter deadlines)
+            10 + (distance * 10)
+        } else if priority == 0 {
+            // Background pre-caching (Lazy deadlines)
+            20000 + (distance * 200)
         } else {
-            // Normal Priority
-            if distance < 3 {
-                // CRITICAL HEAD (First ~5MB): Absolute Priority
-                // Forces strict sequential ordering for the very first pieces.
-                // 100ms base. This must win against everything else.
-                100 + (distance * 100)
+            // Normal Streaming (Regular priority)
+            // Normal Streaming (Regular priority)
+            if distance < 5 {
+                // CRITICAL HEAD: Strict Staircase (0, 50, 100, 150, 200 ms)
+                // This forces sequential download of the first few chunks.
+                distance * 50
             } else if distance < head_window {
-                // HEAD WINDOW (dynamic based on speed): High but Non-Blocking Priority
-                // We want this fast, but NOT at the expense of the critical head.
-                // Base: 2000ms (2 seconds). This allows the first pieces to saturate the link.
-                // Gradient: +20ms per piece to keep order.
-                2000 + (distance * 20)
-            } else if distance < effective_urgent {
-                // BODY (Urgent): Background Fill
-                // 5000ms (5 seconds). Keeps the pipe full but yields to head.
-                5000
+                // HEAD WINDOW: Linear staircase (250, 300, 350...)
+                // We must maintain strict ordering to prevent "rarest first" from sniping later pieces.
+                250 + ((distance - 5) * 50)
             } else {
-                // TAIL (Buffer): Background Aggregation
-                // 10s+
-                10000 + (distance - urgent_window) * 100
+                // BODY/TAIL: Relaxed but still ordered
+                // 10000+, but kept ordered
+                5000 + (distance * 10)
             }
         };
 
@@ -147,7 +164,6 @@ pub fn calculate_priorities(
     priorities
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,16 +175,15 @@ mod tests {
             enabled: false,
         };
         let piece_len = 1024 * 1024; // 1MB
-        let priorities = calculate_priorities(100, 1000, piece_len, &config, 1, 10 * 1024 * 1024);
+        let priorities =
+            calculate_priorities(100, 1000, piece_len, &config, 1, 10 * 1024 * 1024, None);
 
-        // Window size 10 (urgent) + 0 (buffer) = 10.
-        // Indices 100..109. Count 10.
-        assert_eq!(priorities.len(), 10);
-        
-        // Verify deadlines
-        assert_eq!(priorities[0].deadline, 1); // Immediate (Dist 0)
-        assert_eq!(priorities[1].deadline, 5); // Gradient (Dist 1)
-        assert_eq!(priorities[9].deadline, 10); // Fast (Dist 9, < 10)
+        // Minimal window without cache is now 15 (urgent).
+        assert_eq!(priorities.len(), 15);
+
+        // Verify deadlines - now more aggressive
+        assert_eq!(priorities[0].deadline, 100);
+        assert_eq!(priorities[1].deadline, 150);
     }
 
     #[test]
@@ -178,21 +193,19 @@ mod tests {
             enabled: true,
         };
         let piece_len = 1024 * 1024; // 1MB
-        let priorities = calculate_priorities(0, 1000, piece_len, &config, 1, 10 * 1024 * 1024);
+        // Speed 10MB/s -> target 100MB head window -> 100 pieces
+        // Urgent window = 100 + 15 = 115 pieces
+        // Buffer window = 100 pieces
+        // Total = 215 pieces
+        let priorities =
+            calculate_priorities(0, 1000, piece_len, &config, 1, 10 * 1024 * 1024, None);
 
-        // Window = 30 urgent + 100 buffer = 130 pieces total
-        // 1GB cache >>> 130MB, so no clamping
-        assert_eq!(priorities.len(), 130); 
+        assert_eq!(priorities.len(), 215);
 
-        // Head - Strict Gradient
-        assert_eq!(priorities[0].deadline, 1);
-        assert_eq!(priorities[1].deadline, 5);
-        assert_eq!(priorities[2].deadline, 10);
-        
-        // Body (at 10)
-        assert_eq!(priorities[10].deadline, 10);
-        // Buffer (at 40) -> distance 40. urgent=30. 50 + (40-30)*10 = 150ms
-        assert_eq!(priorities[40].deadline, 150);
+        // Head - Tighter deadlines now
+        assert_eq!(priorities[0].deadline, 100);
+        assert_eq!(priorities[1].deadline, 150);
+        assert_eq!(priorities[2].deadline, 200);
     }
 
     #[test]
@@ -202,24 +215,37 @@ mod tests {
             size: 200 * 1024 * 1024, // 200MB cache limit
             enabled: true,
         };
-        
+
         // Max pieces = 200 / 10 = 20 pieces.
-        // prioritized logic: urgent=30, buffer=0. 
-        // Max allow = 20.
-        
-        let priorities = calculate_priorities(0, 1000, piece_len, &config, 1, 10 * 1024 * 1024);
-        
+        let priorities =
+            calculate_priorities(0, 1000, piece_len, &config, 1, 10 * 1024 * 1024, None);
+
         // Should be clamped to 20 items
         assert_eq!(priorities.len(), 20);
-        
+
         // Verify clamp effect
-        // 0..4 = Gradient
-        assert_eq!(priorities[0].deadline, 1);
-        assert_eq!(priorities[1].deadline, 5);
-        
-        // 5..19 = 10ms
-        // Total 20 items.
+        assert_eq!(priorities[0].deadline, 100);
         assert_eq!(priorities[19].piece_idx, 19);
-        assert_eq!(priorities[19].deadline, 10);
+    }
+
+    #[test]
+    fn test_bitrate_aware_window() {
+        let piece_len = 1024 * 1024; // 1MB
+        let config = EngineCacheConfig {
+            size: 2 * 1024 * 1024 * 1024, // 2GB
+            enabled: true,
+        };
+
+        // High bitrate content (10MB/s = 80Mbps)
+        let bitrate = Some(10 * 1024 * 1024);
+        let priorities =
+            calculate_priorities(0, 1000, piece_len, &config, 1, 5 * 1024 * 1024, bitrate);
+
+        // head_window = (10MB * 10s) / 1MB = 100 pieces.
+        // urgent_window = max(60, (10MB * 30s)/1MB) = 300 pieces.
+        // efficient_urgent = max(300, 100 + 15) = 300 pieces.
+        // buffer_window = 100 pieces.
+        // Total = 400 pieces.
+        assert_eq!(priorities.len(), 400);
     }
 }

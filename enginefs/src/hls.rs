@@ -1,64 +1,37 @@
 use anyhow::{Context, Result};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::process::Stdio;
 use std::pin::Pin;
+use std::process::Stdio;
 use std::task::Poll;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Command;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum HlsProfile {
-    Native,
-    Browser,
-}
-
+// HLS config optimized for browser playback
+// Native clients use direct streaming, so HLS is browser-only
 #[derive(Debug, Clone)]
 pub struct TranscodeConfig {
-    pub video_codec: String,      // "libx264", "hevc_nvenc", "copy", "auto"
-    pub audio_codec: String,      // "aac", "copy", "auto"
-    pub bitrate: String,          // "20M", "8M"
-    pub bufsize: String,          // "40M", "16M"
-    pub segment_duration: f64,    // 2.0
-    pub container_format: String, // "mpegts"
-    pub force_transcode_video: bool,
-    pub force_transcode_audio: bool,
-    pub ffmpeg_flags: Vec<String>,
+    pub segment_duration: f64, // 4.0 seconds (HLS V2 optimization)
+    pub video_bitrate: String, // "15M"
+    pub audio_bitrate: String, // "192k"
+    pub gop_frames: u32,       // 96 frames (4s @ 24fps)
 }
 
-impl HlsProfile {
-    pub fn get_config(&self) -> TranscodeConfig {
-        match self {
-            HlsProfile::Native => TranscodeConfig {
-                // Native Profile: Max Quality, Trust the player
-                video_codec: "auto".to_string(), // Tries copy, falls back to high quality
-                audio_codec: "auto".to_string(), // Tries copy
-                bitrate: "20M".to_string(),
-                bufsize: "40M".to_string(),
-                segment_duration: 2.0,
-                container_format: "mpegts".to_string(),
-                force_transcode_video: false,
-                force_transcode_audio: false,
-                ffmpeg_flags: vec![], // Trust default behavior
-            },
-            HlsProfile::Browser => TranscodeConfig {
-                // Browser Profile: Max Compatibility
-                // Browsers usually need H.264 + AAC
-                // We use "veryfast" to ensure low latency transcoding
-                // We force "yuv420p" and "main" profile for max compatibility
-                video_codec: "libx264".to_string(),
-                audio_codec: "aac".to_string(),
-                bitrate: "8M".to_string(),
-                bufsize: "16M".to_string(),
-                segment_duration: 2.0,
-                container_format: "mpegts".to_string(), 
-                force_transcode_video: true, 
-                force_transcode_audio: true,
-                ffmpeg_flags: vec![
-                    "-profile:v".to_string(), "main".to_string(),
-                ],
-            },
+impl Default for TranscodeConfig {
+    fn default() -> Self {
+        Self {
+            segment_duration: 4.0,
+            video_bitrate: "15M".to_string(),
+            audio_bitrate: "192k".to_string(),
+            gop_frames: 96,
         }
+    }
+}
+
+impl TranscodeConfig {
+    /// Browser-optimized HLS config for maximum compatibility and quality
+    pub fn browser() -> Self {
+        Self::default()
     }
 }
 
@@ -85,19 +58,6 @@ pub struct ProbeResult {
 
 #[derive(Clone)]
 pub struct HlsEngine;
-
-#[derive(Debug, Clone)]
-pub struct TranscodeProfile {
-    pub name: &'static str,
-    pub input_args: Vec<&'static str>,
-    pub hw_accel: &'static str, // Value for -hwaccel
-    pub encoders: std::collections::HashMap<&'static str, &'static str>, // codec -> encoder name
-    pub decoders: std::collections::HashMap<&'static str, &'static str>, // codec -> decoder name
-    pub extra_output_args: Vec<&'static str>,
-    pub preset: Option<&'static str>,
-    pub pixel_format: Option<&'static str>, // e.g., nv12, yuv420p
-    pub scale_filter: Option<&'static str>, // e.g., scale_cuda, scale_vaapi
-}
 
 #[derive(Debug)]
 pub struct TranscodeProcess {
@@ -126,7 +86,10 @@ pub struct TranscodeStream {
 impl TranscodeStream {
     pub fn new(mut process: TranscodeProcess) -> Option<Self> {
         let stdout = process.inner.stdout.take()?;
-        Some(Self { _process: process, stdout })
+        Some(Self {
+            _process: process,
+            stdout,
+        })
     }
 }
 
@@ -141,179 +104,24 @@ impl AsyncRead for TranscodeStream {
 }
 
 impl HlsEngine {
-    fn get_hw_profiles() -> std::collections::HashMap<&'static str, TranscodeProfile> {
-        let mut profiles = std::collections::HashMap::new();
-
-        // --- NVENC (Windows) ---
-        profiles.insert("nvenc-win", TranscodeProfile {
-            name: "nvenc-win",
-            input_args: vec![
-                "-init_hw_device", "cuda=cu:0", 
-                "-filter_hw_device", "cu", 
-                "-hwaccel", "cuda", 
-                "-hwaccel_output_format", "cuda", 
-                "-threads", "1"
-            ],
-            hw_accel: "cuda",
-            encoders: std::collections::HashMap::from([
-                ("h264", "h264_nvenc"),
-                ("hevc", "hevc_nvenc"),
-            ]),
-            decoders: std::collections::HashMap::new(),
-            extra_output_args: vec!["-b:v", "{bitrate}", "-maxrate", "{bitrate}", "-bufsize", "{bufsize}"],
-            preset: Some("p1"),
-            pixel_format: None,
-            scale_filter: Some("scale_cuda"),
-        });
-
-        // --- NVENC (Linux) ---
-        profiles.insert("nvenc-linux", TranscodeProfile {
-            name: "nvenc-linux",
-            input_args: vec![
-                "-init_hw_device", "cuda=cu:0", 
-                "-filter_hw_device", "cu", 
-                "-hwaccel", "cuda", 
-                "-hwaccel_output_format", "cuda"
-            ],
-            hw_accel: "cuda",
-            encoders: std::collections::HashMap::from([
-                ("h264", "h264_nvenc"),
-                ("hevc", "hevc_nvenc"),
-            ]),
-            decoders: std::collections::HashMap::from([
-                ("hevc", "hevc_cuvid"),
-                ("h264", "h264_cuvid"),
-                ("av1", "av1_cuvid"),
-                ("vp9", "vp9_cuvid"),
-            ]),
-            extra_output_args: vec!["-b:v", "{bitrate}", "-maxrate", "{bitrate}", "-bufsize", "{bufsize}"],
-            preset: Some("p1"),
-            pixel_format: None,
-            scale_filter: Some("scale_cuda"),
-        });
-
-        // --- QSV (Windows) ---
-        profiles.insert("qsv-win", TranscodeProfile {
-            name: "qsv-win",
-            input_args: vec![
-                "-init_hw_device", "d3d11va=dx11:,vendor=0x8086", 
-                "-init_hw_device", "qsv=qs@dx11", 
-                "-filter_hw_device", "qs", 
-                "-hwaccel", "d3d11va", 
-                "-hwaccel_output_format", "d3d11", 
-                "-threads", "3"
-            ],
-            hw_accel: "d3d11va",
-            encoders: std::collections::HashMap::from([
-                ("h264", "h264_qsv"),
-                ("hevc", "hevc_qsv"),
-            ]),
-            decoders: std::collections::HashMap::new(),
-            extra_output_args: vec!["-look_ahead", "0", "-b:v", "{bitrate}", "-maxrate", "{bitrate}", "-bufsize", "{bufsize}"],
-            preset: Some("veryfast"),
-            pixel_format: Some("nv12"),
-            scale_filter: Some("scale_qsv"),
-        });
-
-         // --- QSV (Linux) ---
-        profiles.insert("qsv-linux", TranscodeProfile {
-            name: "qsv-linux",
-            input_args: vec![
-                "-init_hw_device", "vaapi=va:,driver=iHD,kernel_driver=i915", 
-                "-init_hw_device", "qsv=qs@va", 
-                "-filter_hw_device", "qs", 
-                "-hwaccel", "vaapi", 
-                "-hwaccel_output_format", "vaapi"
-            ],
-            hw_accel: "vaapi",
-            encoders: std::collections::HashMap::from([
-                ("h264", "h264_qsv"),
-                ("hevc", "hevc_qsv"),
-            ]),
-            decoders: std::collections::HashMap::new(),
-            extra_output_args: vec!["-look_ahead", "0", "-b:v", "{bitrate}", "-maxrate", "{bitrate}", "-bufsize", "{bufsize}"],
-            preset: Some("veryfast"),
-            pixel_format: Some("nv12"),
-            scale_filter: Some("scale_vaapi"),
-        });
-
-        // --- AMF (Windows) ---
-        profiles.insert("amf", TranscodeProfile {
-            name: "amf",
-            input_args: vec![
-                 "-init_hw_device", "d3d11va=dx11:,vendor=0x1002", 
-                 "-init_hw_device", "opencl=ocl@dx11", 
-                 "-filter_hw_device", "ocl", 
-                 "-hwaccel", "d3d11va", 
-                 "-hwaccel_output_format", "d3d11"
-            ],
-            hw_accel: "d3d11va",
-            encoders: std::collections::HashMap::from([
-                ("h264", "h264_amf"),
-                ("hevc", "hevc_amf"),
-            ]),
-            decoders: std::collections::HashMap::new(),
-            extra_output_args: vec!["-quality", "speed", "-rc", "cbr", "-b:v", "{bitrate}", "-maxrate", "{bitrate}", "-bufsize", "{bufsize}"],
-            preset: None,
-            pixel_format: Some("nv12"),
-            scale_filter: Some("scale_opencl"),
-        });
-
-        // --- VAAPI (Linux) ---
-        profiles.insert("vaapi", TranscodeProfile {
-            name: "vaapi",
-            input_args: vec![
-                "-init_hw_device", "vaapi=va:/dev/dri/renderD128", 
-                "-filter_hw_device", "va", 
-                "-hwaccel", "vaapi", 
-                "-hwaccel_output_format", "vaapi"
-            ],
-            hw_accel: "vaapi",
-            encoders: std::collections::HashMap::from([
-                ("h264", "h264_vaapi"),
-                ("hevc", "hevc_vaapi"),
-                ("vp9", "vp9_vaapi"),
-            ]),
-            decoders: std::collections::HashMap::new(),
-            extra_output_args: vec!["-rc_mode", "VBR", "-b:v", "{bitrate}", "-maxrate", "{bitrate}", "-bufsize", "{bufsize}"],
-            preset: None,
-            pixel_format: Some("nv12"),
-            scale_filter: Some("scale_vaapi"),
-        });
-
-        // --- VideoToolbox (macOS) ---
-        profiles.insert("videotoolbox", TranscodeProfile {
-            name: "videotoolbox",
-            input_args: vec![
-                "-init_hw_device", "videotoolbox=vt", 
-                "-hwaccel", "videotoolbox"
-            ],
-            hw_accel: "videotoolbox",
-            encoders: std::collections::HashMap::from([
-                ("h264", "h264_videotoolbox"),
-                ("hevc", "hevc_videotoolbox"),
-            ]),
-            decoders: std::collections::HashMap::new(),
-            extra_output_args: vec!["-b:v", "{bitrate}", "-maxrate", "{bitrate}", "-bufsize", "{bufsize}"],
-            preset: None,
-            pixel_format: Some("nv12"),
-            scale_filter: None, 
-        });
-
-        profiles
-    }
-
     pub async fn probe_video(file_path: &str) -> Result<ProbeResult> {
-        tracing::info!("Starting probe_video for {}", file_path);
-        // "Improve it without change in functionality":
-        // We use ffmpeg -i as the JS did, but we use robust async process handling.
+        // Use ffmpeg -i with limited analysis to avoid reading entire file
+        // This is critical for HTTP streams to avoid thread starvation
 
         let mut cmd = Command::new("ffmpeg");
+        // CRITICAL: Limit probe size and duration for fast probing
+        // Otherwise ffmpeg may read large portions of the file
+        cmd.args([
+            "-analyzeduration",
+            "5000000", // 5 seconds max analysis
+            "-probesize",
+            "5000000", // 5MB max probe
+        ]);
         cmd.arg("-i").arg(file_path);
         cmd.stdout(Stdio::null());
         cmd.stderr(Stdio::piped());
 
-        tracing::info!("Spawning ffmpeg probe command: {:?}", cmd);
+        tracing::debug!("Spawning ffmpeg probe command: {:?}", cmd);
         let mut child = cmd.spawn().context("Failed to spawn ffmpeg")?;
         let stderr = child.stderr.take().context("Failed to capture stderr")?;
         let mut reader = BufReader::new(stderr).lines();
@@ -331,7 +139,6 @@ impl HlsEngine {
         let re_fps = Regex::new(r"(\d+(\.\d+)?) fps")?;
         let re_bitrate = Regex::new(r"(\d+) kb/s")?;
 
-        tracing::info!("Reading ffmpeg stderr...");
         while let Ok(Some(line)) = reader.next_line().await {
             let line = line.trim();
             // tracing::trace!("ffmpeg stderr: {}", line);
@@ -346,7 +153,6 @@ impl HlsEngine {
                     } else {
                         container = fmts.split(',').next().unwrap_or("unknown").to_string();
                     }
-                    tracing::info!("Found container: {}", container);
                 }
             }
 
@@ -355,7 +161,6 @@ impl HlsEngine {
                 let m: f64 = caps[2].parse().unwrap_or(0.0);
                 let s: f64 = caps[3].parse().unwrap_or(0.0);
                 duration = h * 3600.0 + m * 60.0 + s;
-                tracing::info!("Found duration: {}s", duration);
             }
 
             if let Some(caps) = re_stream.captures(line) {
@@ -406,19 +211,12 @@ impl HlsEngine {
                     is_default,
                     profile,
                 });
-                tracing::info!(
-                    index,
-                    type_str = %type_str,
-                    codec = %codec_name,
-                    "Probe found stream"
-                );
             }
         }
 
-        tracing::info!("Finished reading stderr, waiting for child process...");
         // We don't care about exit status being non-zero because ffmpeg -i without output always errors.
         let status = child.wait().await;
-        tracing::info!("ffmpeg probe finished with status: {:?}", status);
+        tracing::debug!("ffmpeg probe finished with status: {:?}", status);
 
         Ok(ProbeResult {
             duration,
@@ -428,9 +226,9 @@ impl HlsEngine {
     }
 
     pub fn get_segments(duration: f64) -> Vec<(f64, f64)> {
-        // Shorter segments = faster initial load and seeking
-        // 2.0s is a good balance for efficiency vs latency
-        let segment_duration = 2.0;
+        // Longer segments (4.0s) reduce overhead and improve stability
+        // Matched HLS V2 implementation
+        let segment_duration = 4.0;
         let count = (duration / segment_duration).ceil() as usize;
         let mut segments = Vec::new();
         for i in 0..count {
@@ -451,9 +249,8 @@ impl HlsEngine {
         file_idx: usize,
         base_url: &str,
         query_str: &str,
-        profile: HlsProfile,
     ) -> String {
-        let config = profile.get_config();
+        let config = TranscodeConfig::browser();
         let mut m3u = String::from("#EXTM3U\n#EXT-X-VERSION:4\n");
 
         // Collect audio streams from probe
@@ -476,34 +273,27 @@ impl HlsEngine {
             };
             let is_autoselect = is_default;
 
-            // Each audio track gets its own stream playlist with audio index
-            // Propagate profile to the audio playlist URL
-             let mut audio_query = query_str.to_string();
-             if let HlsProfile::Browser = profile {
-                if !audio_query.contains("profile=browser") {
-                    if !audio_query.is_empty() { audio_query.push('&'); }
-                    audio_query.push_str("profile=browser");
-                }
-             }
-
+            // Use global stream index (audio.index) in URL for robustness
             m3u.push_str(&format!(
                 "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"{}\",LANGUAGE=\"{}\",NAME=\"{}\",DEFAULT={},AUTOSELECT={},URI=\"{}/hlsv2/{}/{}/audio-{}.m3u8?{}\"\n",
-                audio_group_id, lang, name, is_default, is_autoselect, base_url, info_hash, file_idx, audio.index, audio_query
+                audio_group_id, lang, name, is_default, is_autoselect, base_url, info_hash, file_idx, audio.index, query_str
             ));
         }
 
         // Video stream with audio group reference
-        // Use bandwidth from profile
-        let bandwidth = if config.bitrate.ends_with("M") {
-             config.bitrate.trim_end_matches("M").parse::<u64>().unwrap_or(20) * 1_000_000
+        let bandwidth = if config.video_bitrate.ends_with("M") {
+            config
+                .video_bitrate
+                .trim_end_matches("M")
+                .parse::<u64>()
+                .unwrap_or(12)
+                * 1_000_000
         } else {
-             20_000_000
+            12_000_000
         };
-        
-        let codecs = match profile {
-            HlsProfile::Native => "avc1.640033,mp4a.40.2", // Generic high
-            HlsProfile::Browser => "avc1.4d4028,mp4a.40.2", // Main Profile Level 4.0 (Matches ffmpeg flags)
-        };
+
+        // High profile codecs for browser
+        let codecs = "avc1.640028,mp4a.40.2"; // High Profile Level 4.0
 
         if !audio_streams.is_empty() {
             m3u.push_str(&format!(
@@ -516,18 +306,11 @@ impl HlsEngine {
                 bandwidth, codecs
             ));
         }
-        // Video stream playlist URL
-        let mut stream_query = query_str.to_string();
-        if let HlsProfile::Browser = profile {
-            if !stream_query.contains("profile=browser") {
-                if !stream_query.is_empty() { stream_query.push('&'); }
-                stream_query.push_str("profile=browser");
-            }
-        }
 
+        // Video stream playlist URL
         m3u.push_str(&format!(
             "{}/hlsv2/{}/{}/stream-0.m3u8?{}\n",
-            base_url, info_hash, file_idx, stream_query
+            base_url, info_hash, file_idx, query_str
         ));
 
         m3u
@@ -539,47 +322,32 @@ impl HlsEngine {
         segment_base_url: &str,
         audio_track_idx: Option<usize>,
         query_str: &str,
-        profile: HlsProfile,
     ) -> String {
         let segments = Self::get_segments(probe.duration);
 
-        // Ensure profile is propagated in the query string
-        let mut final_query = query_str.to_string();
-        match profile {
-            HlsProfile::Browser => {
-                if !final_query.contains("profile=browser") {
-                    if !final_query.is_empty() { final_query.push('&'); }
-                    final_query.push_str("profile=browser");
-                }
-            }
-            HlsProfile::Native => {
-                // Optional: Force native if needed, but usually default
-                 if !final_query.contains("profile=native") && !final_query.contains("profile=") {
-                    // Don't clutter unless necessary
-                 }
-            }
-        }
+        // Calculate max duration for target duration
+        let max_duration = segments
+            .iter()
+            .map(|(_, dur)| dur.ceil() as u32)
+            .max()
+            .unwrap_or(4);
 
-        let mut m3u = String::from("#EXTM3U\n#EXT-X-VERSION:4\n");
-        m3u.push_str("#EXT-X-TARGETDURATION:2\n");
+        let mut m3u = String::from("#EXTM3U\n");
+        m3u.push_str("#EXT-X-VERSION:3\n");
+        m3u.push_str(&format!("#EXT-X-TARGETDURATION:{}\n", max_duration));
         m3u.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
         m3u.push_str("#EXT-X-PLAYLIST-TYPE:VOD\n");
 
-        // Use .m4s for browser (fMP4), .ts for native (MPEG-TS)
-        let ext = match profile {
-            HlsProfile::Browser => "m4s",
-            HlsProfile::Native => "ts",
-        };
-
+        // MPEG-TS segments (no init segment required)
         for (i, (_start, dur)) in segments.iter().enumerate() {
-            m3u.push_str(&format!("#EXTINF:{},\n", dur));
+            m3u.push_str(&format!("#EXTINF:{:.6},\n", dur));
             let filename = if let Some(audio_idx) = audio_track_idx {
                 format!(
-                    "{}audio-{}-{}.{}?{}",
-                    segment_base_url, audio_idx, i, ext, final_query
+                    "{}audio-{}-{}.ts?{}",
+                    segment_base_url, audio_idx, i, query_str
                 )
             } else {
-                format!("{}{}.{}?{}", segment_base_url, i, ext, final_query)
+                format!("{}{}.ts?{}", segment_base_url, i, query_str)
             };
             m3u.push_str(&format!("{}\n", filename));
         }
@@ -587,350 +355,213 @@ impl HlsEngine {
         m3u
     }
 
-    pub async fn probe_hwaccel() -> &'static str {
-        static HW_ACCEL_METHOD: tokio::sync::OnceCell<String> = tokio::sync::OnceCell::const_new();
-
-        HW_ACCEL_METHOD
-            .get_or_init(|| async {
-                let mut cmd = Command::new("ffmpeg");
-                cmd.arg("-hwaccels");
-                cmd.stdout(Stdio::piped());
-                cmd.stderr(Stdio::null());
-                let os = std::env::consts::OS;
-
-                if let Ok(output) = cmd.output().await {
-                    let output_str = String::from_utf8_lossy(&output.stdout);
-                    let methods: Vec<&str> = output_str.lines().map(|l| l.trim()).collect();
-
-                    if methods.contains(&"cuda") {
-                        if os == "windows" { return "nvenc-win".to_string(); }
-                        else { return "nvenc-linux".to_string(); }
-                    } 
-                    if methods.contains(&"qsv") {
-                         if os == "windows" { return "qsv-win".to_string(); }
-                         else { return "qsv-linux".to_string(); }
-                    }
-                    if methods.contains(&"videotoolbox") {
-                        return "videotoolbox".to_string(); 
-                    }
-                    if methods.contains(&"d3d11va") && methods.contains(&"opencl") {
-                        // AMF usually requires D3D11VA and OpenCL
-                        if os == "windows" { return "amf".to_string(); }
-                    }
-                    if methods.contains(&"vaapi") {
-                        return "vaapi".to_string();
-                    }
-                }
-
-                "cpu".to_string() // Fallback
-            })
-            .await
-            .as_str()
-    }
-
-    pub async fn transcode_segment(
+    /// Transcode video-only segment for HLS V2
+    /// Implements exact logic from ebml_933.js
+    pub async fn transcode_video_segment(
         input_path: &str,
         start: f64,
         duration: f64,
-        container: Option<&str>,
-        target_audio_codec: &str,
-        target_video_codec: &str,
-        input_video_codec: &str,
-        audio_stream_index: Option<usize>,
-        is_hdr: bool,
-        is_browser: bool,  // Use fMP4 for browser, MPEG-TS for native
-        config: &TranscodeConfig, 
+        config: &TranscodeConfig,
     ) -> anyhow::Result<TranscodeProcess> {
-        let profile_key = Self::probe_hwaccel().await;
-        let profiles = Self::get_hw_profiles();
-        let profile = profiles.get(profile_key);
-
         let mut cmd = tokio::process::Command::new("ffmpeg");
 
-        // Input Args (from profile or default)
-        // NOTE: For browser, we skip hardware decoding because CUDA/QSV decoders
-        // fail when seeking to non-keyframe positions. We still use HW encoding.
-        if let Some(p) = profile {
-            if is_browser {
-                // Browser: use software decoding (skip hwaccel input args)
-                cmd.args(["-threads", "0"]);
-            } else {
-                // Native: use full hardware acceleration
-                cmd.args(&p.input_args);
-            }
+        // Reduce FFmpeg verbosity
+        cmd.args(["-loglevel", "warning"]);
+
+        // Input flags (Global)
+        // +discardcorrupt allows skipping corrupt frames
+        // +genpts regenerates presentation timestamps
+        cmd.args(["-fflags", "+genpts+discardcorrupt"]);
+
+        // Large analyzeduration/probesize for proper stream analysis
+        cmd.args(["-analyzeduration", "100000000", "-probesize", "100000000"]);
+
+        // HYBRID SEEKING APPROACH:
+        // 1. Fast input seek to get close (keyframe before target)
+        // 2. Output seek to precise position (ensures proper frame decoding)
+        // This is much faster than pure output seeking for later segments
+        let input_seek_offset = 10.0; // Seek to 10s before target for safety margin
+        let input_seek = (start - input_seek_offset).max(0.0);
+        let output_seek = start - input_seek;
+
+        // Input seeking (fast, coarse) - BEFORE -i
+        if input_seek > 0.0 {
+            cmd.arg("-ss").arg(format!("{:.3}", input_seek));
         }
 
-        // ========== INPUT FLAGS ==========
-        if is_browser {
-            // Browser: higher analysis for better compatibility
-            cmd.args([
-                "-fflags", "+genpts",
-                "-analyzeduration", "10000000", // 10s
-                "-probesize", "10000000", // 10MB
-            ]);
-        } else {
-            // Native: optimized for low latency
-            cmd.args([
-                "-fflags", "+genpts+discardcorrupt+nobuffer",
-                "-flags", "low_delay",
-                "-analyzeduration", "500000",  // 0.5s - faster start
-                "-probesize", "1000000",       // 1MB - faster start
-                "-noaccurate_seek",
-                "-seek_timestamp", "1",
-                "-mpegts_copyts", "1",
-            ]);
-        }
-
-        if let Some(cont) = container {
-            cmd.arg("-f").arg(cont);
-            // For Matroska/WebM, allow seeking to any frame
-            if cont.contains("matroska") || cont.contains("webm") {
-                cmd.args(["-seek2any", "1"]);
-            }
-        }
-
-        cmd.arg("-ignore_unknown");
-
-        // Seeking strategy:
-        // - Native: -ss BEFORE -i (fast input seeking)
-        // - Browser: -ss AFTER -i (slow but accurate output seeking)
-        if !is_browser {
-            cmd.arg("-ss").arg(format!("{}", start));
-        }
         cmd.arg("-i").arg(input_path);
-        
-        // ========== OUTPUT OPTIONS ==========
 
-        // For browser, apply seeking after input (output seeking)
-        // Also set output_ts_offset to align timestamps across segments
-        if is_browser {
-            cmd.arg("-ss").arg(format!("{}", start));
-            // Critical: offset output timestamps to match the seek position
-            // Without this, each segment starts at timestamp 0 instead of its actual position
-            cmd.arg("-output_ts_offset").arg(format!("{}", start));
+        // Output seeking (accurate, slower) - AFTER -i
+        // This decodes from the input seek point and discards until exact target
+        if output_seek > 0.0 {
+            cmd.arg("-ss").arg(format!("{:.3}", output_seek));
         }
 
-        // 1. Map Streams (Must be after input)
-        // Disable data and attachments
-        cmd.args(["-map", "-0:d?", "-map", "-0:t?"]);
-        
-        // Map Video
-        // Only map video if not explicitly set to "none"
-        if target_video_codec != "none" {
-            cmd.args(["-map", "0:v:0"]);
-        } else {
-            cmd.arg("-vn");
-        }
+        // Output timestamp offset - sets segment timestamps correctly
+        cmd.arg("-output_ts_offset").arg(format!("{:.3}", start));
 
-        // Map Audio (if requested)
-        if target_audio_codec != "none" {
-            if let Some(a_idx) = audio_stream_index {
-                // Map specific audio track
-                 cmd.arg("-map").arg(format!("0:{}", a_idx));
-            } else {
-                 // Map default audio track
-                 cmd.args(["-map", "0:a:0"]);
-            }
-        } else {
-             // No audio requested
-             cmd.arg("-an");
-        }
+        // Duration limit (CRITICAL: prevent transcoding entire file)
+        cmd.arg("-t").arg(format!("{:.3}", duration));
 
-        // Output Duration (Apply to output)
-        cmd.arg("-t").arg(format!("{}", duration));
+        // Thread count
+        cmd.args(["-threads", "0"]);
 
-        // Disable subtitles
-        cmd.arg("-sn");
-
-        // 2. Video Codec & Settings
-        if target_video_codec == "none" {
-            // Do nothing, -vn already handled
-        } else if target_video_codec == "copy" {
-             cmd.args(["-c:v", "copy"]);
-             // copying to mpegts requires bitstream filters for mp4/mkv input
-             if input_video_codec == "h264" {
-                 cmd.args(["-bsf:v", "h264_mp4toannexb"]);
-             } else if input_video_codec == "hevc" {
-                 cmd.args(["-bsf:v", "hevc_mp4toannexb"]);
-             }
-        } else {
-             // ... encoder settings ...
-             let encoder = if let Some(p) = profile {
-                p.encoders.get(target_video_codec).unwrap_or(&target_video_codec)
-            } else {
-                target_video_codec
-            };
-            cmd.args(["-c:v", encoder]);
-
-            // Add Profile Output Args (bitrate, bufsize, etc)
-            if let Some(p) = profile {
-                for arg in &p.extra_output_args {
-                    let val = arg.replace("{bitrate}", &config.bitrate).replace("{bufsize}", &config.bufsize);
-                    cmd.arg(val);
-                }
-                 // Preset / Tune
-                if let Some(preset) = p.preset {
-                    cmd.args(["-preset", preset]);
-                }
-
-                // Hardware encoder tuning differs between browser and native
-                if p.name.contains("nvenc") || p.name.contains("qsv") || p.name.contains("amf") {
-                    if is_browser {
-                        // Browser: low-latency options
-                        cmd.args(["-bf", "0"]);    // No B-frames for lower latency
-                        if p.name.contains("nvenc") {
-                            cmd.args(["-delay", "0"]);
-                            cmd.args(["-rc", "cbr"]);
-                        }
-                    } else {
-                        // Native: maximum quality options
-                        if p.name.contains("nvenc") {
-                            cmd.args([
-                                "-rc", "vbr",           // Variable bitrate for quality
-                                "-tune", "hq",          // High quality tuning
-                                "-cq", "19",            // Lower CQ = higher quality (range 0-51)
-                                "-b:v", "0",            // Let CQ control quality
-                                "-profile:v", "high",   // High profile for better quality
-                                "-level", "4.2",        // High level for 4K support
-                            ]);
-                            // Color metadata preservation
-                            cmd.args([
-                                "-color_primaries", "bt709",
-                                "-color_trc", "bt709",
-                                "-colorspace", "bt709",
-                            ]);
-                        } else if p.name.contains("qsv") {
-                            cmd.args(["-global_quality", "20"]);
-                        } else if p.name.contains("amf") {
-                            cmd.args(["-quality", "quality"]);
-                        }
-                    }
-                }
-                
-                // Pixel Format
-                if let Some(pix_fmt) = p.pixel_format {
-                    // QSV/VAAPI often handle format in filters, check exceptions if needed
-                    if !p.name.contains("qsv") && !p.name.contains("vaapi") {
-                        cmd.args(["-pix_fmt", pix_fmt]);
-                    }
-                }
-            }
-            
-            // Software Encoder Optimization
-            if encoder == "libx264" {
-                 cmd.args(["-preset", "veryfast"]);
-                 // Add zerolatency for software encoder on browser too
-                 if is_browser {
-                     cmd.args(["-tune", "zerolatency"]);
-                 }
-            }
-
-            if !config.ffmpeg_flags.is_empty() {
-                cmd.args(&config.ffmpeg_flags);
-            }
-
-            // 4. Muxer Settings (fMP4 / MPEGTS)
-            // config.container_format is usually "mpegts"
-            // cmd.args([
-            //     "-f", &config.container_format,
-            //     "-muxdelay", "0",
-            // ]);
-
-            // 5. Scaling / Filters
-            let mut filters = Vec::new();
-
-
-
-
-            if is_hdr {
-                tracing::info!("Applying HDR Tone Mapping (BT.2020 -> BT.709)");
-                filters.push("colorspace=all=bt709:trc=bt709:format=yuv420p".to_string());
-            }
-            
-            if let Some(p) = profile {
-                // VAAPI / QSV specific filters
-                if p.name == "vaapi" {
-                    filters.push("format=nv12".to_string());
-                    filters.push("hwupload".to_string());
-                } else if p.name.contains("qsv") {
-                    filters.push("format=nv12".to_string());
-                }
-                
-                if p.name.contains("vaapi") || p.name.contains("qsv") {
-                     cmd.args(["-keyint_min", "60"]);
-                }
-            }
-
-            // Standard GOP args
-            cmd.args(["-g", "60"]);
-
-             if !filters.is_empty() {
-                cmd.arg("-vf").arg(filters.join(","));
-            }
-        }
-
-
-        // Audio flags
-        if target_audio_codec == "none" {
-            // Do nothing
-        } else if target_audio_codec == "copy" {
-            cmd.arg("-c:a").arg("copy");
-            // REVERSE ENGINEERED: When copying AAC to MPEG-TS, this filter is often required
-            cmd.args(["-bsf:a", "aac_adtstoasc"]);
-        } else {
-            cmd.args([
-                "-c:a",
-                target_audio_codec,
-                "-ac",
-                "2",
-                "-b:a", // Ensure decent bitrate
-                "192k",
-                // REVERSE ENGINEERED: -async 1 handles drift, apad fills gaps
-                "-async", "1",
-                "-filter:a", "apad",
-                "-strict",
-                "experimental",
-            ]);
-        }
-
-        // Output flags
+        // Metadata cleanup
         cmd.args(["-max_muxing_queue_size", "2048"]);
+        cmd.args(["-ignore_unknown"]);
         cmd.args(["-map_metadata", "-1", "-map_chapters", "-1"]);
+        cmd.args(["-map", "-0:d?", "-map", "-0:t?"]);
 
-        // Output format flags - fMP4 for browser (more robust), MPEG-TS for native
-        if is_browser {
-            // fMP4 (fragmented MP4) - used by old server, better for HTTP streaming
-            cmd.args([
-                "-movflags", "frag_keyframe+empty_moov+default_base_moof+delay_moov+dash",
-                "-use_editlist", "1",
-                "-avoid_negative_ts", "make_zero",
-                "-f", "mp4",
-                "-threads", "0",
-                "pipe:1",
-            ]);
-        } else {
-            // MPEG-TS for native clients (VLC, Stremio Shell, etc.)
-            cmd.args([
-                "-f", "mpegts",
-                "-muxdelay", "0",
-                "-muxpreload", "0",
-                "-copyts",               // Preserve timestamps for sync
-                "-output_ts_offset", &format!("{}", start), // Align segment timestamps
-                "-pat_period", "0.1",    // Frequent PAT/PMT for mid-segment joins
-                "-avoid_negative_ts", "make_zero",
-                "-threads", "0",
-                "pipe:1",
-            ]);
+        // Output mapping: video only
+        cmd.args(["-map", "0:v:0", "-an", "-sn"]);
+
+        // Video filter: pixel format only (simplified for stability)
+        cmd.args(["-vf", "format=yuv420p"]);
+
+        // Video encoding: libx264, ultrafast, zerolatency
+        cmd.args([
+            "-c:v",
+            "libx264",
+            "-preset:v",
+            "ultrafast",
+            "-profile:v",
+            "high",
+            "-tune:v",
+            "zerolatency",
+            "-level",
+            "51",
+        ]);
+
+        // Fixed GOP for HLS V2 segment alignment
+        let gop = config.gop_frames.to_string();
+        cmd.args(["-sc_threshold", "0", "-g", &gop, "-keyint_min", &gop]);
+
+        // Bitrate control (can be scaled here if needed, sticking to config for now)
+        let video_bitrate_num = config
+            .video_bitrate
+            .trim_end_matches('M')
+            .parse::<u32>()
+            .unwrap_or(15);
+        let bufsize = video_bitrate_num * 2;
+        cmd.args(["-b:v", &format!("{}", video_bitrate_num * 1_000_000)]);
+        cmd.args(["-maxrate", &format!("{}", video_bitrate_num * 1_000_000)]);
+        cmd.args(["-bufsize", &format!("{}", bufsize * 1_000_000)]);
+
+        // Output format: MPEG-TS for HLS with copyts to preserve timestamps
+        cmd.args(["-mpegts_copyts", "1", "-f", "mpegts", "pipe:1"]);
+
+        tracing::debug!("FFmpeg video command (HLS V2): {:?}", cmd);
+
+        #[allow(clippy::zombie_processes)]
+        let mut child = cmd
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("Failed to spawn ffmpeg for video segment: {:?}", cmd))?;
+
+        // Spawn a task to log stderr in background (for debugging)
+        if let Some(stderr) = child.stderr.take() {
+            tokio::spawn(async move {
+                use tokio::io::AsyncBufReadExt;
+                let mut reader = tokio::io::BufReader::new(stderr);
+                let mut line = String::new();
+                while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
+                    if !line.trim().is_empty() {
+                        tracing::warn!("FFmpeg video stderr: {}", line.trim());
+                    }
+                    line.clear();
+                }
+            });
         }
 
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::inherit()); // See ffmpeg errors in console
+        Ok(TranscodeProcess { inner: child })
+    }
 
-        // Log the full command for debugging
-        let args: Vec<String> = cmd.as_std().get_args().map(|s| s.to_string_lossy().to_string()).collect();
-        tracing::info!("Running ffmpeg command: ffmpeg {}", args.join(" "));
+    /// Transcode audio-only segment for HLS V2
+    /// Implements exact logic from ebml_933.js
+    pub async fn transcode_audio_segment(
+        input_path: &str,
+        start: f64,
+        duration: f64,
+        audio_stream_index: usize,
+        config: &TranscodeConfig,
+    ) -> anyhow::Result<TranscodeProcess> {
+        let mut cmd = tokio::process::Command::new("ffmpeg");
 
-        let child = cmd.spawn().context("Failed to spawn ffmpeg transcoder")?;
+        // Increase FFmpeg verbosity for debugging
+        cmd.args(["-loglevel", "info"]);
+
+        // Input flags (Global) - match video transcoding approach
+        cmd.args(["-fflags", "+genpts+discardcorrupt"]);
+
+        // Large analyzeduration/probesize for proper stream analysis
+        cmd.args(["-analyzeduration", "100000000", "-probesize", "100000000"]);
+
+        // HYBRID SEEKING APPROACH (same as video):
+        // 1. Fast input seek to get close
+        // 2. Output seek to precise position
+        let input_seek_offset = 10.0;
+        let input_seek = (start - input_seek_offset).max(0.0);
+        let output_seek = start - input_seek;
+
+        // Input seeking (fast, coarse) - BEFORE -i
+        if input_seek > 0.0 {
+            cmd.arg("-ss").arg(format!("{:.3}", input_seek));
+        }
+
+        cmd.arg("-i").arg(input_path);
+
+        // Output seeking (accurate) - AFTER -i
+        if output_seek > 0.0 {
+            cmd.arg("-ss").arg(format!("{:.3}", output_seek));
+        }
+
+        // Output timestamp offset - REQUIRED to match video timestamps
+        cmd.arg("-output_ts_offset").arg(format!("{:.3}", start));
+
+        // Thread count
+        cmd.args(["-threads", "0"]);
+
+        // Duration limit (CRITICAL)
+        cmd.arg("-t").arg(format!("{:.3}", duration));
+
+        // Metadata cleanup
+        cmd.args(["-max_muxing_queue_size", "2048"]);
+        cmd.args(["-ignore_unknown"]);
+        cmd.args(["-map_metadata", "-1", "-map_chapters", "-1"]);
+        cmd.args(["-map", "-0:d?", "-map", "-0:t?"]);
+
+        // Output mapping: specific audio track by GLOBAL index
+        // Use 0:{index} to be precise, instead of a:{index} which is relative to audio streams
+        cmd.arg("-map").arg(format!("0:{}", audio_stream_index));
+        cmd.args(["-vn", "-sn"]);
+
+        // Audio encoding HLS V2: apad + async 1
+        cmd.args([
+            "-c:a",
+            "aac",
+            "-filter:a",
+            "apad", // CRITICAL: Pad with silence to prevent gaps
+            "-async",
+            "1", // CRITICAL: Sync audio to timestamps
+            "-ac",
+            "2",
+            "-b:a",
+            &config.audio_bitrate,
+        ]);
+
+        // Output format: MPEG-TS for HLS
+        cmd.args(["-mpegts_copyts", "1", "-f", "mpegts", "pipe:1"]);
+
+        tracing::debug!("FFmpeg audio command (HLS V2): {:?}", cmd);
+
+        #[allow(clippy::zombie_processes)]
+        let child = cmd
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("Failed to spawn ffmpeg for audio segment: {:?}", cmd))?;
+
         Ok(TranscodeProcess { inner: child })
     }
 }

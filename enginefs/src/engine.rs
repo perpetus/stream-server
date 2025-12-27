@@ -2,8 +2,8 @@ use crate::backend::{EngineStats, PeerStat, SubtitleTrack, TorrentHandle};
 use crate::cache::DataCache;
 use anyhow::Context;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::time::Instant;
 use tokio::io::AsyncSeekExt;
 use tokio::sync::Mutex;
@@ -46,15 +46,44 @@ impl<H: TorrentHandle> Engine<H> {
     pub async fn get_probe_result(
         &self,
         file_idx: usize,
-        input_mri: &str,
+        fallback_url: &str,
     ) -> anyhow::Result<crate::hls::ProbeResult> {
-        let mut cache = self.probe_cache.lock().await;
+        tracing::info!(
+            "[HLS STREAMING] Preparing file {} for HLS playback",
+            file_idx
+        );
+
+        let cache = self.probe_cache.lock().await;
         if let Some(res) = cache.get(&file_idx) {
+            tracing::debug!(
+                "[HLS STREAMING] Using cached probe result for file {}",
+                file_idx
+            );
             return Ok(res.clone());
         }
+        drop(cache); // Release lock before potentially slow operations
 
-        // If not cached, probe execution
-        let res = crate::hls::HlsEngine::probe_video(input_mri).await?;
+        // CRITICAL FIX: Prepare the file for streaming BEFORE probing
+        // This ensures the target file is prioritized and initial pieces are downloaded
+        // Without this, multi-file torrents fail because all files start at priority 0
+        self.handle.prepare_file_for_streaming(file_idx).await?;
+
+        // CRITICAL: Prefer local file path over HTTP URL to avoid thread starvation
+        // When probing via HTTP loopback (e.g. http://127.0.0.1/stream/...),
+        // ffmpeg waits for HTTP data, but the server can't serve data because
+        // it's blocked waiting for the probe to finish. This creates a deadlock.
+        let probe_path = if let Some(local_path) = self.handle.get_file_path(file_idx).await {
+            tracing::info!("Probing via local file path: {}", local_path);
+            local_path
+        } else {
+            tracing::info!("Probing via HTTP URL (fallback): {}", fallback_url);
+            fallback_url.to_string()
+        };
+
+        let res = crate::hls::HlsEngine::probe_video(&probe_path).await?;
+
+        // Re-acquire cache lock to store result
+        let mut cache = self.probe_cache.lock().await;
         cache.insert(file_idx, res.clone());
         Ok(res)
     }
@@ -141,11 +170,11 @@ impl<H: TorrentHandle> Engine<H> {
             let file = &stats.files[guessed_file_idx];
             stats.stream_name = file.name.clone();
             stats.stream_len = file.length;
-            
-            // Note: stats.stream_progress is already populated by the backend 
-            // using total_wanted_done / total_wanted, which is accurate for 
+
+            // Note: stats.stream_progress is already populated by the backend
+            // using total_wanted_done / total_wanted, which is accurate for
             // multi-file torrents where only the streaming file is "wanted".
-            
+
             tracing::debug!(
                 "get_statistics: file_idx={} file.progress={:.2}% total_done={} stream_progress={:.2}%",
                 guessed_file_idx,
@@ -154,7 +183,6 @@ impl<H: TorrentHandle> Engine<H> {
                 stats.stream_progress * 100.0
             );
         } else {
-
             tracing::debug!(
                 "get_statistics: guessed_file_idx {} >= stats.files.len() {}",
                 guessed_file_idx,
@@ -165,11 +193,18 @@ impl<H: TorrentHandle> Engine<H> {
         stats
     }
 
+    pub async fn get_file(
+        self: &Arc<Self>,
+        file_idx: usize,
+        start_offset: u64,
+        priority: u8,
+    ) -> Option<FileHandle<H>> {
+        tracing::info!(
+            "[DIRECT STREAMING] Preparing file {} for direct playback (offset={})",
+            file_idx,
+            start_offset
+        );
 
-
-
-
-    pub async fn get_file(self: &Arc<Self>, file_idx: usize, start_offset: u64, priority: u8) -> Option<FileHandle<H>> {
         self.last_accessed
             .store(Instant::now().elapsed().as_secs() as i64, Ordering::SeqCst);
 
@@ -181,7 +216,39 @@ impl<H: TorrentHandle> Engine<H> {
         let length = files[file_idx].length;
         let name = files[file_idx].name.clone();
 
-        let reader = self.handle.get_file_reader(file_idx, start_offset, priority).await.ok()?;
+        // Try to recover bitrate from probe cache if available
+        let bitrate = {
+            let cache = self.probe_cache.lock().await;
+            cache.get(&file_idx).and_then(|res| {
+                // Find video stream and get its bitrate
+                res.streams
+                    .iter()
+                    .filter(|s| s.codec_type == "video")
+                    .find_map(|s| s.bitrate)
+            })
+        };
+
+        if let Some(br) = bitrate {
+            tracing::debug!(
+                "get_file: using bitrate {} B/s from probe cache for file {}",
+                br / 8,
+                file_idx
+            );
+        }
+
+        // CRITICAL: Prepare file for streaming BEFORE getting the reader.
+        // This ensures the file has priority and initial pieces are downloaded.
+        // Without this, direct stream requests fail because data isn't available.
+        if let Err(e) = self.handle.prepare_file_for_streaming(file_idx).await {
+            tracing::warn!("get_file: prepare_file_for_streaming failed: {}", e);
+            // Continue anyway - the file reader will block on pieces as needed
+        }
+
+        let reader = self
+            .handle
+            .get_file_reader(file_idx, start_offset, priority, bitrate.map(|b| b / 8))
+            .await
+            .ok()?;
 
         self.active_streams.fetch_add(1, Ordering::SeqCst);
 

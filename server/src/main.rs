@@ -1,35 +1,36 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 use axum::{
+    Router,
     http::StatusCode,
     response::Redirect,
     routing::{get, post},
-    Router,
 };
 use enginefs::EngineFS; // This is a type alias in enginefs::lib.rs based on features
+use fslock::LockFile;
 use state::AppState;
 use std::{net::SocketAddr, sync::Arc};
+use tao::event::Event;
+use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-use tao::event_loop::{ControlFlow, EventLoopBuilder};
-use tao::event::Event;
-use fslock::LockFile;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+mod archives;
 mod cache_cleaner;
 mod ffmpeg_setup;
-mod routes;
-mod state;
-mod tui;
 mod local_addon;
-mod archives;
+mod routes;
 mod ssdp;
+mod state;
 mod tray;
+mod tui;
 
-
-async fn run_server(mut external_shutdown_rx: tokio::sync::mpsc::Receiver<()>) -> anyhow::Result<()> {
+async fn run_server(
+    mut external_shutdown_rx: tokio::sync::mpsc::Receiver<()>,
+) -> anyhow::Result<()> {
     // Check for --tui flag
     let use_tui = std::env::args().any(|arg| arg == "--tui");
 
@@ -50,9 +51,9 @@ async fn run_server(mut external_shutdown_rx: tokio::sync::mpsc::Receiver<()>) -
     } else {
         // Only enable console logging if we are actually in a terminal (shell environment)
         if std::io::stdout().is_terminal() {
-             registry.with(tracing_subscriber::fmt::layer()).init();
+            registry.with(tracing_subscriber::fmt::layer()).init();
         } else {
-             registry.init();
+            registry.init();
         }
     }
 
@@ -127,9 +128,13 @@ async fn run_server(mut external_shutdown_rx: tokio::sync::mpsc::Receiver<()>) -
     // Ensure localFiles directory exists
     let local_files_dir = config_dir.join("localFiles");
     tokio::fs::create_dir_all(&local_files_dir).await?;
-    
+
     // Start background scan
-    local_addon::scan_background(local_files_dir.to_string_lossy().to_string(), state.local_index.clone()).await;
+    local_addon::scan_background(
+        local_files_dir.to_string_lossy().to_string(),
+        state.local_index.clone(),
+    )
+    .await;
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel(1);
 
@@ -189,10 +194,7 @@ async fn run_server(mut external_shutdown_rx: tokio::sync::mpsc::Receiver<()>) -
             "/opensubHash/{infoHash}/{fileIdx}",
             get(routes::subtitles::opensub_hash_path),
         )
-        .route(
-            "/subtitlesTracks",
-            get(routes::subtitles::subtitles_tracks),
-        )
+        .route("/subtitlesTracks", get(routes::subtitles::subtitles_tracks))
         .route("/device-info", get(routes::system::get_device_info))
         .route("/hwaccel-profiler", get(routes::system::hwaccel_profiler))
         .route("/get-https", get(routes::system::get_https))
@@ -205,7 +207,6 @@ async fn run_server(mut external_shutdown_rx: tokio::sync::mpsc::Receiver<()>) -
         .nest("/nzb", routes::nzb::router())
         .nest("/local-addon", local_addon::get_router())
         .nest("/proxy", routes::proxy::router())
-
         .nest("/ftp", routes::ftp::router())
         .route("/samples/{filename}", get(routes::system::get_samples))
         // HLS routes with query params for Stremio compatibility
@@ -223,6 +224,11 @@ async fn run_server(mut external_shutdown_rx: tokio::sync::mpsc::Receiver<()>) -
         .route(
             "/hlsv2/{infoHash}/{fileIdx}/{resource}",
             get(routes::hls::handle_hls_resource),
+        )
+        // Route for nested fMP4 segment paths (video0/init.mp4, video0/segment1.m4s)
+        .route(
+            "/hlsv2/{infoHash}/{fileIdx}/{track}/{segment}",
+            get(routes::hls::handle_hls_fmp4_segment),
         )
         // HLS probe with query params for Stremio compatibility
         .route("/hlsv2/probe", get(routes::hls::probe_by_url))
@@ -253,7 +259,7 @@ async fn run_server(mut external_shutdown_rx: tokio::sync::mpsc::Receiver<()>) -
                 tracing::info!("Shutdown signal received from Tray, shutting down");
             }
         }
-        
+
         // FORCE EXIT TIMER
         // Libtorrent often hangs on shutdown trying to contact trackers.
         // We give the graceful shutdown 1 second to finish, otherwise we pull the plug.
@@ -272,11 +278,9 @@ async fn run_server(mut external_shutdown_rx: tokio::sync::mpsc::Receiver<()>) -
     if https_cert_path.exists() && https_key_path.exists() {
         tracing::info!("Found HTTPS certificates, starting HTTPS server on port 12470");
         let https_app = app.clone();
-        let https_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(
-            https_cert_path,
-            https_key_path,
-        )
-        .await?;
+        let https_config =
+            axum_server::tls_rustls::RustlsConfig::from_pem_file(https_cert_path, https_key_path)
+                .await?;
 
         let https_addr = SocketAddr::from(([0, 0, 0, 0], 12470));
         tokio::spawn(async move {
@@ -288,7 +292,10 @@ async fn run_server(mut external_shutdown_rx: tokio::sync::mpsc::Receiver<()>) -
             }
         });
     } else {
-        tracing::info!("No HTTPS certificates found in {:?}, skipping HTTPS server (Port 12470)", config_dir);
+        tracing::info!(
+            "No HTTPS certificates found in {:?}, skipping HTTPS server (Port 12470)",
+            config_dir
+        );
     }
 
     axum::serve(listener, app)
@@ -306,7 +313,7 @@ fn main() -> anyhow::Result<()> {
     // even though we are a windows subsystem app.
     #[cfg(windows)]
     let attached_console = unsafe {
-        use windows::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
+        use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
         AttachConsole(ATTACH_PARENT_PROCESS).is_ok()
     };
     #[cfg(not(windows))]
@@ -319,7 +326,7 @@ fn main() -> anyhow::Result<()> {
 
     if !lockfile.try_lock()? {
         if attached_console {
-             eprintln!("Exiting, another instance is running.");
+            eprintln!("Exiting, another instance is running.");
         }
         return Ok(());
     }
@@ -345,7 +352,8 @@ fn main() -> anyhow::Result<()> {
 
         // Shared state for controlling the server thread
         // The server thread will put its current shutdown sender here
-        let server_control: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::Sender<()>>>> = Arc::new(std::sync::Mutex::new(None));
+        let server_control: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::Sender<()>>>> =
+            Arc::new(std::sync::Mutex::new(None));
         let keep_running = Arc::new(AtomicBool::new(true));
 
         let server_control_clone = server_control.clone();
@@ -360,7 +368,7 @@ fn main() -> anyhow::Result<()> {
 
                 // Channel for tray -> server shutdown for this iteration
                 let (tx, rx) = tokio::sync::mpsc::channel(1);
-                
+
                 // Publish the sender
                 *server_control_clone.lock().unwrap() = Some(tx);
 
@@ -383,12 +391,12 @@ fn main() -> anyhow::Result<()> {
             match event {
                 Event::UserEvent(e) => match e {
                     tray::UserEvent::OpenWeb => {
-                         tray::open_stremio_web();
+                        tray::open_stremio_web();
                     }
                     tray::UserEvent::Restart => {
                         // Signal shutdown to current instance; loop will restart it since keep_running is true
                         if let Some(tx) = server_control.lock().unwrap().take() {
-                             let _ = tx.blocking_send(());
+                            let _ = tx.blocking_send(());
                         }
                     }
                     tray::UserEvent::Quit => {
@@ -399,7 +407,7 @@ fn main() -> anyhow::Result<()> {
                         *control_flow = ControlFlow::Exit;
                     }
                 },
-                _ => ()
+                _ => (),
             }
         });
     } else {
@@ -408,7 +416,7 @@ fn main() -> anyhow::Result<()> {
         let (_tx, rx) = tokio::sync::mpsc::channel(1);
         rt.block_on(run_server(rx))?;
     }
-    
+
     Ok(())
 }
 

@@ -257,7 +257,13 @@ impl TorrentHandle for LibrqbitHandle {
         Ok(())
     }
 
-    async fn get_file_reader(&self, file_idx: usize, _start_offset: u64, _priority: u8) -> Result<Box<dyn FileStreamTrait>> {
+    async fn get_file_reader(
+        &self,
+        file_idx: usize,
+        _start_offset: u64,
+        _priority: u8,
+        _bitrate: Option<u64>,
+    ) -> Result<Box<dyn FileStreamTrait>> {
         let stream = self
             .handle
             .clone()
@@ -279,6 +285,12 @@ impl TorrentHandle for LibrqbitHandle {
             }
         }
         files
+    }
+
+    async fn get_file_path(&self, _file_idx: usize) -> Option<String> {
+        // librqbit doesn't expose local file paths easily
+        // Return None to fall back to HTTP URL probing
+        None
     }
 }
 

@@ -7,6 +7,7 @@ pub mod librqbit;
 #[cfg(feature = "libtorrent")]
 pub mod libtorrent;
 
+pub mod metadata;
 pub mod priorities;
 
 pub trait FileStreamTrait: AsyncRead + AsyncSeek + Unpin + Send + Sync {}
@@ -40,8 +41,20 @@ pub trait TorrentHandle: Send + Sync + Clone {
 
     async fn stats(&self) -> EngineStats;
     async fn add_trackers(&self, trackers: Vec<String>) -> Result<()>;
-    async fn get_file_reader(&self, file_idx: usize, start_offset: u64, priority: u8) -> Result<Box<dyn FileStreamTrait>>;
+    async fn get_file_reader(
+        &self,
+        file_idx: usize,
+        start_offset: u64,
+        priority: u8,
+        bitrate: Option<u64>,
+    ) -> Result<Box<dyn FileStreamTrait>>;
     async fn get_files(&self) -> Vec<BackendFileInfo>;
+    /// Get the local filesystem path for a file (for probing without HTTP loopback)
+    async fn get_file_path(&self, file_idx: usize) -> Option<String>;
+    /// Prepare a file for streaming by setting its priority and waiting for initial pieces.
+    /// This should be called BEFORE probing the file with ffprobe.
+    /// Returns Ok(()) when initial pieces are available, or Err on timeout.
+    async fn prepare_file_for_streaming(&self, file_idx: usize) -> Result<()>;
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -77,7 +90,6 @@ pub struct StatsFile {
     /// Progress 0.0 to 1.0 (from C++ file_progress)
     pub progress: f64,
 }
-
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -156,11 +168,11 @@ impl Default for TorrentSpeedProfile {
         Self {
             bt_download_speed_hard_limit: 0.0, // 0 = unlimited
             bt_download_speed_soft_limit: 0.0, // 0 = unlimited
-            bt_handshake_timeout: 20000, // 20s - faster failure for dead peers
+            bt_handshake_timeout: 20000,       // 20s - faster failure for dead peers
             // 65535 is a safe high number for "unlimited" without overflowing i32 when cast or causing OS issues.
-            bt_max_connections: 65535, 
+            bt_max_connections: 65535,
             bt_min_peers_for_stable: 5, // Lower barrier to entry
-            bt_request_timeout: 10000, // 10s
+            bt_request_timeout: 10000,  // 10s
         }
     }
 }
@@ -185,7 +197,6 @@ impl Default for BackendConfig {
         }
     }
 }
-
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]

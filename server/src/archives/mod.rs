@@ -1,22 +1,22 @@
 use anyhow::Result;
-use std::path::Path;
 use async_trait::async_trait;
+use std::path::Path;
 use tokio::io::{AsyncRead, AsyncSeek};
 
-pub mod zip;
+pub mod bridge;
+pub mod cache;
+pub mod nzb;
 pub mod rar;
 pub mod sevenz;
 pub mod tar;
 pub mod tgz;
-pub mod nzb;
-pub mod cache;
-pub mod bridge;
+pub mod zip;
 
 /// Represents a file inside an archive
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct ArchiveEntry {
-    pub path: String,       // Internal path in archive
+    pub path: String, // Internal path in archive
     pub size: u64,
     pub is_dir: bool,
 }
@@ -34,18 +34,15 @@ pub struct CacheConfig {
     /// Directory where cache files should be written
     pub cache_dir: Option<std::path::PathBuf>,
     /// Maximum cache size in bytes (0 = disabled)
-    pub cache_size: u64,
+    pub _cache_size: u64,
 }
 
 impl CacheConfig {
-    /// Returns true if caching is enabled (cache_size > 0)
-    pub fn is_enabled(&self) -> bool {
-        self.cache_size > 0
-    }
-    
     /// Get the cache directory, falling back to system temp if not configured
     pub fn get_dir_or_temp(&self) -> std::path::PathBuf {
-        self.cache_dir.clone().unwrap_or_else(|| std::env::temp_dir())
+        self.cache_dir
+            .clone()
+            .unwrap_or_else(|| std::env::temp_dir())
     }
 }
 
@@ -53,7 +50,7 @@ impl Default for CacheConfig {
     fn default() -> Self {
         Self {
             cache_dir: None,
-            cache_size: 10 * 1024 * 1024 * 1024, // 10GB default
+            _cache_size: 10 * 1024 * 1024 * 1024, // 10GB default
         }
     }
 }
@@ -80,9 +77,9 @@ pub fn is_archive(path: &Path) -> bool {
 #[allow(dead_code)]
 pub fn is_split_archive_part(path: &Path) -> Option<(String, u32)> {
     if let Some(_file_name) = path.file_stem().and_then(|s| s.to_str()) {
-         // Regex-like check for .partXXX or .rXX
-         // Simple heuristic: ends with .part\d+
-         // TODO: Implement robust split detection
+        // Regex-like check for .partXXX or .rXX
+        // Simple heuristic: ends with .part\d+
+        // TODO: Implement robust split detection
     }
     None
 }
@@ -106,9 +103,12 @@ pub async fn get_archive_reader(path: &Path) -> Result<Box<dyn ArchiveReader>> {
 }
 
 /// Create an archive reader with custom cache configuration
-pub async fn get_archive_reader_with_config(path: &Path, cache_config: CacheConfig) -> Result<Box<dyn ArchiveReader>> {
+pub async fn get_archive_reader_with_config(
+    path: &Path,
+    cache_config: CacheConfig,
+) -> Result<Box<dyn ArchiveReader>> {
     let path_str = path.to_string_lossy().to_lowercase();
-    
+
     // For local files, we open them here to pass into the new async handlers if possible,
     // OR the handlers themselves open the file (backward compat logic).
     // But since we are rewriting handlers to be async, let's try to unify.
@@ -119,11 +119,25 @@ pub async fn get_archive_reader_with_config(path: &Path, cache_config: CacheConf
         tracing::info!("Archive detected: ZIP at {:?}", path);
         Ok(Box::new(zip::ZipHandler::new(path.to_path_buf())))
     } else if path_str.ends_with(".rar") {
-        tracing::info!("Archive detected: RAR at {:?}, cache_dir={:?}", path, cache_config.cache_dir);
-        Ok(Box::new(rar::RarHandler::new_with_config(path.to_path_buf(), cache_config)))
+        tracing::info!(
+            "Archive detected: RAR at {:?}, cache_dir={:?}",
+            path,
+            cache_config.cache_dir
+        );
+        Ok(Box::new(rar::RarHandler::new_with_config(
+            path.to_path_buf(),
+            cache_config,
+        )))
     } else if path_str.ends_with(".7z") {
-        tracing::info!("Archive detected: 7z at {:?}, cache_dir={:?}", path, cache_config.cache_dir);
-        Ok(Box::new(sevenz::SevenZHandler::new_with_config(path.to_path_buf(), cache_config)))
+        tracing::info!(
+            "Archive detected: 7z at {:?}, cache_dir={:?}",
+            path,
+            cache_config.cache_dir
+        );
+        Ok(Box::new(sevenz::SevenZHandler::new_with_config(
+            path.to_path_buf(),
+            cache_config,
+        )))
     } else if path_str.ends_with(".tar") {
         tracing::info!("Archive detected: TAR at {:?}", path);
         Ok(Box::new(tar::TarHandler::new(path.to_path_buf()))) // TODO: Async Tar
@@ -135,11 +149,12 @@ pub async fn get_archive_reader_with_config(path: &Path, cache_config: CacheConf
         Ok(Box::new(nzb::NzbHandler::new(path.to_path_buf())))
     } else {
         tracing::info!("Normal file detected (not an archive): {:?}", path);
-        Err(anyhow::anyhow!("Unsupported archive type: {:?}", path.extension()))
+        Err(anyhow::anyhow!(
+            "Unsupported archive type: {:?}",
+            path.extension()
+        ))
     }
 }
-
-
 
 pub fn get_archive_reader_from_stream(
     reader: Box<dyn AsyncSeekableReader>,
@@ -151,6 +166,9 @@ pub fn get_archive_reader_from_stream(
     } else if ext == "7z" {
         Ok(Box::new(sevenz::SevenZHandler::new_with_reader(reader)))
     } else {
-        Err(anyhow::anyhow!("Unsupported archive type for streaming: .{}", ext))
+        Err(anyhow::anyhow!(
+            "Unsupported archive type for streaming: .{}",
+            ext
+        ))
     }
 }

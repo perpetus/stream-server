@@ -17,9 +17,12 @@
 #include <libtorrent/read_resume_data.hpp>
 #include <libtorrent/hex.hpp>
 #include <libtorrent/version.hpp>
+#include <libtorrent/create_torrent.hpp>
+#include <libtorrent/bencode.hpp>
 
 #include <sstream>
 #include <chrono>
+#include <iterator>
 
 namespace libtorrent_wrapper {
 
@@ -155,14 +158,36 @@ std::unique_ptr<Session> create_session(SessionSettings const& settings) {
     pack.set_int(lt::settings_pack::peer_timeout, 60);
     pack.set_int(lt::settings_pack::min_reconnect_time, 1);
     pack.set_int(lt::settings_pack::max_failcount, 3);
-    pack.set_int(lt::settings_pack::connection_speed, 30); // Connections per second
+    pack.set_int(lt::settings_pack::connection_speed, 200); // Connections per second (was 30)
     
+    // DHT Bootstrap nodes - helpful for fast initial startup
+    pack.set_str(lt::settings_pack::dht_bootstrap_nodes, 
+        "router.bittorrent.com:6881,"
+        "router.utorrent.com:6881,"
+        "dht.transmissionbt.com:6881,"
+        "dht.libtorrent.org:25401,"
+        "router.bitcomet.com:6881");
+
     // Piece selection for streaming
-    pack.set_bool(lt::settings_pack::strict_end_game_mode, false);
+    // CRITICAL: Enable strict endgame mode for deadline pieces
+    // This allows requesting the same blocks from MULTIPLE peers simultaneously
+    // The fastest peer wins, dramatically speeding up critical piece downloads
+    pack.set_bool(lt::settings_pack::strict_end_game_mode, true);
     pack.set_bool(lt::settings_pack::prioritize_partial_pieces, true);
     
-    // Outgoing connections (half_open_limit removed in newer libtorrent)
-    pack.set_int(lt::settings_pack::unchoke_slots_limit, 8);
+    // Faster connections for streaming
+    pack.set_bool(lt::settings_pack::smooth_connects, false);  // Don't spread out connection attempts
+    pack.set_int(lt::settings_pack::piece_timeout, 5);          // Time before considering piece stalled (was 20)
+    pack.set_int(lt::settings_pack::peer_connect_timeout, 3);   // Faster peer connection timeout (was 15)
+    pack.set_int(lt::settings_pack::request_timeout, 10);       // Faster request timeout (was 60)
+    
+    // Increase request queue depth for more aggressive downloading
+    pack.set_int(lt::settings_pack::max_out_request_queue, 500);      // Default 200
+    pack.set_int(lt::settings_pack::max_allowed_in_request_queue, 250); // Default 100
+    pack.set_int(lt::settings_pack::request_queue_time, 3);            // Default 5, reduce for faster requests
+    
+    // Outgoing connections
+    pack.set_int(lt::settings_pack::unchoke_slots_limit, 20); // (was 8)
     
     // Alert mask for debugging (can remove in production)
     pack.set_int(lt::settings_pack::alert_mask, 
@@ -591,6 +616,7 @@ rust::Vec<FileInfo> handle_get_files(TorrentHandle const& handle) {
         auto piece_len = ti->piece_length();
         info.first_piece = static_cast<int32_t>(file_offset / piece_len);
         info.last_piece = static_cast<int32_t>((file_offset + file_size - 1) / piece_len);
+        info.offset = file_offset;
         
         result.push_back(std::move(info));
     }
@@ -785,6 +811,18 @@ AddTorrentParams parse_magnet_uri(rust::Str uri) {
     result.name = rust::String(p.name);
     for (const auto& t : p.trackers)
         result.trackers.push_back(rust::String(t));
+    return result;
+}
+
+rust::Vec<uint8_t> handle_get_metadata(TorrentHandle const& handle) {
+    rust::Vec<uint8_t> result;
+    auto ti = handle.handle.torrent_file();
+    if (ti) {
+        lt::create_torrent ct(*ti);
+        std::vector<char> buf;
+        lt::bencode(std::back_inserter(buf), ct.generate());
+        for (char c : buf) result.push_back(static_cast<uint8_t>(c));
+    }
     return result;
 }
 

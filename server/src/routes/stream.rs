@@ -2,12 +2,52 @@ use crate::state::AppState;
 use axum::{
     body::Body,
     extract::{Path, RawQuery, State},
-    http::{header, StatusCode},
+    http::{StatusCode, header},
     response::{IntoResponse, Response},
 };
 
 use axum::http::HeaderMap;
+use futures_util::Stream;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
 use tokio::io::AsyncSeekExt;
+
+/// Guard that calls on_stream_end when dropped
+struct StreamGuard<S> {
+    inner: S,
+    engine: Arc<crate::state::AppState>,
+    info_hash: String,
+    notified: bool,
+}
+
+impl<S: Stream + Unpin> Stream for StreamGuard<S> {
+    type Item = S::Item;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.inner).poll_next(cx)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl<S> Drop for StreamGuard<S> {
+    fn drop(&mut self) {
+        if !self.notified {
+            self.notified = true;
+            let engine = self.engine.clone();
+            let info_hash = self.info_hash.clone();
+
+            // Spawn a task to notify stream end since Drop is sync
+            tokio::spawn(async move {
+                engine.engine.on_stream_end(&info_hash).await;
+                tracing::debug!("StreamGuard: Notified stream end for {}", info_hash);
+            });
+        }
+    }
+}
 
 pub async fn stream_video(
     State(state): State<AppState>,
@@ -64,6 +104,10 @@ pub async fn stream_video(
         }
     };
 
+    // --- Stream Lifecycle: Notify start and focus bandwidth ---
+    state.engine.on_stream_start(&info_hash).await;
+    state.engine.focus_torrent(&info_hash).await;
+
     // Parse start offset from Range header for prioritization
     let start_offset_hint = if let Some(range_header) = headers.get(header::RANGE) {
         let range_str = range_header.to_str().unwrap_or("");
@@ -87,7 +131,12 @@ pub async fn stream_video(
     };
 
     // Await the async get_file
-    tracing::debug!("stream_video: Calling get_file({}) with offset {} and priority {}", idx, start_offset_hint, priority);
+    tracing::debug!(
+        "stream_video: Calling get_file({}) with offset {} and priority {}",
+        idx,
+        start_offset_hint,
+        priority
+    );
     if let Some(mut file) = engine.get_file(idx, start_offset_hint, priority).await {
         tracing::debug!(
             "stream_video: get_file returned success. Size={}",
@@ -140,7 +189,7 @@ pub async fn stream_video(
         let content_length = end - start + 1;
 
         let mut res_headers = header::HeaderMap::new();
-        
+
         // Detect file type
         let mime = if name.ends_with(".mp4") {
             "video/mp4"
@@ -177,10 +226,10 @@ pub async fn stream_video(
         } else {
             "application/octet-stream"
         };
-        
+
         // Log detected file type
         tracing::info!("Media file detected: {} ({})", name, mime);
-        
+
         res_headers.insert(header::CONTENT_TYPE, mime.parse().unwrap());
 
         res_headers.insert(header::CONTENT_LENGTH, content_length.into());
@@ -197,10 +246,20 @@ pub async fn stream_video(
         let reader = tokio::io::AsyncReadExt::take(file, content_length);
 
         // Use ReaderStream to convert AsyncRead to Stream for Axum Body
-        let stream = tokio_util::io::ReaderStream::new(reader);
-        let body = Body::from_stream(stream);
+        // OPTIMIZATION: Use 64KB buffer (vs default 8KB) to reduce poll_read overhead
+        // and set_priorities calculation frequency in the backend.
+        let base_stream = tokio_util::io::ReaderStream::with_capacity(reader, 65536);
 
-        tracing::debug!("stream_video: Sending body response");
+        // Wrap with StreamGuard to notify when stream ends
+        let guarded_stream = StreamGuard {
+            inner: base_stream,
+            engine: Arc::new(state.clone()),
+            info_hash: info_hash.clone(),
+            notified: false,
+        };
+        let body = Body::from_stream(guarded_stream);
+
+        tracing::debug!("stream_video: Sending body response with lifecycle tracking");
 
         if headers.contains_key(header::RANGE) {
             (StatusCode::PARTIAL_CONTENT, res_headers, body).into_response()

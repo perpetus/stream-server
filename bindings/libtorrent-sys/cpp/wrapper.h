@@ -154,6 +154,7 @@ bool handle_need_save_resume_data(TorrentHandle const& handle);
 // ============================================================================
 
 AddTorrentParams parse_magnet_uri(rust::Str uri);
+rust::Vec<uint8_t> handle_get_metadata(TorrentHandle const& handle);
 rust::String make_magnet_uri(TorrentHandle const& handle);
 rust::String libtorrent_version();
 

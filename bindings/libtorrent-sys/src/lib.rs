@@ -74,6 +74,10 @@ mod ffi {
         download_limit: i32,
         /// Sequential download mode
         sequential_download: bool,
+        /// Info hash (v1)
+        info_hash: String,
+        /// Info hash (v2)
+        info_hash_v2: String,
     }
 
     /// Torrent status information
@@ -174,6 +178,8 @@ mod ffi {
         first_piece: i32,
         /// Last piece index
         last_piece: i32,
+        /// File offset in the torrent (global byte offset)
+        offset: i64,
     }
 
     /// Peer information
@@ -448,6 +454,7 @@ mod ffi {
         // Utilities
         // ------------------------------------------------------------------------
         fn parse_magnet_uri(uri: &str) -> Result<AddTorrentParams>;
+        fn handle_get_metadata(handle: &TorrentHandle) -> Vec<u8>;
         fn make_magnet_uri(handle: &TorrentHandle) -> String;
         fn libtorrent_version() -> String;
     }
@@ -704,6 +711,11 @@ impl LibtorrentHandle {
         ffi::handle_add_tracker(self.inner.pin_mut(), url, tier)
     }
 
+    /// Replace trackers
+    pub fn replace_trackers(&mut self, urls: &[String]) {
+        ffi::handle_replace_trackers(self.inner.pin_mut(), urls)
+    }
+
     /// Force recheck
     pub fn force_recheck(&mut self) {
         ffi::handle_force_recheck(self.inner.pin_mut())
@@ -712,6 +724,11 @@ impl LibtorrentHandle {
     /// Force reannounce
     pub fn force_reannounce(&mut self) {
         ffi::handle_force_reannounce(self.inner.pin_mut())
+    }
+
+    /// Force DHT announce
+    pub fn force_dht_announce(&mut self) {
+        ffi::handle_force_dht_announce(self.inner.pin_mut())
     }
 
     /// Move storage to new path
@@ -727,6 +744,11 @@ impl LibtorrentHandle {
     /// Set download limit
     pub fn set_download_limit(&mut self, limit: i32) {
         ffi::handle_set_download_limit(self.inner.pin_mut(), limit)
+    }
+
+    /// Get metadata as .torrent bytes
+    pub fn get_metadata(&self) -> Vec<u8> {
+        ffi::handle_get_metadata(&self.inner)
     }
 
     /// Make magnet URI

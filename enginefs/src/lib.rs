@@ -49,6 +49,8 @@ pub struct BackendEngineFS<B: TorrentBackend> {
     tracker_manager: Arc<crate::trackers::TrackerManager>,
     pub cache_dir: std::path::PathBuf,
     pub download_dir: std::path::PathBuf,
+    /// Track active streams per info_hash for single-file prioritization
+    active_streams: Arc<RwLock<HashMap<String, usize>>>,
 }
 
 #[cfg(all(feature = "librqbit", not(feature = "libtorrent")))]
@@ -81,6 +83,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             tracker_manager,
             cache_dir,
             download_dir: download_dir.clone(),
+            active_streams: Arc::new(RwLock::new(HashMap::new())),
         };
 
         let engines_clone = engines.clone();
@@ -200,11 +203,51 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         let engines = self.engines.read().await;
         engines.keys().cloned().collect()
     }
+
+    /// Called when a stream starts for a torrent
+    /// Tracks active streams and can be used to implement single-file prioritization
+    pub async fn on_stream_start(&self, info_hash: &str) {
+        let mut streams = self.active_streams.write().await;
+        let count = streams.entry(info_hash.to_lowercase()).or_insert(0);
+        *count += 1;
+
+        tracing::debug!(
+            "Stream started for {}, active stream count: {}",
+            info_hash,
+            *count
+        );
+    }
+
+    /// Called when a stream ends for a torrent
+    pub async fn on_stream_end(&self, info_hash: &str) {
+        let mut streams = self.active_streams.write().await;
+        if let Some(count) = streams.get_mut(&info_hash.to_lowercase()) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                streams.remove(&info_hash.to_lowercase());
+            }
+        }
+
+        let remaining = streams.values().sum::<usize>();
+        tracing::debug!(
+            "Stream ended for {}, total active streams: {}",
+            info_hash,
+            remaining
+        );
+    }
+
+    /// Get a reference to the backend for direct access
+    pub fn get_backend(&self) -> &Arc<B> {
+        &self.backend
+    }
 }
 
 #[cfg(all(feature = "librqbit", not(feature = "libtorrent")))]
 impl BackendEngineFS<LibrqbitBackend> {
-    pub async fn new(root_dir: std::path::PathBuf, _cache_config: EngineCacheConfig) -> Result<Self> {
+    pub async fn new(
+        root_dir: std::path::PathBuf,
+        _cache_config: EngineCacheConfig,
+    ) -> Result<Self> {
         let download_dir = root_dir.join("rqbit-downloads");
         let (backend, restored) = LibrqbitBackend::new(download_dir.clone()).await?;
         Ok(Self::new_with_backend(
@@ -218,7 +261,10 @@ impl BackendEngineFS<LibrqbitBackend> {
 
 #[cfg(feature = "libtorrent")]
 impl BackendEngineFS<LibtorrentBackend> {
-    pub async fn new(root_dir: std::path::PathBuf, config: crate::backend::BackendConfig) -> Result<Self> {
+    pub async fn new(
+        root_dir: std::path::PathBuf,
+        config: crate::backend::BackendConfig,
+    ) -> Result<Self> {
         let download_dir = root_dir.join("libtorrent-downloads");
         let backend = LibtorrentBackend::new(download_dir.clone(), config)?;
         // For libtorrent we don't restore handles automatically yet in this simple impl
@@ -234,5 +280,14 @@ impl BackendEngineFS<LibtorrentBackend> {
     pub async fn update_speed_profile(&self, profile: &crate::backend::TorrentSpeedProfile) {
         self.backend.update_session_settings(profile).await;
     }
-}
 
+    /// Pause all torrents except the specified one to focus bandwidth on streaming
+    pub async fn focus_torrent(&self, target_info_hash: &str) {
+        self.backend.focus_torrent(target_info_hash).await;
+    }
+
+    /// Resume all paused torrents (called when streaming ends)
+    pub async fn resume_all_torrents(&self) {
+        self.backend.resume_all_torrents().await;
+    }
+}
