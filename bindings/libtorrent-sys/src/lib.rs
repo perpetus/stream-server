@@ -249,6 +249,8 @@ mod ffi {
         timestamp: i64,
         /// Associated info_hash (if any)
         info_hash: String,
+        /// Piece index (for piece_finished_alert, -1 otherwise)
+        piece_index: i32,
     }
 
     /// DHT stats
@@ -694,7 +696,6 @@ impl LibtorrentHandle {
     pub fn get_file_priorities(&self) -> Vec<i32> {
         ffi::handle_get_file_priorities(&self.inner)
     }
-
 
     /// Get peers
     pub fn peers(&self) -> Vec<PeerInfo> {

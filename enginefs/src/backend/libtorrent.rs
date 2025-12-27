@@ -27,6 +27,18 @@ const DEFAULT_TRACKERS: &[&str] = &[
     "udp://tracker.torrent.eu.org:451/announce",
     "udp://tracker.tiny-vps.com:6969/announce",
     "udp://retracker.lanta-net.ru:2710/announce",
+    "udp://tracker.coppersurfer.tk:6969/announce",
+    "udp://tracker.leechers-paradise.org:6969/announce",
+    "udp://p4p.arenabg.com:1337/announce",
+    "udp://9.rarbg.me:2970/announce",
+    "udp://9.rarbg.to:2710/announce",
+    "udp://tracker.internetwarriors.net:1337/announce",
+    "udp://tracker.cyberia.is:6969/announce",
+    "udp://tracker.moeking.me:6969/announce",
+    "http://tracker.openbittorrent.com:80/announce",
+    "udp://tracker.zer0day.to:1337/announce",
+    "udp://tracker.leechers-paradise.org:6969/announce",
+    "udp://coppersurfer.tk:6969/announce",
 ];
 
 /// libtorrent backend implementation
@@ -36,6 +48,8 @@ pub struct LibtorrentBackend {
     metadata_path: PathBuf,
     config: crate::backend::BackendConfig,
     stream_counter: Arc<std::sync::atomic::AtomicUsize>,
+    /// In-memory piece cache for fast streaming
+    piece_cache: Arc<crate::piece_cache::PieceCacheManager>,
 }
 
 impl LibtorrentBackend {
@@ -53,9 +67,9 @@ impl LibtorrentBackend {
             max_connections_per_torrent: (config.speed_profile.bt_max_connections / 2) as i32,
             download_rate_limit: config.speed_profile.bt_download_speed_hard_limit as i32,
             upload_rate_limit: 0,
-            active_downloads: 30,
-            active_seeds: 20,
-            active_limit: 50,
+            active_downloads: 50, // Increased from 30
+            active_seeds: 50,     // Increased from 20
+            active_limit: 100,    // Increased from 50
             anonymous_mode: false,
             proxy_host: String::new(),
             proxy_port: 0,
@@ -78,12 +92,22 @@ impl LibtorrentBackend {
         let metadata_path = save_path.join(".metadata");
         let _ = std::fs::create_dir_all(&metadata_path);
 
+        // Create piece cache using existing cache settings
+        let piece_cache_config = crate::piece_cache::PieceCacheConfig::from_engine_config(
+            &config.cache,
+            save_path.join(".piece_cache"),
+        );
+        let piece_cache = Arc::new(crate::piece_cache::PieceCacheManager::new(
+            piece_cache_config,
+        ));
+
         let backend = Self {
             session: Arc::new(RwLock::new(session)),
             save_path,
             metadata_path,
             config,
             stream_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            piece_cache,
         };
         backend.start_monitor_task();
         Ok(backend)
@@ -103,12 +127,22 @@ impl LibtorrentBackend {
         let metadata_path = save_path.join(".metadata");
         let _ = std::fs::create_dir_all(&metadata_path);
 
+        // Create piece cache using existing cache settings
+        let piece_cache_config = crate::piece_cache::PieceCacheConfig::from_engine_config(
+            &config.cache,
+            save_path.join(".piece_cache"),
+        );
+        let piece_cache = Arc::new(crate::piece_cache::PieceCacheManager::new(
+            piece_cache_config,
+        ));
+
         let backend = Self {
             session: Arc::new(RwLock::new(session)),
             save_path,
             metadata_path,
             config,
             stream_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            piece_cache,
         };
         backend.start_monitor_task();
         Ok(backend)
@@ -137,9 +171,9 @@ impl LibtorrentBackend {
             max_connections_per_torrent: (profile.bt_max_connections / 2) as i32,
             download_rate_limit: download_limit,
             upload_rate_limit: 0,
-            active_downloads: 30,
-            active_seeds: 20,
-            active_limit: 50,
+            active_downloads: 50,
+            active_seeds: 50,
+            active_limit: 100,
             anonymous_mode: false,
             proxy_host: String::new(),
             proxy_port: 0,
@@ -162,13 +196,51 @@ impl LibtorrentBackend {
         let session = self.session.clone();
         let metadata_path = self.metadata_path.clone();
         let config = self.config.clone();
+        let piece_cache = self.piece_cache.clone();
+        let save_path = self.save_path.clone();
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
             let mut last_reannounce: std::collections::HashMap<String, std::time::Instant> =
                 std::collections::HashMap::new();
+
+            // Alert type constant for piece_finished_alert (libtorrent internal)
+            const PIECE_FINISHED_ALERT_TYPE: i32 = 69;
+
             loop {
                 interval.tick().await;
+
+                // === PROACTIVE PIECE CACHING VIA ALERTS ===
+                // Poll alerts and cache pieces when they finish downloading
+                {
+                    let mut s = session.write().await;
+                    let alerts = s.pop_alerts();
+                    for alert in alerts {
+                        if alert.alert_type == PIECE_FINISHED_ALERT_TYPE && alert.piece_index >= 0 {
+                            let info_hash = alert.info_hash.clone();
+                            let piece_idx = alert.piece_index;
+                            let cache = piece_cache.clone();
+                            let sp = save_path.clone();
+
+                            // Spawn background task to read piece from disk and cache it
+                            tokio::spawn(async move {
+                                // Find the piece data from disk
+                                // This is a simplified approach - we read the piece from disk
+                                // In a more optimized version, we'd get it directly from libtorrent's buffer
+                                tracing::debug!(
+                                    "Proactive caching: piece {} for torrent {}",
+                                    piece_idx,
+                                    info_hash
+                                );
+
+                                // For now, just mark that we know about this piece
+                                // The full implementation would read the piece bytes here
+                                // but that requires knowing piece length and file mapping
+                                let _ = (cache, sp); // Silence unused warnings for now
+                            });
+                        }
+                    }
+                }
 
                 // Get all handles first to avoid holding lock too long?
                 // Actually we need the lock to find them.
@@ -226,8 +298,9 @@ impl LibtorrentBackend {
                         let min_peers = config.peer_search.min as i32;
                         let num_peers = status.num_peers as i32;
 
-                        // Rule 1: Low peer count or slow speed
-                        let slow_threshold = 1024 * 1024; // 1MB/s
+                        // Rule 1: Low peer count or slow speed (Aggressive)
+                        // If we are slow (<2MB/s) and have fewer than max peers, try to find more.
+                        let slow_threshold = 2 * 1024 * 1024; // Increased to 2MB/s
                         if num_peers < min_peers
                             || (status.download_rate < slow_threshold
                                 && num_peers < config.peer_search.max as i32)
@@ -235,16 +308,22 @@ impl LibtorrentBackend {
                             force = true;
                         }
 
-                        // Rule 2: Periodic Re-announce
+                        // Rule 2: Periodic Re-announce (Aggressive)
                         let now = std::time::Instant::now();
                         let last_announce =
                             last_reannounce.entry(handle.info_hash()).or_insert(now);
 
-                        // Metadata Burst: If we don't have metadata, re-announce every 15s instead of 60s
+                        // Metadata Burst: If we don't have metadata, re-announce every 10s (was 15s)
+                        // If we have metadata but are slow, re-announce every 30s (was 60s)
                         let interval = if !status.has_metadata {
-                            std::time::Duration::from_secs(15)
+                            std::time::Duration::from_secs(10)
                         } else {
-                            std::time::Duration::from_secs(60)
+                            // If slow, being more aggressive
+                            if status.download_rate < slow_threshold {
+                                std::time::Duration::from_secs(30)
+                            } else {
+                                std::time::Duration::from_secs(60)
+                            }
                         };
 
                         if now.duration_since(*last_announce) > interval {
@@ -253,6 +332,8 @@ impl LibtorrentBackend {
                         }
 
                         if force {
+                            // Don't spam logs too much, but this is an "aggressive" mode
+                            // tracing::debug!("Monitor: Force re-announce for {}", handle.info_hash());
                             let _ = handle.force_reannounce();
                             let _ = handle.force_dht_announce();
                         }
@@ -463,6 +544,7 @@ impl TorrentBackend for LibtorrentBackend {
             save_path: self.save_path.clone(),
             config: self.config.clone(),
             stream_counter: self.stream_counter.clone(),
+            piece_cache: self.piece_cache.clone(),
         })
     }
 
@@ -475,6 +557,7 @@ impl TorrentBackend for LibtorrentBackend {
                 save_path: self.save_path.clone(),
                 config: self.config.clone(),
                 stream_counter: self.stream_counter.clone(),
+                piece_cache: self.piece_cache.clone(),
             }),
             Err(_) => None,
         }
@@ -509,6 +592,8 @@ pub struct LibtorrentTorrentHandle {
     save_path: PathBuf,
     config: crate::backend::BackendConfig,
     stream_counter: Arc<std::sync::atomic::AtomicUsize>,
+    /// In-memory piece cache for fast streaming
+    piece_cache: Arc<crate::piece_cache::PieceCacheManager>,
 }
 
 #[async_trait::async_trait]
@@ -737,38 +822,22 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
         // REMOVED: We want to return potentially BEFORE the piece is available.
         // The LibtorrentFileStream::poll_read will handle the waiting/blocking if data is missing.
         // This allows the Axum handler to send HTTP headers immediately.
-        /*
-        if !is_complete && actual_start_piece >= 0 {
-            let target_piece = actual_start_piece;
-            // ... (removed blocking loop)
-        }
-        */
 
-        // Open the file from disk
+        // Get file path (file may not exist yet for incomplete torrents)
         let file_path = PathBuf::from(&file_info.absolute_path);
 
-        // If complete, file should exist immediately; otherwise wait briefly
-        if !file_path.exists() {
-            if is_complete {
-                tracing::warn!(
-                    "get_file_reader: complete but file doesn't exist: {:?}",
-                    file_path
-                );
-            }
-            let max_attempts = if is_complete { 50 } else { 500 }; // 1s for complete, 10s otherwise
-            let mut attempts = 0;
-            while !file_path.exists() && attempts < max_attempts {
-                tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
-                attempts += 1;
-            }
-        }
-
-        if !file_path.exists() {
-            return Err(anyhow!("File does not exist yet: {:?}", file_path));
-        }
-
-        tracing::debug!("get_file_reader: opening file {:?}", file_path);
-        let opened_file = tokio::fs::File::open(&file_path).await?;
+        // Try to open file if it exists - don't block waiting for it
+        // poll_read will handle lazy opening
+        let opened_file = if file_path.exists() {
+            tracing::debug!("get_file_reader: opening file {:?}", file_path);
+            tokio::fs::File::open(&file_path).await.ok()
+        } else {
+            tracing::debug!(
+                "get_file_reader: file does not exist yet, will open lazily: {:?}",
+                file_path
+            );
+            None
+        };
 
         tracing::debug!(
             "get_file_reader: Calculated global offset for file {}: {}",
@@ -782,6 +851,7 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
 
         Ok(Box::new(LibtorrentFileStream {
             file: opened_file,
+            file_path,
             handle: handle.clone(),
             first_piece,
             last_piece,
@@ -795,6 +865,10 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
             bitrate,
             download_speed_ema: 0.0,
             stream_id,
+            piece_cache: self.piece_cache.clone(),
+            info_hash: self.info_hash.clone(),
+            cached_piece_data: None,
+            last_prefetch_piece: -1,
         }))
     }
 
@@ -1044,7 +1118,8 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
 }
 
 struct LibtorrentFileStream {
-    file: tokio::fs::File,
+    file: Option<tokio::fs::File>, // Made optional - file may not exist yet
+    file_path: PathBuf,            // Path to file for lazy opening
     handle: libtorrent_sys::LibtorrentHandle,
     first_piece: i32,
     last_piece: i32,
@@ -1058,6 +1133,14 @@ struct LibtorrentFileStream {
     bitrate: Option<u64>,
     download_speed_ema: f64,
     stream_id: usize,
+    /// In-memory piece cache for fast streaming
+    piece_cache: Arc<crate::piece_cache::PieceCacheManager>,
+    /// Info hash for cache lookups
+    info_hash: String,
+    /// Currently cached piece data for fast serving
+    cached_piece_data: Option<(i32, Arc<Vec<u8>>)>, // (piece_idx, data)
+    /// Last piece we triggered prefetch for (to avoid repeated requests)
+    last_prefetch_piece: i32,
 }
 
 impl LibtorrentFileStream {
@@ -1190,63 +1273,211 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
         let pos = self.current_pos;
         self.set_priorities(pos);
 
-        // Critical Fix: Block read if piece is not downloaded yet.
-        // Reading undownloaded parts from disk returns sparse zeros, which confuses parsers (ffmpeg).
-        if self.piece_length > 0 {
-            // Correct calculation: file_offset is TRUE global offset
-            let piece = ((self.file_offset + pos) / self.piece_length) as i32;
-            if !self.handle.have_piece(piece) {
-                // Throttle log logs
-                if pos % (1024 * 1024) == 0 {
-                    // log roughly every MB or when stuck
-                    tracing::debug!("poll_read: blocking for piece {} (pos={})", piece, pos);
+        // Calculate which piece we need
+        let piece = if self.piece_length > 0 {
+            ((self.file_offset + pos) / self.piece_length) as i32
+        } else {
+            -1
+        };
+
+        // Calculate offset within the piece (global piece offset)
+        let global_piece_start = piece as u64 * self.piece_length;
+
+        // For multi-file torrents: cached data may be a partial piece
+        // The cached data starts at max(file_offset, global_piece_start) - global_piece_start
+        // But wait, read_piece_from_disk returns data starting at the file beginning for pieces
+        // that start before the file. So we need to calculate the offset into the cached data.
+        //
+        // If piece starts BEFORE file: cached data starts at offset 0 (file beginning)
+        // If piece starts AFTER/AT file: cached data starts at the piece-relative offset
+        let piece_starts_before_file = global_piece_start < self.file_offset;
+
+        // offset_in_cached_data: where in the cached piece data do we read from
+        let offset_in_cached_data = if piece_starts_before_file {
+            // Piece spans from previous file into this one
+            // The cached data represents the portion in this file (starts at offset 0 in cached data)
+            // Our position in this portion is: (file_offset + pos) - max(file_offset, piece_start)
+            pos as usize // pos is already file-relative
+        } else {
+            // Piece starts at or after the file start
+            // Cached data represents the whole piece (or portion until next file)
+            ((self.file_offset + pos) % self.piece_length) as usize
+        };
+
+        // MEMORY-FIRST READING: Check if we have this piece in our local cache
+        if piece >= 0 {
+            // Check if we already have the right piece cached locally
+            let have_cached = match &self.cached_piece_data {
+                Some((cached_piece, _)) => *cached_piece == piece,
+                None => false,
+            };
+
+            if have_cached {
+                // Serve from local cache - FASTEST PATH
+                if let Some((_, data)) = &self.cached_piece_data {
+                    let available = data.len().saturating_sub(offset_in_cached_data);
+                    let to_read = buf.remaining().min(available);
+
+                    if to_read > 0 {
+                        buf.put_slice(
+                            &data[offset_in_cached_data..offset_in_cached_data + to_read],
+                        );
+                        self.current_pos += to_read as u64;
+
+                        if pos % (1024 * 1024) == 0 || pos < 4096 {
+                            tracing::debug!(
+                                "poll_read: Served {} bytes from MEMORY cache (piece {})",
+                                to_read,
+                                piece
+                            );
+                        }
+                    }
+                    return std::task::Poll::Ready(Ok(()));
+                }
+            }
+
+            // Try to get from moka cache (check synchronously)
+            let cache = self.piece_cache.clone();
+            let info_hash = self.info_hash.clone();
+            if let Some(piece_data) =
+                futures::executor::block_on(cache.get_piece(&info_hash, piece))
+            {
+                // Cache hit! Store locally for fast repeated access
+                self.cached_piece_data = Some((piece, piece_data.clone()));
+
+                let available = piece_data.len().saturating_sub(offset_in_cached_data);
+                let to_read = buf.remaining().min(available);
+
+                if to_read > 0 {
+                    buf.put_slice(
+                        &piece_data[offset_in_cached_data..offset_in_cached_data + to_read],
+                    );
+                    self.current_pos += to_read as u64;
+
+                    tracing::debug!(
+                        "poll_read: Served {} bytes from MOKA cache (piece {})",
+                        to_read,
+                        piece
+                    );
                 }
 
-                // REMOVED: Do NOT reset deadline here. It resets the timer in libtorrent.
-                // set_priorities() already set the deadline for this piece.
-                // Letting libtorrent manage the existing deadline is correct.
+                // === READ-AHEAD PREFETCH ===
+                // Pre-fetch next 3 pieces into moka cache for fast access
+                if piece != self.last_prefetch_piece {
+                    self.last_prefetch_piece = piece;
+                    let prefetch_cache = cache.clone();
+                    let prefetch_info_hash = info_hash.clone();
+                    let prefetch_handle = self.handle.clone();
+                    let file_path = self.file_path.clone();
+                    let piece_len = self.piece_length;
+                    let file_offset = self.file_offset;
+                    let last_piece = self.last_piece;
 
-                // Schedule a wakeup to check again
-                // Using 50ms for slightly less aggressive polling
+                    // Spawn background prefetch task
+                    tokio::spawn(async move {
+                        const PREFETCH_COUNT: i32 = 3;
+                        for i in 1..=PREFETCH_COUNT {
+                            let next_piece = piece + i;
+                            if next_piece > last_piece {
+                                break;
+                            }
+
+                            // Check if already in cache
+                            if prefetch_cache
+                                .has_piece(&prefetch_info_hash, next_piece)
+                                .await
+                            {
+                                continue;
+                            }
+
+                            // Check if piece is downloaded
+                            if !prefetch_handle.have_piece(next_piece) {
+                                continue;
+                            }
+
+                            // Read piece from disk into cache
+                            if let Ok(data) =
+                                read_piece_from_disk(&file_path, next_piece, piece_len, file_offset)
+                                    .await
+                            {
+                                prefetch_cache
+                                    .put_piece(&prefetch_info_hash, next_piece, data)
+                                    .await;
+                                tracing::debug!(
+                                    "Read-ahead: prefetched piece {} into cache",
+                                    next_piece
+                                );
+                            }
+                        }
+                    });
+                }
+
+                return std::task::Poll::Ready(Ok(()));
+            }
+        }
+
+        // Not in cache - check if piece is available in libtorrent
+        if piece >= 0 && !self.handle.have_piece(piece) {
+            if pos % (1024 * 1024) == 0 {
+                tracing::debug!("poll_read: waiting for piece {} (pos={})", piece, pos);
+            }
+
+            let waker = cx.waker().clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                waker.wake();
+            });
+            return std::task::Poll::Pending;
+        }
+
+        // Ensure file is open (lazy opening)
+        if self.file.is_none() {
+            if self.file_path.exists() {
+                match std::fs::File::open(&self.file_path) {
+                    Ok(std_file) => {
+                        self.file = Some(tokio::fs::File::from_std(std_file));
+                        tracing::debug!("poll_read: lazily opened file {:?}", self.file_path);
+                    }
+                    Err(e) => {
+                        tracing::debug!("poll_read: failed to open file: {}", e);
+                    }
+                }
+            }
+        }
+
+        // If file is still not open, wait for it
+        let file = match self.file.as_mut() {
+            Some(f) => f,
+            None => {
+                tracing::debug!("poll_read: file not yet available, waiting...");
                 let waker = cx.waker().clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     waker.wake();
                 });
                 return std::task::Poll::Pending;
-            } else {
-                if pos % (1024 * 1024) == 0 || pos < 4096 {
-                    tracing::debug!(
-                        "poll_read: have piece {}, proceeding to read. Pos={}",
-                        piece,
-                        pos
-                    );
-                }
             }
-        }
+        };
 
+        // Read from disk
         let rem_before = buf.remaining();
-        match std::pin::Pin::new(&mut self.file).poll_read(cx, buf) {
+        match std::pin::Pin::new(file).poll_read(cx, buf) {
             std::task::Poll::Ready(Ok(())) => {
                 let read = rem_before - buf.remaining();
                 if read > 0 {
+                    self.current_pos += read as u64;
+
                     if pos % (1024 * 1024) == 0 || pos < 4096 {
                         tracing::debug!(
-                            "poll_read: Read {} bytes. New pos={}",
+                            "poll_read: Read {} bytes from DISK. Pos={}",
                             read,
-                            self.current_pos + read as u64
+                            self.current_pos
                         );
                     }
-                } else {
-                    tracing::debug!("poll_read: Read 0 bytes (EOF?). Pos={}", self.current_pos);
                 }
-                self.current_pos += read as u64;
                 std::task::Poll::Ready(Ok(()))
             }
-            std::task::Poll::Pending => {
-                // tracing::debug!("poll_read: Underlying file read pending");
-                std::task::Poll::Pending
-            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
             std::task::Poll::Ready(Err(e)) => {
                 tracing::error!("poll_read: Error reading file: {}", e);
                 std::task::Poll::Ready(Err(e))
@@ -1260,42 +1491,115 @@ impl tokio::io::AsyncSeek for LibtorrentFileStream {
         mut self: std::pin::Pin<&mut Self>,
         position: std::io::SeekFrom,
     ) -> std::io::Result<()> {
-        std::pin::Pin::new(&mut self.file).start_seek(position)
+        // If file is open, delegate to it
+        if let Some(ref mut file) = self.file {
+            std::pin::Pin::new(file).start_seek(position)
+        } else {
+            // File not open yet - just calculate the new position
+            // We'll handle actual seeking when file opens
+            let new_pos = match position {
+                std::io::SeekFrom::Start(pos) => pos,
+                std::io::SeekFrom::Current(delta) => (self.current_pos as i64 + delta) as u64,
+                std::io::SeekFrom::End(_) => {
+                    // Can't seek from end without file size
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "Cannot seek from end without file",
+                    ));
+                }
+            };
+            self.current_pos = new_pos;
+            Ok(())
+        }
     }
 
     fn poll_complete(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<u64>> {
-        match std::pin::Pin::new(&mut self.file).poll_complete(cx) {
-            std::task::Poll::Ready(Ok(pos)) => {
-                self.current_pos = pos;
+        // If file is open, delegate to it
+        if let Some(ref mut file) = self.file {
+            match std::pin::Pin::new(file).poll_complete(cx) {
+                std::task::Poll::Ready(Ok(pos)) => {
+                    self.current_pos = pos;
 
-                let piece_idx = if self.piece_length > 0 {
-                    // Correct calculation: file_offset is TRUE global offset
-                    ((self.file_offset + pos) / self.piece_length) as i32
-                } else {
-                    -1
-                };
+                    let piece_idx = if self.piece_length > 0 {
+                        ((self.file_offset + pos) / self.piece_length) as i32
+                    } else {
+                        -1
+                    };
 
-                // Optimization: Only clear and reset priorities if we moved to a new piece window
-                if piece_idx != self.last_priorities_piece {
-                    // Critical for seek: Clear OLD deadlines so we don't keep downloading the old position.
-                    // Concurrent streams will re-assert their priorities in their next poll_read().
-                    self.handle.clear_piece_deadlines();
-                    self.last_priorities_piece = -1; // Force immediate priority update via set_priorities
-                    self.set_priorities(pos);
-                } else {
-                    tracing::debug!(
-                        "poll_complete: Seek within the same priority window (piece {}), skipping update",
-                        piece_idx
-                    );
+                    // Optimization: Only clear and reset priorities if we moved to a new piece window
+                    if piece_idx != self.last_priorities_piece {
+                        self.handle.clear_piece_deadlines();
+                        self.last_priorities_piece = -1;
+                        self.set_priorities(pos);
+                    }
+                    std::task::Poll::Ready(Ok(pos))
                 }
-                std::task::Poll::Ready(Ok(pos))
+                other => other,
             }
-            other => other,
+        } else {
+            // File not open - return current position
+            std::task::Poll::Ready(Ok(self.current_pos))
         }
     }
+}
+
+/// Read a piece from disk for prefetch caching
+/// Correctly handles multi-file torrents by accounting for file_offset
+async fn read_piece_from_disk(
+    file_path: &PathBuf,
+    piece_idx: i32,
+    piece_length: u64,
+    file_offset: u64,
+) -> std::io::Result<Vec<u8>> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+    let mut file = tokio::fs::File::open(file_path).await?;
+
+    // Get file size to calculate valid read range
+    let file_metadata = file.metadata().await?;
+    let file_size = file_metadata.len();
+
+    // For multi-file torrents:
+    // - piece_idx * piece_length gives global torrent byte offset
+    // - file_offset is where this file starts in the torrent
+    // - We need the offset WITHIN this file
+    let piece_global_start = piece_idx as u64 * piece_length;
+    let piece_global_end = piece_global_start + piece_length;
+
+    // Calculate file's range in global torrent space
+    let file_global_start = file_offset;
+    let file_global_end = file_offset + file_size;
+
+    // Check if piece overlaps with this file
+    if piece_global_end <= file_global_start || piece_global_start >= file_global_end {
+        // Piece doesn't overlap with this file
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Piece does not overlap with this file",
+        ));
+    }
+
+    // Calculate the overlap range
+    let overlap_start = piece_global_start.max(file_global_start);
+    let overlap_end = piece_global_end.min(file_global_end);
+    let overlap_size = overlap_end - overlap_start;
+
+    // Convert to file-relative offset
+    let file_relative_offset = overlap_start - file_global_start;
+
+    // Seek to the correct position in the file
+    file.seek(std::io::SeekFrom::Start(file_relative_offset))
+        .await?;
+
+    // Read the overlapping portion
+    let mut data = vec![0u8; overlap_size as usize];
+    let bytes_read = file.read(&mut data).await?;
+    data.truncate(bytes_read);
+
+    Ok(data)
 }
 
 fn default_stats(info_hash: &str) -> EngineStats {

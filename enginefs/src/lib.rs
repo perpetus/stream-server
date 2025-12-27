@@ -12,8 +12,12 @@ pub mod cache;
 pub mod engine;
 pub mod files;
 pub mod hls;
+pub mod piece_cache;
 pub mod tracker_prober;
 pub mod trackers;
+
+// Re-export TrackerStorage for use by server crate
+pub use trackers::TrackerStorage;
 
 #[cfg(all(feature = "librqbit", not(feature = "libtorrent")))]
 use crate::backend::librqbit::LibrqbitBackend;
@@ -66,6 +70,16 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         cache_dir: std::path::PathBuf,
         download_dir: std::path::PathBuf,
     ) -> Self {
+        Self::new_with_backend_and_storage(backend, restored_handles, cache_dir, download_dir, None)
+    }
+
+    pub fn new_with_backend_and_storage(
+        backend: B,
+        restored_handles: HashMap<String, B::Handle>,
+        cache_dir: std::path::PathBuf,
+        download_dir: std::path::PathBuf,
+        tracker_storage: Option<Arc<dyn crate::trackers::TrackerStorage>>,
+    ) -> Self {
         let mut engines_map = HashMap::new();
         for (hash, handle) in restored_handles {
             engines_map.insert(
@@ -75,7 +89,12 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         }
 
         let engines = Arc::new(RwLock::new(engines_map));
-        let tracker_manager = Arc::new(crate::trackers::TrackerManager::new());
+
+        // Create tracker manager with or without storage
+        let tracker_manager = match tracker_storage {
+            Some(storage) => Arc::new(crate::trackers::TrackerManager::new_with_storage(storage)),
+            None => Arc::new(crate::trackers::TrackerManager::new()),
+        };
 
         let efs = Self {
             backend: Arc::new(backend),
@@ -126,38 +145,24 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         source: TorrentSource,
         extra_trackers: Option<Vec<String>>,
     ) -> Result<Arc<Engine<B::Handle>>> {
+        // Start with default trackers
         let mut trackers: Vec<String> = DEFAULT_TRACKERS.iter().map(|s| s.to_string()).collect();
+
+        // Add cached trackers from tracker manager (already ranked by RTT)
+        let cached_trackers = self.tracker_manager.get_trackers().await;
+        trackers.extend(cached_trackers);
+
+        // Add any extra trackers provided
         if let Some(extra) = extra_trackers {
             trackers.extend(extra);
         }
         trackers.sort();
         trackers.dedup();
 
-        let tracker_manager = self.tracker_manager.clone();
-
-        // Handle magnets if source is URL
-        if let TorrentSource::Url(ref url) = source {
-            if url.starts_with("magnet:") {
-                // We'll modify the URL to inject trackers if needed, but for now passing as is
-                // or rebuilding it if we were modifying it.
-                // The previous logic modified the magnet string.
-            }
-        }
+        debug!(count = trackers.len(), "Adding torrent with trackers");
 
         let handle = self.backend.add_torrent(source, trackers).await?;
         let info_hash = handle.info_hash();
-
-        // Background Ranking
-        let handle_clone = handle.clone();
-        tokio::spawn(async move {
-            let dynamic = tracker_manager.get_trackers().await;
-            if !dynamic.is_empty() {
-                let ranked = crate::tracker_prober::TrackerProber::rank_trackers(dynamic).await;
-                if !ranked.is_empty() {
-                    let _ = handle_clone.add_trackers(ranked).await;
-                }
-            }
-        });
 
         let mut engines = self.engines.write().await;
         if let Some(engine) = engines.get(&info_hash) {
@@ -265,14 +270,23 @@ impl BackendEngineFS<LibtorrentBackend> {
         root_dir: std::path::PathBuf,
         config: crate::backend::BackendConfig,
     ) -> Result<Self> {
+        Self::new_with_storage(root_dir, config, None).await
+    }
+
+    pub async fn new_with_storage(
+        root_dir: std::path::PathBuf,
+        config: crate::backend::BackendConfig,
+        tracker_storage: Option<Arc<dyn crate::trackers::TrackerStorage>>,
+    ) -> Result<Self> {
         let download_dir = root_dir.join("libtorrent-downloads");
         let backend = LibtorrentBackend::new(download_dir.clone(), config)?;
         // For libtorrent we don't restore handles automatically yet in this simple impl
-        Ok(Self::new_with_backend(
+        Ok(Self::new_with_backend_and_storage(
             backend,
             HashMap::new(),
             download_dir.clone(),
             download_dir,
+            tracker_storage,
         ))
     }
 

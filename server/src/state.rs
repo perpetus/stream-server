@@ -20,11 +20,19 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(engine: Arc<EngineFS>, settings: ServerSettings, config_dir: PathBuf) -> Self {
+        Self::new_with_shared_settings(engine, Arc::new(RwLock::new(settings)), config_dir)
+    }
+
+    pub fn new_with_shared_settings(
+        engine: Arc<EngineFS>,
+        settings: Arc<RwLock<ServerSettings>>,
+        config_dir: PathBuf,
+    ) -> Self {
         let settings_path = config_dir.join("settings.json");
 
         Self {
             engine,
-            settings: Arc::new(RwLock::new(settings)),
+            settings,
             settings_path,
             config_dir,
             local_index: LocalIndex::new(),
@@ -73,5 +81,104 @@ impl AppState {
 
         tracing::info!("Using default settings");
         defaults.clone()
+    }
+}
+
+/// Wrapper for TrackerStorage that bridges sync trait with async AppState
+/// This is created before EngineFS and passed to it for tracker persistence
+pub struct TrackerStorageBridge {
+    settings: Arc<RwLock<ServerSettings>>,
+    settings_path: PathBuf,
+}
+
+impl TrackerStorageBridge {
+    pub fn new(settings: Arc<RwLock<ServerSettings>>, settings_path: PathBuf) -> Self {
+        Self {
+            settings,
+            settings_path,
+        }
+    }
+}
+
+impl enginefs::TrackerStorage for TrackerStorageBridge {
+    fn get_cached_trackers(&self) -> Vec<String> {
+        // Use blocking_read for sync access from async context
+        // This is safe because we're only reading small data
+        let handle = tokio::runtime::Handle::try_current();
+        match handle {
+            Ok(h) => {
+                // We're in an async context, use block_in_place
+                tokio::task::block_in_place(|| {
+                    h.block_on(async {
+                        let settings = self.settings.read().await;
+                        settings.cached_trackers.clone()
+                    })
+                })
+            }
+            Err(_) => {
+                // Not in async context, shouldn't happen but return empty
+                Vec::new()
+            }
+        }
+    }
+
+    fn get_last_updated(&self) -> i64 {
+        let handle = tokio::runtime::Handle::try_current();
+        match handle {
+            Ok(h) => tokio::task::block_in_place(|| {
+                h.block_on(async {
+                    let settings = self.settings.read().await;
+                    settings.trackers_last_updated
+                })
+            }),
+            Err(_) => 0,
+        }
+    }
+
+    fn get_source_url(&self) -> String {
+        let handle = tokio::runtime::Handle::try_current();
+        match handle {
+            Ok(h) => tokio::task::block_in_place(|| {
+                h.block_on(async {
+                    let settings = self.settings.read().await;
+                    settings.trackers_source_url.clone()
+                })
+            }),
+            Err(_) => crate::routes::system::default_trackers_url(),
+        }
+    }
+
+    fn save_trackers(&self, trackers: Vec<String>, timestamp: i64) {
+        let settings = self.settings.clone();
+        let settings_path = self.settings_path.clone();
+
+        // Spawn async task to update and save
+        tokio::spawn(async move {
+            let mut guard = settings.write().await;
+            guard.cached_trackers = trackers;
+            guard.trackers_last_updated = timestamp;
+            let json = match serde_json::to_string_pretty(&*guard) {
+                Ok(j) => j,
+                Err(e) => {
+                    tracing::error!("Failed to serialize settings: {}", e);
+                    return;
+                }
+            };
+            drop(guard);
+
+            // Ensure parent directory exists
+            if let Some(parent) = settings_path.parent() {
+                if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                    tracing::error!("Failed to create settings directory: {}", e);
+                    return;
+                }
+            }
+
+            if let Err(e) = tokio::fs::write(&settings_path, json).await {
+                tracing::error!("Failed to save settings after tracker update: {}", e);
+            } else {
+                tracing::debug!("Saved cached trackers to settings");
+            }
+        });
     }
 }

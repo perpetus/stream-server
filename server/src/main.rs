@@ -86,6 +86,16 @@ async fn run_server(
 
     let settings = AppState::load_settings(&config_dir, &default_settings);
 
+    // Wrap settings in Arc<RwLock> early so we can share with TrackerStorageBridge
+    let settings_arc = Arc::new(tokio::sync::RwLock::new(settings.clone()));
+    let settings_path = config_dir.join("settings.json");
+
+    // Create tracker storage bridge for persisting trackers to settings
+    let tracker_storage = Arc::new(state::TrackerStorageBridge::new(
+        settings_arc.clone(),
+        settings_path.clone(),
+    ));
+
     // Create BackendConfig from settings
     let backend_config = enginefs::backend::BackendConfig {
         cache: enginefs::backend::priorities::EngineCacheConfig {
@@ -108,14 +118,16 @@ async fn run_server(
         },
     };
 
-    // EngineFS::new() now handles its own librqbit session and background cleanup.
-    // We pass the cache_dir as the root for downloads
+    // EngineFS::new_with_storage() passes tracker storage for persistence.
     // We also pass the backend config for prioritization/monitoring logic
-    let engine_fs = EngineFS::new(cache_dir.clone(), backend_config).await?;
+    let engine_fs =
+        EngineFS::new_with_storage(cache_dir.clone(), backend_config, Some(tracker_storage))
+            .await?;
     let engine = Arc::new(engine_fs);
 
-    // Create state once
-    let state = AppState::new(engine, settings, config_dir.clone());
+    // Create state with the shared settings Arc
+    let state =
+        AppState::new_with_shared_settings(engine, settings_arc.clone(), config_dir.clone());
 
     // Start Cache Cleaner
     // Start Cache Cleaner

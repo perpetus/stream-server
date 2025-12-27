@@ -1,11 +1,11 @@
 use crate::state::AppState;
 use axum::{
+    Json,
     extract::{Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 #[derive(serde::Deserialize)]
 pub struct StatsParams {
@@ -86,6 +86,22 @@ pub struct ServerSettings {
     pub remote_https: Option<String>,
     #[serde(rename = "transcodeProfile")]
     pub transcode_profile: Option<String>,
+
+    /// Cached list of fastest trackers (ranked by RTT)
+    #[serde(rename = "cachedTrackers", default)]
+    pub cached_trackers: Vec<String>,
+
+    /// Unix timestamp (seconds) when trackers were last updated
+    #[serde(rename = "trackersLastUpdated", default)]
+    pub trackers_last_updated: i64,
+
+    /// URL to fetch public tracker list (configurable)
+    #[serde(rename = "trackersSourceUrl", default = "default_trackers_url")]
+    pub trackers_source_url: String,
+}
+
+pub fn default_trackers_url() -> String {
+    "https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_best.txt".to_string()
 }
 
 impl Default for ServerSettings {
@@ -115,6 +131,9 @@ impl Default for ServerSettings {
             bt_min_peers_for_stable: 5,
             remote_https: None,
             transcode_profile: None,
+            cached_trackers: Vec::new(),
+            trackers_last_updated: 0,
+            trackers_source_url: default_trackers_url(),
         }
     }
 }
@@ -302,7 +321,7 @@ pub async fn get_https(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("API error: {}", e),
             )
-                .into_response()
+                .into_response();
         }
     };
 
@@ -313,7 +332,7 @@ pub async fn get_https(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("JSON error: {}", e),
             )
-                .into_response()
+                .into_response();
         }
     };
 
@@ -335,7 +354,7 @@ pub async fn get_https(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Failed to parse inner certificate JSON",
             )
-                .into_response()
+                .into_response();
         }
     };
 
@@ -348,10 +367,10 @@ pub async fn get_https(
         let key_path = state.config_dir.join("https-key.pem");
 
         if let Err(e) = tokio::fs::write(&cert_path, cert).await {
-             tracing::error!("Failed to write https-cert.pem: {}", e);
+            tracing::error!("Failed to write https-cert.pem: {}", e);
         }
         if let Err(e) = tokio::fs::write(&key_path, key).await {
-             tracing::error!("Failed to write https-key.pem: {}", e);
+            tracing::error!("Failed to write https-key.pem: {}", e);
         }
         tracing::info!("Saved HTTPS certificates to {:?}", state.config_dir);
     }

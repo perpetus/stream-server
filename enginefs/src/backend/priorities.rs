@@ -50,42 +50,69 @@ pub fn calculate_priorities(
         return priorities;
     }
 
+    // 1. DYNAMIC WINDOW SIZING
+    // -----------------------------------------------------------------------
+
+    // Base "Urgent" Window: The absolute minimum we need to keep playback going.
+    // Default: 15 pieces (~15MB-60MB depending on piece size).
+    // If bitrate is known, ensure at least 15 seconds.
+    let mut urgent_base_pieces = 15;
+    if let Some(br) = bitrate {
+        let pieces_for_15s = ((br * 15) / piece_length) as i32;
+        urgent_base_pieces = urgent_base_pieces.max(pieces_for_15s);
+    }
+
+    // Proactive "Lookahead" Window:
+    // If we are downloading significantly faster than the bitrate, expadn the window
+    // to build a larger safety buffer.
+    let mut proactive_bonus_pieces = 0;
+    if let Some(br) = bitrate {
+        if download_speed > (br * 15 / 10) {
+            // 1.5x bitrate
+            // We have excess bandwidth. Expand window up to 60s ahead.
+            let pieces_for_45s = ((br * 45) / piece_length) as i32;
+            proactive_bonus_pieces = pieces_for_45s;
+        }
+    } else {
+        // Fallback if bitrate unknown: if speed > 5MB/s, add 20 pieces (~20MB)
+        if download_speed > 5 * 1024 * 1024 {
+            proactive_bonus_pieces = 20;
+        }
+    }
+
     // Parameters for window sizing
     let (mut urgent_window, buffer_window, max_buffer_pieces) = if config.enabled {
         let max_pieces = (config.size / piece_length) as i32;
 
-        // Base urgent: 15 pieces (~15MB) - Reduced from 60 to prevent probe flooding
-        // If bitrate is known, ensure at least 10 seconds of content is "urgent"
-        let mut urgent = 15;
-        if let Some(br) = bitrate {
-            let pieces_for_10s = ((br * 10) / piece_length) as i32;
-            urgent = urgent.max(pieces_for_10s);
-        }
+        // Urgent = Base + Proactive
+        // But clamped to valid cache limits
+        let mut urgent = urgent_base_pieces + proactive_bonus_pieces;
 
-        // Buffer: Up to 15 extra pieces
+        // Cap urgent window to avoid insane values on huge cache
+        urgent = urgent.min(max_pieces).min(300); // Absolute max 300 pieces urgent
+
+        // Buffer: Fill the rest of the cache space, up to a limit
         let remaining_for_buffer = max_pieces.saturating_sub(urgent);
         let buffer = 15.min(remaining_for_buffer);
         (urgent, buffer, max_pieces)
     } else {
         // Cache Disabled: Streaming Mode
-        // Minimal window to keep playback going without filling disk
-        // Urgent: 15 pieces (~15-60MB). Slightly increased for safety.
-        (15, 0, 15)
+        // Use calculated values but clamp to a safe limit for strict streaming (e.g. 50 pieces max)
+        let urgent = (urgent_base_pieces + proactive_bonus_pieces).min(50);
+        (urgent, 0, urgent)
     };
 
     let start_piece = current_piece;
 
-    // Dynamic Head Window Calculation based on download speed and bitrate
-    // Target: Buffer enough data for N seconds of playback startup
-    // Dynamic Head Window Calculation based on download speed and bitrate
-    // Target: Buffer enough data for N seconds of playback startup
-    // REDUCED: 50MB is too much for immediate start. Use 5MB min, 50MB max.
-    let target_buffer_seconds = 5;
-    let minimum_buffer_bytes = 5 * 1024 * 1024u64; // Minimum 5MB (approx 5 pieces)
-    let maximum_buffer_bytes = 50 * 1024 * 1024u64; // Maximum 50MB to avoid over-buffering
+    // 2. DYNAMIC HEAD/DEADLINE CALCULATION
+    // -----------------------------------------------------------------------
 
-    // If bitrate is known, we use it to calculate required bytes for 10s.
-    // Otherwise we use a heuristic based on download speed.
+    // Calculate "Head Window": The extremely critical immediate future.
+    // We want this to be roughly 5-10 seconds of playback.
+    let target_buffer_seconds = 5;
+    let minimum_buffer_bytes = 5 * 1024 * 1024u64; // Minimum 5MB
+    let maximum_buffer_bytes = 50 * 1024 * 1024u64; // Maximum 50MB
+
     let target_head_bytes = if let Some(br) = bitrate {
         (br * target_buffer_seconds)
             .max(minimum_buffer_bytes)
@@ -98,12 +125,7 @@ pub fn calculate_priorities(
     };
 
     let mut head_window = (target_head_bytes / piece_length) as i32;
-    if head_window < 5 {
-        head_window = 5;
-    }
-    if head_window > 250 {
-        head_window = 250;
-    } // Increased cap for 4K
+    head_window = head_window.clamp(5, 250);
 
     // Urgent window must be at least head window + some body
     urgent_window = urgent_window.max(head_window + 15);
@@ -125,6 +147,17 @@ pub fn calculate_priorities(
 
     let effective_end_piece = end_piece.min(allowed_end_piece);
 
+    // Dynamic Deadline Steps
+    // If usage is high (low buffer/health) or speed is low, we might need stricter deadlines.
+    // For now, we use a simple heuristic:
+    // If we have high speed, we can afford slightly looser deadlines to allow
+    // multiple peers to compete naturally?
+    // ACTUALLY: High speed usually comes from aggressive requesting.
+    // Let's stick to a robust default but allow specific overrides.
+
+    // We'll just use the standard step but ensure head is strict.
+    // The "Staircase" ensures order.
+
     for p in start_piece..=effective_end_piece {
         let distance = p - start_piece;
 
@@ -138,20 +171,27 @@ pub fn calculate_priorities(
             // Background pre-caching (Lazy deadlines)
             20000 + (distance * 200)
         } else {
-            // Normal Streaming (Regular priority)
-            // Normal Streaming (Regular priority)
+            // Normal Streaming
             if distance < 5 {
-                // CRITICAL HEAD: Strict Staircase (0, 50, 100, 150, 200 ms)
-                // This forces sequential download of the first few chunks.
+                // CRITICAL HEAD: Very Strict Staircase
+                // 0, 50, 100, 150, 200
                 distance * 50
             } else if distance < head_window {
-                // HEAD WINDOW: Linear staircase (250, 300, 350...)
-                // We must maintain strict ordering to prevent "rarest first" from sniping later pieces.
+                // HEAD WINDOW: Linear staircase
                 250 + ((distance - 5) * 50)
             } else {
-                // BODY/TAIL: Relaxed but still ordered
-                // 10000+, but kept ordered
-                5000 + (distance * 10)
+                // BODY/TAIL
+                // If we are in the "proactive bonus" area (distance > urgent_base),
+                // we can be very relaxed.
+                let is_proactive_area = distance > urgent_base_pieces;
+
+                if is_proactive_area {
+                    // Relaxed deadlines (10s+) for lookahead
+                    10000 + (distance * 50)
+                } else {
+                    // Standard body
+                    5000 + (distance * 20)
+                }
             }
         };
 
@@ -175,15 +215,20 @@ mod tests {
             enabled: false,
         };
         let piece_len = 1024 * 1024; // 1MB
+        // Speed 10MB/s. Bitrate None.
+        // Proactive bonus: 10MB > 5MB -> +20 pieces.
+        // Urgent Base: 15.
+        // Total Urgent: 35.
+        // Cache enabled=false -> buffer=0.
+        // Total = 35.
         let priorities =
             calculate_priorities(100, 1000, piece_len, &config, 1, 10 * 1024 * 1024, None);
 
-        // Minimal window without cache is now 15 (urgent).
-        assert_eq!(priorities.len(), 15);
+        assert_eq!(priorities.len(), 35);
 
-        // Verify deadlines - now more aggressive
-        assert_eq!(priorities[0].deadline, 100);
-        assert_eq!(priorities[1].deadline, 150);
+        // Verify deadlines - now more aggressive (0, 50, 100...)
+        assert_eq!(priorities[0].deadline, 0); // distance 0 * 50
+        assert_eq!(priorities[1].deadline, 50); // distance 1 * 50
     }
 
     #[test]
@@ -193,19 +238,21 @@ mod tests {
             enabled: true,
         };
         let piece_len = 1024 * 1024; // 1MB
-        // Speed 10MB/s -> target 100MB head window -> 100 pieces
-        // Urgent window = 100 + 15 = 115 pieces
-        // Buffer window = 100 pieces
-        // Total = 215 pieces
+        // Speed 10MB/s -> target head window 5s = 50MB -> 50 pieces.
+        // Proactive bonus: 20 pieces.
+        // Urgent Base: 15 + 20 = 35.
+        // Urgent = max(35, head(50) + 15) = 65 pieces.
+        // Buffer window = 15 pieces.
+        // Total = 80 pieces.
         let priorities =
             calculate_priorities(0, 1000, piece_len, &config, 1, 10 * 1024 * 1024, None);
 
-        assert_eq!(priorities.len(), 215);
+        assert_eq!(priorities.len(), 80);
 
-        // Head - Tighter deadlines now
-        assert_eq!(priorities[0].deadline, 100);
-        assert_eq!(priorities[1].deadline, 150);
-        assert_eq!(priorities[2].deadline, 200);
+        // Head - Strict Staircase
+        assert_eq!(priorities[0].deadline, 0);
+        assert_eq!(priorities[1].deadline, 50);
+        assert_eq!(priorities[2].deadline, 100);
     }
 
     #[test]
@@ -217,14 +264,15 @@ mod tests {
         };
 
         // Max pieces = 200 / 10 = 20 pieces.
+        // Speed 10MB.
         let priorities =
             calculate_priorities(0, 1000, piece_len, &config, 1, 10 * 1024 * 1024, None);
 
-        // Should be clamped to 20 items
+        // Should be fully clamped to 20 items (cache max)
         assert_eq!(priorities.len(), 20);
 
         // Verify clamp effect
-        assert_eq!(priorities[0].deadline, 100);
+        assert_eq!(priorities[0].deadline, 0);
         assert_eq!(priorities[19].piece_idx, 19);
     }
 
@@ -238,14 +286,23 @@ mod tests {
 
         // High bitrate content (10MB/s = 80Mbps)
         let bitrate = Some(10 * 1024 * 1024);
-        let priorities =
-            calculate_priorities(0, 1000, piece_len, &config, 1, 5 * 1024 * 1024, bitrate);
+        // Download speed 20MB/s (2x bitrate).
+        // Proactive bonus: Speed > 1.5*Br? Yes.
+        // Bonus = 45s @ 10MB/s = 450MB = 450 pieces.
 
-        // head_window = (10MB * 10s) / 1MB = 100 pieces.
-        // urgent_window = max(60, (10MB * 30s)/1MB) = 300 pieces.
-        // efficient_urgent = max(300, 100 + 15) = 300 pieces.
-        // buffer_window = 100 pieces.
-        // Total = 400 pieces.
-        assert_eq!(priorities.len(), 400);
+        // Urgent Base = 15s @ 10MB = 150 pieces.
+        // Urgent Total Calc = 150 + 450 = 600 pieces.
+        // CLAMP: max urgent is 300. So Urgent = 300.
+
+        // Head Window: 5s @ 10MB = 50 pieces. (Target head bytes uses bitrate if avail).
+        // Urgent = max(300, 50+15) = 300.
+
+        // Buffer = 15.
+        // Total = 315.
+
+        let priorities =
+            calculate_priorities(0, 1000, piece_len, &config, 1, 20 * 1024 * 1024, bitrate);
+
+        assert_eq!(priorities.len(), 315);
     }
 }

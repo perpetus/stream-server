@@ -428,10 +428,16 @@ rust::Vec<AlertInfo> session_pop_alerts(Session& session) {
         info.message = rust::String(a->message());
         info.timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
             a->timestamp().time_since_epoch()).count();
+        info.piece_index = -1; // Default: not a piece alert
         
         // Try to get info_hash if this is a torrent alert
         if (const auto* ta = dynamic_cast<const lt::torrent_alert*>(a)) {
             info.info_hash = sha1_to_hex(ta->handle.info_hashes().get_best());
+        }
+        
+        // Extract piece index from piece_finished_alert
+        if (const auto* pfa = dynamic_cast<const lt::piece_finished_alert*>(a)) {
+            info.piece_index = static_cast<int32_t>(pfa->piece_index);
         }
         
         result.push_back(std::move(info));
