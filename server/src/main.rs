@@ -30,6 +30,7 @@ mod tui;
 
 async fn run_server(
     mut external_shutdown_rx: tokio::sync::mpsc::Receiver<()>,
+    tray_stats: Option<std::sync::Arc<tray::TrayStats>>,
 ) -> anyhow::Result<()> {
     // Check for --tui flag
     let use_tui = std::env::args().any(|arg| arg == "--tui");
@@ -48,13 +49,30 @@ async fn run_server(
 
     if let Some(layer) = tui_log_layer {
         registry.with(layer).init();
+    } else if std::io::stdout().is_terminal() {
+        // Console logging when running in terminal
+        registry.with(tracing_subscriber::fmt::layer()).init();
     } else {
-        // Only enable console logging if we are actually in a terminal (shell environment)
-        if std::io::stdout().is_terminal() {
-            registry.with(tracing_subscriber::fmt::layer()).init();
-        } else {
-            registry.init();
-        }
+        // File logging when running without terminal (e.g., from Explorer/tray)
+        let log_dir = dirs::config_dir()
+            .map(|d| d.join("stremio-server"))
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+        // Create log filename with timestamp
+        let now = chrono::Local::now();
+        let log_filename = format!("server_{}.log", now.format("%Y-%m-%d_%H-%M-%S"));
+        let log_path = log_dir.join(&log_filename);
+        let file = std::fs::File::create(&log_path).expect("Failed to create log file");
+        let (non_blocking, _guard) = tracing_appender::non_blocking(file);
+        // Leak the guard to keep the writer alive for the program lifetime
+        std::mem::forget(_guard);
+        registry
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(non_blocking)
+                    .with_ansi(false),
+            )
+            .init();
     }
 
     // Check/Install FFmpeg on Windows
@@ -135,6 +153,30 @@ async fn run_server(
 
     // Start SSDP Discovery
     tokio::spawn(crate::ssdp::start_discovery(state.devices.clone()));
+
+    // Start tray stats collection if tray is active
+    if let Some(stats) = tray_stats {
+        let engine_clone = state.engine.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                let all_stats = engine_clone.get_all_statistics().await;
+
+                let mut total_down = 0.0;
+                let mut total_up = 0.0;
+                let mut total_peers = 0u64;
+                let active = all_stats.len();
+
+                for (_, s) in all_stats {
+                    total_down += s.download_speed;
+                    total_up += s.upload_speed;
+                    total_peers += s.peers;
+                }
+
+                stats.update(total_down, total_up, total_peers, active);
+            }
+        });
+    }
 
     // Local Addon Init
     // Ensure localFiles directory exists
@@ -354,13 +396,16 @@ fn main() -> anyhow::Result<()> {
 
     if silent_mode {
         let event_loop = EventLoopBuilder::<tray::UserEvent>::with_user_event().build();
-        let (mut _tray_icon, _open_id, _quit_id) = match tray::create_system_tray(&event_loop) {
+        let tray_handle = match tray::create_system_tray(&event_loop) {
             Ok(t) => t,
             Err(e) => {
                 eprintln!("Failed to create tray icon: {}", e);
                 return Err(e);
             }
         };
+
+        // Shared stats for tray display
+        let tray_stats = Arc::new(tray::TrayStats::new());
 
         // Shared state for controlling the server thread
         // The server thread will put its current shutdown sender here
@@ -370,6 +415,7 @@ fn main() -> anyhow::Result<()> {
 
         let server_control_clone = server_control.clone();
         let keep_running_clone = keep_running.clone();
+        let tray_stats_clone = tray_stats.clone();
 
         // Spawn server thread with restart loop
         std::thread::spawn(move || {
@@ -387,7 +433,7 @@ fn main() -> anyhow::Result<()> {
                 // Run server (blocking on runtime)
                 // We unwrap here because if run_server fails fatally, we might want to log it and retry or exit.
                 // For now, let's log and retry after a delay to prevent busy loops.
-                if let Err(e) = rt.block_on(run_server(rx)) {
+                if let Err(e) = rt.block_on(run_server(rx, Some(tray_stats_clone.clone()))) {
                     eprintln!("Server crashed: {}", e);
                     std::thread::sleep(std::time::Duration::from_secs(2));
                 }
@@ -397,6 +443,20 @@ fn main() -> anyhow::Result<()> {
             }
         });
 
+        // Spawn stats update timer thread
+        let proxy = event_loop.create_proxy();
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                if proxy.send_event(tray::UserEvent::UpdateStats).is_err() {
+                    break; // Event loop closed
+                }
+            }
+        });
+
+        let tray_icon = tray_handle.tray_icon;
+        let stats_item = tray_handle.stats_item;
+
         event_loop.run(move |event, _, control_flow| {
             *control_flow = ControlFlow::Wait;
 
@@ -404,6 +464,9 @@ fn main() -> anyhow::Result<()> {
                 Event::UserEvent(e) => match e {
                     tray::UserEvent::OpenWeb => {
                         tray::open_stremio_web();
+                    }
+                    tray::UserEvent::OpenLogs => {
+                        tray::open_config_folder();
                     }
                     tray::UserEvent::Restart => {
                         // Signal shutdown to current instance; loop will restart it since keep_running is true
@@ -418,6 +481,14 @@ fn main() -> anyhow::Result<()> {
                         }
                         *control_flow = ControlFlow::Exit;
                     }
+                    tray::UserEvent::UpdateStats => {
+                        // Update tooltip and menu item with latest stats
+                        let tooltip = tray_stats.format_tooltip();
+                        let stats_line = tray_stats.format_stats_line();
+
+                        tray_icon.set_tooltip(Some(&tooltip)).ok();
+                        stats_item.set_text(&stats_line);
+                    }
                 },
                 _ => (),
             }
@@ -426,7 +497,7 @@ fn main() -> anyhow::Result<()> {
         // Normal mode: Run on main thread (blocking), no tray
         // Create a dummy channel for external shutdown that we hold open but never send to
         let (_tx, rx) = tokio::sync::mpsc::channel(1);
-        rt.block_on(run_server(rx))?;
+        rt.block_on(run_server(rx, None))?;
     }
 
     Ok(())
@@ -436,7 +507,7 @@ async fn root_redirect() -> Redirect {
     let base_url = "http://127.0.0.1:11470";
     let encoded_url = urlencoding::encode(base_url);
     Redirect::temporary(&format!(
-        "https://app.strem.io/#/?streamingServer={}",
+        "https://web.stremio.com/#/?streamingServer={}",
         encoded_url
     ))
 }

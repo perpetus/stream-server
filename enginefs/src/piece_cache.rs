@@ -19,7 +19,7 @@ pub type PieceCache = Cache<(String, i32), Arc<Vec<u8>>>;
 #[derive(Debug, Clone)]
 pub struct PieceCacheConfig {
     /// Maximum memory to use for piece cache (bytes)
-    /// Default: 512MB
+    /// 0 = unlimited (dynamic sizing based on available RAM)
     pub max_memory_bytes: u64,
     /// Whether to write pieces to disk in background
     /// When true, pieces are persisted; when false, memory-only caching
@@ -35,9 +35,14 @@ impl PieceCacheConfig {
         cache_path: PathBuf,
     ) -> Self {
         Self {
-            // Use 512MB or 5% of disk cache size, whichever is smaller
-            max_memory_bytes: (engine_config.size / 20).min(512 * 1024 * 1024),
-            disk_cache_enabled: engine_config.enabled,
+            // Dynamic: 0 = unlimited, let moka evict based on TTI
+            // For disk-backed cache, use 5% of disk cache size up to 512MB
+            max_memory_bytes: if engine_config.size > 0 {
+                (engine_config.size / 20).min(512 * 1024 * 1024)
+            } else {
+                0 // Unlimited memory cache
+            },
+            disk_cache_enabled: engine_config.enabled && engine_config.size > 0,
             disk_cache_path: Some(cache_path),
         }
     }
@@ -46,8 +51,8 @@ impl PieceCacheConfig {
 impl Default for PieceCacheConfig {
     fn default() -> Self {
         Self {
-            max_memory_bytes: 512 * 1024 * 1024, // 512MB default
-            disk_cache_enabled: true,
+            max_memory_bytes: 0,       // Dynamic/unlimited by default
+            disk_cache_enabled: false, // Memory-only by default
             disk_cache_path: None,
         }
     }
@@ -64,14 +69,33 @@ pub struct PieceCacheManager {
 impl PieceCacheManager {
     pub fn new(config: PieceCacheConfig) -> Self {
         // Moka cache with advanced eviction policies:
-        // 1. Size-based: uses weigher with max_capacity for memory limit
+        // 1. Size-based: uses weigher with max_capacity for memory limit (if > 0)
         // 2. Time-to-idle: expire entries not accessed for 5 minutes
         // This ensures memory is freed for pieces not being actively streamed
-        let cache = Cache::builder()
-            .weigher(|_key: &(String, i32), value: &Arc<Vec<u8>>| value.len() as u32)
-            .max_capacity(config.max_memory_bytes)
-            .time_to_idle(std::time::Duration::from_secs(300)) // 5 minute idle timeout
-            .build();
+        let cache = if config.max_memory_bytes > 0 {
+            // Bounded cache
+            Cache::builder()
+                .weigher(|_key: &(String, i32), value: &Arc<Vec<u8>>| value.len() as u32)
+                .max_capacity(config.max_memory_bytes)
+                .time_to_idle(std::time::Duration::from_secs(300)) // 5 minute idle timeout
+                .build()
+        } else {
+            // Unbounded cache - only TTI eviction
+            Cache::builder()
+                .weigher(|_key: &(String, i32), value: &Arc<Vec<u8>>| value.len() as u32)
+                .time_to_idle(std::time::Duration::from_secs(300)) // 5 minute idle timeout
+                .build()
+        };
+
+        debug!(
+            "PieceCacheManager: Created with max_memory={}, disk_enabled={}",
+            if config.max_memory_bytes > 0 {
+                format!("{}MB", config.max_memory_bytes / (1024 * 1024))
+            } else {
+                "unlimited".to_string()
+            },
+            config.disk_cache_enabled
+        );
 
         Self {
             cache,
@@ -83,19 +107,21 @@ impl PieceCacheManager {
     /// Store a piece in memory cache
     pub async fn put_piece(&self, info_hash: &str, piece_idx: i32, data: Vec<u8>) {
         let key = (info_hash.to_lowercase(), piece_idx);
+        let data_len = data.len();
         let data = Arc::new(data);
 
         self.cache.insert(key.clone(), data.clone()).await;
 
         debug!(
-            "PieceCache: Stored piece {} for {} ({} bytes)",
-            piece_idx,
-            info_hash,
-            data.len()
+            "PieceCache: Stored piece {} for {} ({} bytes) - memory-first",
+            piece_idx, info_hash, data_len
         );
 
-        // Spawn background disk write if enabled
-        if self.config.disk_cache_enabled {
+        // Only write to disk if:
+        // 1. Disk cache is enabled
+        // 2. max_memory_bytes > 0 (bounded cache, so we need disk backup)
+        // 3. disk_cache_path is set
+        if self.config.disk_cache_enabled && self.config.max_memory_bytes > 0 {
             if let Some(ref disk_path) = self.config.disk_cache_path {
                 let piece_path = disk_path
                     .join(&key.0)
@@ -117,7 +143,7 @@ impl PieceCacheManager {
                         Ok(_) => {
                             let mut written = disk_written.write().await;
                             written.insert(key_clone);
-                            debug!("PieceCache: Written piece to disk: {:?}", piece_path);
+                            debug!("PieceCache: Background disk write: {:?}", piece_path);
                         }
                         Err(e) => {
                             warn!("Failed to write piece to disk: {}", e);

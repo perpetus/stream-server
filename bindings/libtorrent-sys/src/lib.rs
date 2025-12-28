@@ -249,8 +249,10 @@ mod ffi {
         timestamp: i64,
         /// Associated info_hash (if any)
         info_hash: String,
-        /// Piece index (for piece_finished_alert, -1 otherwise)
+        /// Piece index (for piece_finished_alert and read_piece_alert, -1 otherwise)
         piece_index: i32,
+        /// Piece data (for read_piece_alert only, empty otherwise)
+        piece_data: Vec<u8>,
     }
 
     /// DHT stats
@@ -755,6 +757,13 @@ impl LibtorrentHandle {
     /// Make magnet URI
     pub fn make_magnet_uri(&self) -> String {
         ffi::make_magnet_uri(&self.inner)
+    }
+
+    /// Request piece data asynchronously (result comes via read_piece_alert)
+    /// This is used for memory-first streaming - libtorrent reads the piece
+    /// and sends the data via alert before/without disk I/O
+    pub fn read_piece(&mut self, piece: i32) -> Result<(), cxx::Exception> {
+        ffi::handle_read_piece(self.inner.pin_mut(), piece)
     }
 }
 

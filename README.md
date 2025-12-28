@@ -1,22 +1,41 @@
 # Stream Server
 
-**A blazing-fast, self-hosted torrent streaming server** — a modern, high-performance alternative to traditional streaming servers. Built in Rust for maximum performance and reliability.
+<div align="center">
+
+**🚀 Open Source Torrent Streaming Engine**
+
+*A modern, high-performance alternative to Stremio's closed-source `server.js`*
 
 [![Release Build](https://github.com/perpetus/stream-server/actions/workflows/release.yml/badge.svg)](https://github.com/perpetus/stream-server/actions/workflows/release.yml)
 [![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
+[![Open Source](https://img.shields.io/badge/Open%20Source-✓-brightgreen?style=flat-square)](https://github.com/perpetus/stream-server)
+
+</div>
+
+---
+
+## 💡 About
+
+Stream Server is a **fully open-source** replacement for Stremio's proprietary `server.js`. While Stremio's streaming backend remains closed-source, this project provides complete transparency, community-driven development, and the freedom to run your streaming engine locally on your own terms.
+
+**Built in Rust** for maximum performance, minimal memory footprint, and rock-solid reliability.
+
+---
 
 ## 🌟 Why Stream Server?
 
-| Feature | Stream Server | Traditional Servers |
-|---------|--------------|---------------------|
+| Feature | Stream Server | Stremio server.js |
+|---------|--------------|-------------------|
+| **Open Source** | ✅ **Yes** (MIT License) | ❌ Closed source |
 | **Performance** | ⚡ Native Rust | Node.js overhead |
 | **Memory Usage** | ~50MB | ~200MB+ |
+| **Control** | ✅ Full local control | ⚠️ Limited |
+| **Customizable** | ✅ Fork & modify | ❌ No access |
 | **HLS Transcoding** | ✅ Built-in | ✅ |
-| **Self-hosted** | ✅ Full control | ⚠️ Often cloud-dependent |
 | **Seekable Streams** | ✅ Instant | ⚠️ Variable |
 | **Archive Streaming** | ✅ RAR/ZIP/7Z | ✅ |
 
-> **Seamless Migration**: Drop-in compatible with existing streaming setups. Same API endpoints, same functionality — just faster.
+> **Seamless Migration**: Drop-in compatible with existing Stremio setups. Same API endpoints, same functionality — just faster and open source.
 
 ---
 
@@ -77,38 +96,6 @@ cargo run --release -p server
 ```
 
 The server starts on `http://localhost:11470` by default (compatible with standard streaming server port).
-
-### API Endpoints
-
-| Endpoint | Description |
-|----------|-------------|
-| `GET /{hash}/{fileIdx}` | Stream torrent file |
-| `GET /{hash}/{fileIdx}/master.m3u8` | HLS master playlist |
-| `GET /{hash}/{fileIdx}/stream.m3u8` | HLS stream playlist |
-| `GET /stats.json` | Server statistics |
-| `GET /settings` | Get current settings |
-| `POST /settings` | Update settings |
-| `GET /network-info` | Available network interfaces |
-| `GET /heartbeat` | Health check |
-| `GET /opensubHash?videoUrl=` | OpenSubtitles hash |
-| `GET /subtitles.vtt?from=` | Subtitle conversion |
-| `GET /probe?url=` | Video probe/analysis |
-| `GET /rar/{path}` | Stream from RAR archive |
-| `GET /zip/{path}` | Stream from ZIP archive |
-
----
-
-## ⚙️ Configuration
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `SAVE_PATH` | `./downloads` | Torrent download location |
-| `LISTEN_PORT` | `11470` | HTTP server port |
-| `DHT_ENABLED` | `true` | Enable DHT for peer discovery |
-| `BT_MAX_CONNECTIONS` | `35` | Maximum peer connections |
-| `BT_HANDSHAKE_TIMEOUT` | `20000` | Handshake timeout (ms) |
-| `BT_REQUEST_TIMEOUT` | `4000` | Request timeout (ms) |
-| `CACHE_SIZE` | `2GB` | Download cache size |
 
 ---
 
@@ -252,4 +239,4 @@ MIT License - see [LICENSE](LICENSE) for details.
 
 ## Keywords
 
-`torrent streaming` `streaming server` `self-hosted streaming` `hls transcoding` `rust torrent` `libtorrent` `video streaming server` `media server` `torrent player` `stream torrents` `stremio alternative` `enginefs`
+`stremio server.js alternative` `open source streaming engine` `torrent streaming` `local streaming` `desktop streaming` `hls transcoding` `rust torrent` `libtorrent` `video streaming server` `media engine` `torrent player` `stream torrents` `stremio alternative` `enginefs` `stremio open source`

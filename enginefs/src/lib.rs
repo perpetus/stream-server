@@ -12,6 +12,7 @@ pub mod cache;
 pub mod engine;
 pub mod files;
 pub mod hls;
+pub mod metadata_cache;
 pub mod piece_cache;
 pub mod tracker_prober;
 pub mod trackers;

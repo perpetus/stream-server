@@ -429,6 +429,7 @@ rust::Vec<AlertInfo> session_pop_alerts(Session& session) {
         info.timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
             a->timestamp().time_since_epoch()).count();
         info.piece_index = -1; // Default: not a piece alert
+        // piece_data is empty by default (rust::Vec default constructor)
         
         // Try to get info_hash if this is a torrent alert
         if (const auto* ta = dynamic_cast<const lt::torrent_alert*>(a)) {
@@ -438,6 +439,19 @@ rust::Vec<AlertInfo> session_pop_alerts(Session& session) {
         // Extract piece index from piece_finished_alert
         if (const auto* pfa = dynamic_cast<const lt::piece_finished_alert*>(a)) {
             info.piece_index = static_cast<int32_t>(pfa->piece_index);
+        }
+        
+        // MEMORY-FIRST STREAMING: Extract piece data from read_piece_alert
+        // This allows us to cache pieces in memory before they hit disk
+        if (const auto* rpa = dynamic_cast<const lt::read_piece_alert*>(a)) {
+            info.piece_index = static_cast<int32_t>(rpa->piece);
+            if (rpa->buffer && rpa->size > 0) {
+                info.piece_data.reserve(rpa->size);
+                const char* buf = rpa->buffer.get();
+                for (int i = 0; i < rpa->size; ++i) {
+                    info.piece_data.push_back(static_cast<uint8_t>(buf[i]));
+                }
+            }
         }
         
         result.push_back(std::move(info));

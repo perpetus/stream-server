@@ -298,8 +298,17 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
 
         // Not in cache - check if piece is available in libtorrent
         if piece >= 0 && !self.handle.have_piece(piece) {
+            // Log download status periodically to help debug stalled downloads
             if pos % (1024 * 1024) == 0 {
-                tracing::debug!("poll_read: waiting for piece {} (pos={})", piece, pos);
+                let status = self.handle.status();
+                tracing::warn!(
+                    "poll_read: WAITING for piece {} (pos={}, peers={}, speed={:.1}MB/s, state={:?})",
+                    piece,
+                    pos,
+                    status.num_peers,
+                    status.download_rate as f64 / 1_000_000.0,
+                    status.state
+                );
             }
 
             // ADAPTIVE DELAY: Poll faster when download speed is high

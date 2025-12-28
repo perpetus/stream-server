@@ -7,23 +7,34 @@
 //! a "unity build" approach with a single source file that includes
 //! everything in the correct order.
 
-use std::path::PathBuf;
 use std::env;
+use std::path::PathBuf;
 
 fn find_llvm_path() -> Option<PathBuf> {
     if env::var("LIBCLANG_PATH").is_ok() {
         return None;
     }
 
-    let program_files = env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".to_string());
-    let program_files_x86 = env::var("ProgramFiles(x86)").unwrap_or_else(|_| r"C:\Program Files (x86)".to_string());
+    let program_files =
+        env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".to_string());
+    let program_files_x86 =
+        env::var("ProgramFiles(x86)").unwrap_or_else(|_| r"C:\Program Files (x86)".to_string());
 
     let search_paths = vec![
         format!(r"{}\LLVM\bin", program_files),
         format!(r"{}\LLVM\bin", program_files_x86),
-        format!(r"{}\Microsoft Visual Studio\2022\Community\VC\Tools\Llvm\x64\bin", program_files),
-        format!(r"{}\Microsoft Visual Studio\2022\Enterprise\VC\Tools\Llvm\x64\bin", program_files),
-        format!(r"{}\Microsoft Visual Studio\2022\Professional\VC\Tools\Llvm\x64\bin", program_files),
+        format!(
+            r"{}\Microsoft Visual Studio\2022\Community\VC\Tools\Llvm\x64\bin",
+            program_files
+        ),
+        format!(
+            r"{}\Microsoft Visual Studio\2022\Enterprise\VC\Tools\Llvm\x64\bin",
+            program_files
+        ),
+        format!(
+            r"{}\Microsoft Visual Studio\2022\Professional\VC\Tools\Llvm\x64\bin",
+            program_files
+        ),
         r"C:\ProgramData\chocolatey\bin".to_string(),
         r"C:\ProgramData\chocolatey\lib\llvm\tools\llvm\bin".to_string(),
     ];
@@ -34,7 +45,7 @@ fn find_llvm_path() -> Option<PathBuf> {
             return Some(p);
         }
     }
-    
+
     // Check scoop
     if let Ok(profile) = env::var("USERPROFILE") {
         let p = PathBuf::from(profile).join(r"scoop\apps\llvm\current\bin");
@@ -48,8 +59,10 @@ fn find_llvm_path() -> Option<PathBuf> {
 
 fn find_include_paths() -> Vec<PathBuf> {
     let mut includes = Vec::new();
-    let program_files = env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".to_string());
-    let program_files_x86 = env::var("ProgramFiles(x86)").unwrap_or_else(|_| r"C:\Program Files (x86)".to_string());
+    let program_files =
+        env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".to_string());
+    let program_files_x86 =
+        env::var("ProgramFiles(x86)").unwrap_or_else(|_| r"C:\Program Files (x86)".to_string());
 
     // 1. Find MSVC Includes
     let vs_editions = ["Enterprise", "Professional", "Community", "BuildTools"];
@@ -60,7 +73,10 @@ fn find_include_paths() -> Vec<PathBuf> {
         for edition in vs_editions {
             // Check both Program Files directories
             for root in &[&program_files, &program_files_x86] {
-                let p = PathBuf::from(format!(r"{}\Microsoft Visual Studio\{}\{}\VC\Tools\MSVC", root, year, edition));
+                let p = PathBuf::from(format!(
+                    r"{}\Microsoft Visual Studio\{}\{}\VC\Tools\MSVC",
+                    root, year, edition
+                ));
                 if p.exists() {
                     // Find latest version
                     if let Ok(entries) = std::fs::read_dir(&p) {
@@ -68,7 +84,7 @@ fn find_include_paths() -> Vec<PathBuf> {
                             .filter_map(Result::ok)
                             .filter(|e| e.path().is_dir())
                             .map(|e| e.path())
-                            .max() 
+                            .max()
                         {
                             let include = latest.join("include");
                             if include.exists() {
@@ -79,9 +95,13 @@ fn find_include_paths() -> Vec<PathBuf> {
                     }
                 }
             }
-            if msvc_path.is_some() { break; }
+            if msvc_path.is_some() {
+                break;
+            }
         }
-        if msvc_path.is_some() { break; }
+        if msvc_path.is_some() {
+            break;
+        }
     }
 
     if let Some(p) = msvc_path {
@@ -90,7 +110,7 @@ fn find_include_paths() -> Vec<PathBuf> {
     } else {
         // println!("cargo:warning=Could not find MSVC includes (checked standard paths)");
     }
-    
+
     // 2. Find Windows SDK Includes
     let sdk_roots = vec![
         PathBuf::from(format!(r"{}\Windows Kits\10\Include", program_files_x86)),
@@ -117,11 +137,11 @@ fn find_include_paths() -> Vec<PathBuf> {
             }
         }
     }
-    
+
     if !found_sdk {
         // println!("cargo:warning=Could not find Windows SDK includes");
     }
-    
+
     includes
 }
 
@@ -136,7 +156,7 @@ fn main() {
                 env::set_var("LIBCLANG_PATH", path);
             }
         }
-        
+
         // Find and set include paths for autocxx/bindgen
         if env::var("INCLUDE").is_err() {
             let includes = find_include_paths();
@@ -162,7 +182,7 @@ fn main() {
     }
 
     let unrar_src = PathBuf::from("vendor/unrar");
-    
+
     if !unrar_src.exists() {
         panic!(
             "UnRAR source not found at {:?}. Please download from https://www.rarlab.com/rar_add.htm",
@@ -171,16 +191,17 @@ fn main() {
     }
 
     // Collect all C++ source files
-    // Note: UnRAR uses #include for some .cpp files, so we exclude those that are 
+    // Note: UnRAR uses #include for some .cpp files, so we exclude those that are
     // included by other files to avoid duplicate symbol errors.
     let mut cpp_files: Vec<PathBuf> = glob::glob("vendor/unrar/*.cpp")
         .expect("Failed to read glob pattern")
         .filter_map(Result::ok)
         .filter(|p| {
             let name = p.file_name().unwrap().to_str().unwrap();
-            
+
             // Common exclusions
-            if matches!(name,
+            if matches!(
+                name,
                 // GUI/Console related - not needed for library
                 "arccmt.cpp" |
                 "consio.cpp" |
@@ -211,7 +232,7 @@ fn main() {
                 "rs16.cpp" |            // included by recvol5.cpp
                 "win32acl.cpp" |        // Windows-specific, included conditionally
                 "win32stm.cpp" |        // Windows-specific, included conditionally
-                "win32lnk.cpp"          // Windows-specific, included conditionally
+                "win32lnk.cpp" // Windows-specific, included conditionally
             ) {
                 return false;
             }
@@ -219,6 +240,13 @@ fn main() {
             // Platform-specific exclusions
             if cfg!(windows) {
                 if matches!(name, "ulinks.cpp" | "uowners.cpp") {
+                    return false;
+                }
+            }
+
+            // Unix: exclude threading files (CRITSECT_HANDLE not defined without RAR_SMP)
+            if cfg!(not(windows)) {
+                if matches!(name, "threadmisc.cpp" | "threadpool.cpp") {
                     return false;
                 }
             }
@@ -236,8 +264,8 @@ fn main() {
         .cpp(true)
         .include(&unrar_src)
         .files(&cpp_files)
-        .define("RARDLL", None)      // Build as DLL/library mode
-        .define("SILENT", None);      // Disable console output
+        .define("RARDLL", None) // Build as DLL/library mode
+        .define("SILENT", None); // Disable console output
 
     // Platform-specific settings
     #[cfg(target_os = "windows")]
@@ -245,11 +273,11 @@ fn main() {
         cc_build
             .define("_WIN_ALL", None)
             .flag("/std:c++17")
-            .flag("/EHsc")  // Enable C++ exceptions
+            .flag("/EHsc") // Enable C++ exceptions
             // Force include rar.hpp - UnRAR uses precompiled headers
             .flag("/FIrar.hpp");
     }
-    
+
     #[cfg(not(target_os = "windows"))]
     {
         cc_build
@@ -259,12 +287,12 @@ fn main() {
             // Force include rar.hpp - UnRAR uses precompiled headers
             .flag("-include")
             .flag("rar.hpp");
-        
+
         #[cfg(target_os = "macos")]
         {
             cc_build.define("_APPLE", None);
         }
-        
+
         #[cfg(target_os = "linux")]
         {
             cc_build.define("_UNIX", None);
@@ -275,16 +303,16 @@ fn main() {
 
     // Generate autocxx bindings
     let mut clang_args = vec!["-DRARDLL", "-DSILENT"];
-    
+
     #[cfg(target_os = "windows")]
     clang_args.extend(&["-D_WIN_ALL", "-std=c++17"]);
-    
+
     #[cfg(target_os = "macos")]
     clang_args.extend(&["-D_APPLE", "-std=c++17"]);
-    
+
     #[cfg(target_os = "linux")]
     clang_args.extend(&["-D_UNIX", "-std=c++17"]);
-    
+
     // Add explicitly found includes
     let extra_includes_refs: Vec<&str> = extra_includes.iter().map(|s| s.as_str()).collect();
     clang_args.extend(extra_includes_refs);
@@ -296,7 +324,7 @@ fn main() {
 
     #[cfg(target_os = "windows")]
     b.flag("/std:c++17");
-    
+
     #[cfg(not(target_os = "windows"))]
     b.flag("-std=c++17");
 
@@ -306,4 +334,3 @@ fn main() {
     println!("cargo:rerun-if-changed=src/ffi.rs");
     println!("cargo:rerun-if-changed=vendor/unrar");
 }
-

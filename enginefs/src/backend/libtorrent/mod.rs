@@ -180,7 +180,7 @@ impl LibtorrentBackend {
         let metadata_path = self.metadata_path.clone();
         let config = self.config.clone();
         let piece_cache = self.piece_cache.clone();
-        let save_path = self.save_path.clone();
+        let _save_path = self.save_path.clone(); // Keep for potential future use
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
@@ -193,33 +193,44 @@ impl LibtorrentBackend {
             loop {
                 interval.tick().await;
 
-                // === PROACTIVE PIECE CACHING VIA ALERTS ===
-                // Poll alerts and cache pieces when they finish downloading
+                // === MEMORY-FIRST STREAMING VIA ALERTS ===
+                // Process alerts for piece caching:
+                // 1. piece_finished_alert: Piece downloaded -> trigger read_piece()
+                // 2. read_piece_alert: Piece data ready -> cache in memory
                 {
                     let mut s = session.write().await;
                     let alerts = s.pop_alerts();
+
                     for alert in alerts {
+                        // Handle piece_finished_alert: Request piece data from libtorrent
                         if alert.alert_type == PIECE_FINISHED_ALERT_TYPE && alert.piece_index >= 0 {
+                            // Trigger async read_piece - libtorrent will send read_piece_alert
+                            if let Ok(mut handle) = s.find_torrent(&alert.info_hash) {
+                                let _ = handle.read_piece(alert.piece_index);
+                                tracing::trace!(
+                                    "Memory-first: Requested piece {} for {}",
+                                    alert.piece_index,
+                                    alert.info_hash
+                                );
+                            }
+                        }
+
+                        // Handle read_piece_alert: Cache piece data in memory
+                        // Alert type 45 = read_piece_alert
+                        if alert.alert_type == 45 && !alert.piece_data.is_empty() {
                             let info_hash = alert.info_hash.clone();
                             let piece_idx = alert.piece_index;
+                            let piece_data = alert.piece_data.clone();
                             let cache = piece_cache.clone();
-                            let sp = save_path.clone();
 
-                            // Spawn background task to read piece from disk and cache it
+                            // Cache in memory immediately (non-blocking)
                             tokio::spawn(async move {
-                                // Find the piece data from disk
-                                // This is a simplified approach - we read the piece from disk
-                                // In a more optimized version, we'd get it directly from libtorrent's buffer
+                                cache.put_piece(&info_hash, piece_idx, piece_data).await;
                                 tracing::debug!(
-                                    "Proactive caching: piece {} for torrent {}",
+                                    "Memory-first: Cached piece {} for {} from alert",
                                     piece_idx,
                                     info_hash
                                 );
-
-                                // For now, just mark that we know about this piece
-                                // The full implementation would read the piece bytes here
-                                // but that requires knowing piece length and file mapping
-                                let _ = (cache, sp); // Silence unused warnings for now
                             });
                         }
                     }
