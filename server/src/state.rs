@@ -19,6 +19,7 @@ pub struct AppState {
 }
 
 impl AppState {
+    #[allow(unused)]
     pub fn new(engine: Arc<EngineFS>, settings: ServerSettings, config_dir: PathBuf) -> Self {
         Self::new_with_shared_settings(engine, Arc::new(RwLock::new(settings)), config_dir)
     }
