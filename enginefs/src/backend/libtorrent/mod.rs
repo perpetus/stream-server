@@ -176,69 +176,74 @@ impl LibtorrentBackend {
         }
     }
     fn start_monitor_task(&self) {
+        // === FAST ALERT PUMP ===
+        // Process alerts every 100ms for minimal latency on piece caching
+        // This is CRITICAL for streaming - reduces cache latency from 2s to ~100ms
+        let alert_session = self.session.clone();
+        let alert_piece_cache = self.piece_cache.clone();
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
+
+            // Alert type constants
+            const PIECE_FINISHED_ALERT_TYPE: i32 = 69;
+            const READ_PIECE_ALERT_TYPE: i32 = 45;
+
+            loop {
+                interval.tick().await;
+
+                let mut s = alert_session.write().await;
+                let alerts = s.pop_alerts();
+
+                for alert in alerts {
+                    // Handle piece_finished_alert: Request piece data from libtorrent
+                    if alert.alert_type == PIECE_FINISHED_ALERT_TYPE && alert.piece_index >= 0 {
+                        if let Ok(mut handle) = s.find_torrent(&alert.info_hash) {
+                            let _ = handle.read_piece(alert.piece_index);
+                            tracing::trace!(
+                                "Fast-alert: Requested piece {} for {}",
+                                alert.piece_index,
+                                alert.info_hash
+                            );
+                        }
+                    }
+
+                    // Handle read_piece_alert: Cache piece data in memory immediately
+                    if alert.alert_type == READ_PIECE_ALERT_TYPE && !alert.piece_data.is_empty() {
+                        let info_hash = alert.info_hash.clone();
+                        let piece_idx = alert.piece_index;
+                        let piece_data = alert.piece_data.clone();
+                        let cache = alert_piece_cache.clone();
+
+                        // Cache synchronously for fastest path (data is already in memory)
+                        tokio::spawn(async move {
+                            cache.put_piece(&info_hash, piece_idx, piece_data).await;
+                            tracing::debug!(
+                                "Fast-alert: Cached piece {} for {}",
+                                piece_idx,
+                                info_hash
+                            );
+                        });
+                    }
+                }
+            }
+        });
+
+        // === SLOW MONITOR ===
+        // Handle stats, metadata, peer search, etc. every 2 seconds
         let session = self.session.clone();
         let metadata_path = self.metadata_path.clone();
         let config = self.config.clone();
-        let piece_cache = self.piece_cache.clone();
-        let _save_path = self.save_path.clone(); // Keep for potential future use
+        let _save_path = self.save_path.clone();
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
             let mut last_reannounce: std::collections::HashMap<String, std::time::Instant> =
                 std::collections::HashMap::new();
 
-            // Alert type constant for piece_finished_alert (libtorrent internal)
-            const PIECE_FINISHED_ALERT_TYPE: i32 = 69;
-
             loop {
                 interval.tick().await;
 
-                // === MEMORY-FIRST STREAMING VIA ALERTS ===
-                // Process alerts for piece caching:
-                // 1. piece_finished_alert: Piece downloaded -> trigger read_piece()
-                // 2. read_piece_alert: Piece data ready -> cache in memory
-                {
-                    let mut s = session.write().await;
-                    let alerts = s.pop_alerts();
-
-                    for alert in alerts {
-                        // Handle piece_finished_alert: Request piece data from libtorrent
-                        if alert.alert_type == PIECE_FINISHED_ALERT_TYPE && alert.piece_index >= 0 {
-                            // Trigger async read_piece - libtorrent will send read_piece_alert
-                            if let Ok(mut handle) = s.find_torrent(&alert.info_hash) {
-                                let _ = handle.read_piece(alert.piece_index);
-                                tracing::trace!(
-                                    "Memory-first: Requested piece {} for {}",
-                                    alert.piece_index,
-                                    alert.info_hash
-                                );
-                            }
-                        }
-
-                        // Handle read_piece_alert: Cache piece data in memory
-                        // Alert type 45 = read_piece_alert
-                        if alert.alert_type == 45 && !alert.piece_data.is_empty() {
-                            let info_hash = alert.info_hash.clone();
-                            let piece_idx = alert.piece_index;
-                            let piece_data = alert.piece_data.clone();
-                            let cache = piece_cache.clone();
-
-                            // Cache in memory immediately (non-blocking)
-                            tokio::spawn(async move {
-                                cache.put_piece(&info_hash, piece_idx, piece_data).await;
-                                tracing::debug!(
-                                    "Memory-first: Cached piece {} for {} from alert",
-                                    piece_idx,
-                                    info_hash
-                                );
-                            });
-                        }
-                    }
-                }
-
-                // Get all handles first to avoid holding lock too long?
-                // Actually we need the lock to find them.
-                // We'll iterate.
                 let handles: Vec<_> = {
                     let s = session.read().await;
                     s.get_torrents()
@@ -251,13 +256,8 @@ impl LibtorrentBackend {
                     let status = handle.status();
 
                     // --- Metadata Initialization Logic ---
-                    // For magnets, files are not known until metadata is acquired.
-                    // Once metadata is available, libtorrent defaults all files to priority 4.
-                    // We catch this and set them to 0 (skip) so the user can then start streaming a specific file.
                     if status.has_metadata {
                         let priorities = handle.get_file_priorities();
-                        // 4 is the libtorrent default for "normal" priority.
-                        // If ALL files are at 4, it's highly likely they haven't been initialized by us yet.
                         if !priorities.is_empty() && priorities.iter().all(|&p| p == 4) {
                             tracing::info!(
                                 "Monitor: Metadata acquired for '{}' ({} files). Resetting all priorities to 0 (skip).",
@@ -292,9 +292,7 @@ impl LibtorrentBackend {
                         let min_peers = config.peer_search.min as i32;
                         let num_peers = status.num_peers as i32;
 
-                        // Rule 1: Low peer count or slow speed (Aggressive)
-                        // If we are slow (<2MB/s) and have fewer than max peers, try to find more.
-                        let slow_threshold = 2 * 1024 * 1024; // Increased to 2MB/s
+                        let slow_threshold = 2 * 1024 * 1024;
                         if num_peers < min_peers
                             || (status.download_rate < slow_threshold
                                 && num_peers < config.peer_search.max as i32)
@@ -302,32 +300,24 @@ impl LibtorrentBackend {
                             force = true;
                         }
 
-                        // Rule 2: Periodic Re-announce (Aggressive)
                         let now = std::time::Instant::now();
                         let last_announce =
                             last_reannounce.entry(handle.info_hash()).or_insert(now);
 
-                        // Metadata Burst: If we don't have metadata, re-announce every 10s (was 15s)
-                        // If we have metadata but are slow, re-announce every 30s (was 60s)
-                        let interval = if !status.has_metadata {
+                        let reannounce_interval = if !status.has_metadata {
                             std::time::Duration::from_secs(10)
+                        } else if status.download_rate < slow_threshold {
+                            std::time::Duration::from_secs(30)
                         } else {
-                            // If slow, being more aggressive
-                            if status.download_rate < slow_threshold {
-                                std::time::Duration::from_secs(30)
-                            } else {
-                                std::time::Duration::from_secs(60)
-                            }
+                            std::time::Duration::from_secs(60)
                         };
 
-                        if now.duration_since(*last_announce) > interval {
+                        if now.duration_since(*last_announce) > reannounce_interval {
                             force = true;
                             *last_announce = now;
                         }
 
                         if force {
-                            // Don't spam logs too much, but this is an "aggressive" mode
-                            // tracing::debug!("Monitor: Force re-announce for {}", handle.info_hash());
                             let _ = handle.force_reannounce();
                             let _ = handle.force_dht_announce();
                         }
@@ -336,10 +326,7 @@ impl LibtorrentBackend {
                     // --- SwarmCap Logic ---
                     if let Some(max_speed) = config.swarm_cap.max_speed {
                         if (status.download_rate as f64) > max_speed {
-                            // Limit reached. Pause this torrent?
-                            // handle.auto_managed(true); // Let libtorrent manage?
-                            // Or explicit pause.
-                            // if !status.is_paused { handle.pause(); }
+                            // Limit handling placeholder
                         }
                     }
 

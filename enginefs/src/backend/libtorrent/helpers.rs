@@ -4,14 +4,25 @@ use crate::backend::{EngineStats, Growler, PeerSearch, Source, StatsOptions, Swa
 use libtorrent_sys::TorrentStatus;
 use std::path::PathBuf;
 
+/// Cached piece data with position metadata for correct offset calculation
+#[derive(Clone, Debug)]
+pub(super) struct CachedPieceData {
+    /// The actual piece data (may be partial for pieces spanning files)
+    pub data: Vec<u8>,
+    /// File-relative byte offset where this data starts
+    /// Used to calculate correct offsets when reading from cache
+    pub file_relative_start: u64,
+}
+
 /// Read a piece from disk for prefetch caching
 /// Correctly handles multi-file torrents by accounting for file_offset
+/// Returns CachedPieceData containing both the data and its file-relative start position
 pub(super) async fn read_piece_from_disk(
     file_path: &PathBuf,
     piece_idx: i32,
     piece_length: u64,
     file_offset: u64,
-) -> std::io::Result<Vec<u8>> {
+) -> std::io::Result<CachedPieceData> {
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
     let mut file = tokio::fs::File::open(file_path).await?;
@@ -57,7 +68,10 @@ pub(super) async fn read_piece_from_disk(
     let bytes_read = file.read(&mut data).await?;
     data.truncate(bytes_read);
 
-    Ok(data)
+    Ok(CachedPieceData {
+        data,
+        file_relative_start: file_relative_offset,
+    })
 }
 
 pub(super) fn default_stats(info_hash: &str) -> EngineStats {

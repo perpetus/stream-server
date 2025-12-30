@@ -4,16 +4,16 @@
 			"path": "../../../../stremio-core-development"
 		},
 		{
-			"path": "../../../../stremio-web-development"
-		},
-		{
 			"path": "../../.."
 		},
 		{
 			"path": "../../../../server"
 		},
 		{
-			"path": "../../../../logs_53025275721"
+			"path": "../../../../stremio-shell-ng"
+		},
+		{
+			"path": "../../../../stremio-web"
 		}
 	]
 }

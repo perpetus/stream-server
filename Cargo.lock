@@ -1832,6 +1832,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bumpalo",
  "bytes",
  "futures",
  "hex 0.4.3",

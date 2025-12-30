@@ -298,6 +298,9 @@ async fn run_server(
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 11470));
     tracing::info!("listening on {}", addr);
+    // Print to stdout explicitly so stremio-shell-ng can detect startup
+    // (tracing may go to file when no terminal is attached)
+    println!("listening on {}", addr);
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
     // Shutdown signal
@@ -386,10 +389,13 @@ fn main() -> anyhow::Result<()> {
     }
 
     let args: Vec<String> = std::env::args().collect();
+    // --no-tray: Disable tray icon (for embedded use in stremio-shell-ng)
+    let no_tray = args.iter().any(|a| a == "--no-tray");
     // Silent mode is true if:
     // 1. Explicitly requested via --silent
     // 2. OR if we failed to attach to a console (implies Explorer launch)
-    let silent_mode = args.iter().any(|a| a == "--silent") || !attached_console;
+    // BUT: if --no-tray is specified, we run in normal mode without tray
+    let silent_mode = !no_tray && (args.iter().any(|a| a == "--silent") || !attached_console);
 
     // Initialize Tokio Runtime
     let rt = tokio::runtime::Runtime::new()?;

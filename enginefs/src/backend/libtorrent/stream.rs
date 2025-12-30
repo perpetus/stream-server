@@ -27,7 +27,8 @@ pub(crate) struct LibtorrentFileStream {
     /// Info hash for cache lookups
     pub(crate) info_hash: String,
     /// Currently cached piece data for fast serving
-    pub(crate) cached_piece_data: Option<(i32, Arc<Vec<u8>>)>, // (piece_idx, data)
+    /// Tuple: (piece_idx, data, file_relative_start)
+    pub(crate) cached_piece_data: Option<(i32, Arc<Vec<u8>>, u64)>,
     /// Last piece we triggered prefetch for (to avoid repeated requests)
     pub(crate) last_prefetch_piece: i32,
 }
@@ -160,55 +161,47 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
             -1
         };
 
-        // Calculate offset within the piece (global piece offset)
-        let global_piece_start = piece as u64 * self.piece_length;
-
-        // For multi-file torrents: cached data may be a partial piece
-        // The cached data starts at max(file_offset, global_piece_start) - global_piece_start
-        // But wait, read_piece_from_disk returns data starting at the file beginning for pieces
-        // that start before the file. So we need to calculate the offset into the cached data.
+        // For multi-file torrents, we need to calculate the file-relative offset
+        // where the cached piece data starts. This is determined by the overlap
+        // between the piece's global range and this file's range.
         //
-        // If piece starts BEFORE file: cached data starts at offset 0 (file beginning)
-        // If piece starts AFTER/AT file: cached data starts at the piece-relative offset
-        let piece_starts_before_file = global_piece_start < self.file_offset;
-
-        // offset_in_cached_data: where in the cached piece data do we read from
-        let offset_in_cached_data = if piece_starts_before_file {
-            // Piece spans from previous file into this one
-            // The cached data represents the portion in this file (starts at offset 0 in cached data)
-            // Our position in this portion is: (file_offset + pos) - max(file_offset, piece_start)
-            pos as usize // pos is already file-relative
-        } else {
-            // Piece starts at or after the file start
-            // Cached data represents the whole piece (or portion until next file)
-            ((self.file_offset + pos) % self.piece_length) as usize
-        };
+        // piece_global_start = piece * piece_length
+        // file_global_start = file_offset
+        // overlap_start = max(piece_global_start, file_global_start)
+        // file_relative_start = overlap_start - file_global_start
+        let calculate_file_relative_start =
+            |piece_idx: i32, piece_len: u64, file_off: u64| -> u64 {
+                let piece_global_start = piece_idx as u64 * piece_len;
+                let overlap_start = piece_global_start.max(file_off);
+                overlap_start - file_off
+            };
 
         // MEMORY-FIRST READING: Check if we have this piece in our local cache
         if piece >= 0 {
             // Check if we already have the right piece cached locally
             let have_cached = match &self.cached_piece_data {
-                Some((cached_piece, _)) => *cached_piece == piece,
+                Some((cached_piece, _, _)) => *cached_piece == piece,
                 None => false,
             };
 
             if have_cached {
                 // Serve from local cache - FASTEST PATH
-                if let Some((_, data)) = &self.cached_piece_data {
-                    let available = data.len().saturating_sub(offset_in_cached_data);
+                if let Some((_, data, file_relative_start)) = &self.cached_piece_data {
+                    // Calculate offset into cached data: current file position - where cached data starts
+                    let offset_in_cached = pos.saturating_sub(*file_relative_start) as usize;
+                    let available = data.len().saturating_sub(offset_in_cached);
                     let to_read = buf.remaining().min(available);
 
                     if to_read > 0 {
-                        buf.put_slice(
-                            &data[offset_in_cached_data..offset_in_cached_data + to_read],
-                        );
+                        buf.put_slice(&data[offset_in_cached..offset_in_cached + to_read]);
                         self.current_pos += to_read as u64;
 
                         if pos % (1024 * 1024) == 0 || pos < 4096 {
                             tracing::debug!(
-                                "poll_read: Served {} bytes from MEMORY cache (piece {})",
+                                "poll_read: Served {} bytes from MEMORY cache (piece {}, offset_in_cached={})",
                                 to_read,
-                                piece
+                                piece,
+                                offset_in_cached
                             );
                         }
                     }
@@ -222,22 +215,27 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
             if let Some(piece_data) =
                 futures::executor::block_on(cache.get_piece(&info_hash, piece))
             {
-                // Cache hit! Store locally for fast repeated access
-                self.cached_piece_data = Some((piece, piece_data.clone()));
+                // Calculate file_relative_start for this piece
+                let file_relative_start =
+                    calculate_file_relative_start(piece, self.piece_length, self.file_offset);
 
-                let available = piece_data.len().saturating_sub(offset_in_cached_data);
+                // Cache hit! Store locally for fast repeated access
+                self.cached_piece_data = Some((piece, piece_data.clone(), file_relative_start));
+
+                // Calculate offset into cached data
+                let offset_in_cached = pos.saturating_sub(file_relative_start) as usize;
+                let available = piece_data.len().saturating_sub(offset_in_cached);
                 let to_read = buf.remaining().min(available);
 
                 if to_read > 0 {
-                    buf.put_slice(
-                        &piece_data[offset_in_cached_data..offset_in_cached_data + to_read],
-                    );
+                    buf.put_slice(&piece_data[offset_in_cached..offset_in_cached + to_read]);
                     self.current_pos += to_read as u64;
 
                     tracing::debug!(
-                        "poll_read: Served {} bytes from MOKA cache (piece {})",
+                        "poll_read: Served {} bytes from MOKA cache (piece {}, offset_in_cached={})",
                         to_read,
-                        piece
+                        piece,
+                        offset_in_cached
                     );
                 }
 
@@ -276,16 +274,17 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
                             }
 
                             // Read piece from disk into cache
-                            if let Ok(data) =
+                            if let Ok(cached_data) =
                                 read_piece_from_disk(&file_path, next_piece, piece_len, file_offset)
                                     .await
                             {
                                 prefetch_cache
-                                    .put_piece(&prefetch_info_hash, next_piece, data)
+                                    .put_piece(&prefetch_info_hash, next_piece, cached_data.data)
                                     .await;
                                 tracing::debug!(
-                                    "Read-ahead: prefetched piece {} into cache",
-                                    next_piece
+                                    "Read-ahead: prefetched piece {} into cache (file_rel_start={})",
+                                    next_piece,
+                                    cached_data.file_relative_start
                                 );
                             }
                         }
@@ -311,9 +310,12 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
                 );
             }
 
-            // ADAPTIVE DELAY: Poll faster when download speed is high
-            // At 10MB/s, a 4MB piece takes ~400ms - poll every 15-50ms
-            let delay_ms = if self.download_speed_ema > 5_000_000.0 {
+            // ULTRA-FAST POLLING for first 3 pieces to minimize time-to-first-frame
+            // After that, use adaptive delay based on download speed
+            let pieces_from_start = piece - self.first_piece;
+            let delay_ms = if pieces_from_start < 3 {
+                5 // Critical startup pieces: poll every 5ms
+            } else if self.download_speed_ema > 5_000_000.0 {
                 15 // Fast download: check frequently (>5MB/s)
             } else if self.download_speed_ema > 1_000_000.0 {
                 25 // Medium: moderate polling (1-5MB/s)

@@ -373,8 +373,8 @@ impl HlsEngine {
         // +genpts regenerates presentation timestamps
         cmd.args(["-fflags", "+genpts+discardcorrupt"]);
 
-        // Large analyzeduration/probesize for proper stream analysis
-        cmd.args(["-analyzeduration", "100000000", "-probesize", "100000000"]);
+        // Optimized for fast startup - 10MB/10s is enough for most video
+        cmd.args(["-analyzeduration", "10000000", "-probesize", "10000000"]);
 
         // HYBRID SEEKING APPROACH:
         // 1. Fast input seek to get close (keyframe before target)
@@ -494,8 +494,8 @@ impl HlsEngine {
         // Input flags (Global) - match video transcoding approach
         cmd.args(["-fflags", "+genpts+discardcorrupt"]);
 
-        // Large analyzeduration/probesize for proper stream analysis
-        cmd.args(["-analyzeduration", "100000000", "-probesize", "100000000"]);
+        // Optimized for fast startup - 5MB/5s is enough for audio headers
+        cmd.args(["-analyzeduration", "5000000", "-probesize", "5000000"]);
 
         // HYBRID SEEKING APPROACH (same as video):
         // 1. Fast input seek to get close

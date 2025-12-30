@@ -554,11 +554,15 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
         }; // session lock released here
 
         // Perform reactive metadata inspection in BACKGROUND
-        // This ensures we return from prepare_file_for_streaming immediately so playback can start
+        // DEFERRED: Wait 500ms before starting to give initial playback pieces a head start
+        // This ensures bandwidth is focused on pieces 0-2 before we start fetching moov/Cues
         let this = self.clone();
         tokio::spawn(async move {
+            // CRITICAL: Delay metadata inspection to not compete with startup pieces
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
             tracing::info!(
-                "Background Metadata Inspection: Starting for file {}",
+                "Background Metadata Inspection: Starting for file {} (deferred 500ms)",
                 file_idx
             );
 
