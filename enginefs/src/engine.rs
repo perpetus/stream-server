@@ -301,8 +301,14 @@ impl<H: TorrentHandle> Engine<H> {
     }
 
     pub async fn find_subtitle_tracks(&self) -> Vec<SubtitleTrack> {
+        tracing::info!(
+            "[SUBTITLES] find_subtitle_tracks called for info_hash={}",
+            self.info_hash
+        );
         let mut tracks = Vec::new();
         let files = self.handle.get_files().await;
+
+        // 1. Find external subtitle files in the torrent
         for (idx, file) in files.iter().enumerate() {
             let filename = file.name.clone();
             let path = std::path::PathBuf::from(&filename);
@@ -312,6 +318,7 @@ impl<H: TorrentHandle> Engine<H> {
                     if ["srt", "vtt", "sub", "idx", "txt", "ssa", "ass"]
                         .contains(&ext_lower.as_str())
                     {
+                        tracing::info!("[SUBTITLES] Found external subtitle: {}", filename);
                         tracks.push(SubtitleTrack {
                             id: idx,
                             name: filename,
@@ -321,6 +328,75 @@ impl<H: TorrentHandle> Engine<H> {
                 }
             }
         }
+
+        // 2. Check for embedded subtitles in the main video file
+        // Find the largest video file (likely the main content)
+        let video_extensions = ["mkv", "mp4", "avi", "webm", "mov"];
+        let video_file = files
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| {
+                let path = std::path::PathBuf::from(&f.name);
+                path.extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| video_extensions.contains(&e.to_lowercase().as_str()))
+                    .unwrap_or(false)
+            })
+            .max_by_key(|(_, f)| f.length);
+
+        if let Some((file_idx, file)) = video_file {
+            tracing::info!(
+                "[SUBTITLES] Main video file found: {} (idx={})",
+                file.name,
+                file_idx
+            );
+
+            // Get local file path and probe for embedded subtitles
+            if let Some(file_path) = self.handle.get_file_path(file_idx).await {
+                // CRITICAL FIX: Prepare the file for streaming BEFORE probing
+                // This ensures the main video file is prioritized and header pieces are downloaded
+                if let Err(e) = self.handle.prepare_file_for_streaming(file_idx).await {
+                    tracing::warn!("[SUBTITLES] prepare_file_for_streaming failed: {}", e);
+                    // Continue anyway, probe might fail but worth a try
+                }
+
+                tracing::info!("[SUBTITLES] Probing file at path: {}", file_path);
+                match probe_embedded_subtitles(&file_path).await {
+                    Ok(embedded) => {
+                        tracing::info!("[SUBTITLES] Probed {} embedded tracks", embedded.len());
+                        for (stream_idx, lang, title) in embedded {
+                            // Create a special ID format for embedded subs: 1000 + stream_idx
+                            let id = 1000 + stream_idx;
+                            let name = if let Some(t) = title {
+                                format!("{} ({})", t, lang.unwrap_or_else(|| "und".to_string()))
+                            } else {
+                                format!(
+                                    "Track {} ({})",
+                                    stream_idx,
+                                    lang.unwrap_or_else(|| "und".to_string())
+                                )
+                            };
+                            tracks.push(SubtitleTrack {
+                                id,
+                                name,
+                                size: 0, // Embedded subs don't have a file size
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("[SUBTITLES] Probe failed: {}", e);
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    "[SUBTITLES] Could not get file path for probing idx={}",
+                    file_idx
+                );
+            }
+        } else {
+            tracing::warn!("[SUBTITLES] No main video file found to probe");
+        }
+
         tracks
     }
 
@@ -328,4 +404,117 @@ impl<H: TorrentHandle> Engine<H> {
         // Placeholder for now, handle stats() returns EngineStats which has peers count but not per-peer stats yet
         Vec::new()
     }
+
+    /// Extract embedded subtitle track to VTT format
+    pub async fn extract_embedded_subtitle(
+        &self,
+        file_idx: usize,
+        track_id: usize,
+    ) -> anyhow::Result<String> {
+        // Special ID format: 1000 + stream_index
+        if track_id < 1000 {
+            return Err(anyhow::anyhow!("Invalid embedded track ID"));
+        }
+        let stream_index = track_id - 1000;
+
+        let file_path = self
+            .handle
+            .get_file_path(file_idx)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("File not found locally"))?;
+
+        // Prepare file for streaming first to ensure we have enough data
+        self.handle.prepare_file_for_streaming(file_idx).await?;
+
+        // Use ffmpeg to extract and convert to VTT
+        // ffmpeg -i input.mkv -map 0:s:INDEX -c:s webvtt -f webvtt -
+        let mut cmd = tokio::process::Command::new("ffmpeg");
+
+        // Add hardware acceleration flags if available (might speed up decoding even for subs)
+        cmd.arg("-y"); // Overwrite output (though we output to stdout)
+        cmd.arg("-i").arg(&file_path);
+
+        // Map the specific subtitle stream
+        // Note: stream_index from probe is absolute index among subtitles
+        // So we use -map 0:s:INDEX
+        cmd.args(["-map", &format!("0:s:{}", stream_index)]);
+
+        // Convert to WebVTT
+        cmd.args(["-c:s", "webvtt"]);
+        cmd.args(["-f", "webvtt"]);
+
+        // Output to stdout
+        cmd.arg("-");
+
+        let output = cmd.output().await?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(anyhow::anyhow!("FFmpeg extraction failed: {}", stderr));
+        }
+
+        let content =
+            String::from_utf8(output.stdout).context("Invalid UTF-8 in extracted subtitles")?;
+
+        Ok(content)
+    }
+}
+
+/// Helper to probe for embedded subtitles using ffprobe
+async fn probe_embedded_subtitles(
+    path: &str,
+) -> anyhow::Result<Vec<(usize, Option<String>, Option<String>)>> {
+    tracing::info!("[SUBTITLES] Executing ffprobe on: {}", path);
+    let output = tokio::process::Command::new("ffprobe")
+        .args([
+            "-v",
+            "quiet",
+            "-print_format",
+            "json",
+            "-show_streams",
+            "-select_streams",
+            "s",
+            path,
+        ])
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        tracing::error!("[SUBTITLES] ffprobe command failed: {}", stderr);
+        return Err(anyhow::anyhow!("ffprobe failed"));
+    }
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let mut tracks = Vec::new();
+
+    if let Some(streams) = json.get("streams").and_then(|s| s.as_array()) {
+        for (idx, stream) in streams.iter().enumerate() {
+            // Get language and title tags
+            let tags = stream.get("tags");
+            let lang = tags
+                .and_then(|t| t.get("language"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let title = tags
+                .and_then(|t| t.get("title"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
+
+            // Check codec - only support text-based subs for now (ass, srt, webvtt)
+            // PGS/DVD bitmap subs require OCR which ffmpeg can't do easily to text
+            let codec = stream
+                .get("codec_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            tracing::debug!("[SUBTITLES] Found stream idx={} codec={}", idx, codec);
+
+            if ["ass", "ssa", "subrip", "webvtt", "mov_text", "text"].contains(&codec) {
+                tracks.push((idx, lang, title));
+            }
+        }
+    }
+
+    Ok(tracks)
 }

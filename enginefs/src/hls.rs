@@ -7,14 +7,18 @@ use std::task::Poll;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Command;
 
+use crate::backend::SubtitleTrack;
+use crate::hwaccel::HwAccelConfig;
+
 // HLS config optimized for browser playback
 // Native clients use direct streaming, so HLS is browser-only
 #[derive(Debug, Clone)]
 pub struct TranscodeConfig {
-    pub segment_duration: f64, // 4.0 seconds (HLS V2 optimization)
-    pub video_bitrate: String, // "15M"
-    pub audio_bitrate: String, // "192k"
-    pub gop_frames: u32,       // 96 frames (4s @ 24fps)
+    pub segment_duration: f64,          // 4.0 seconds (HLS V2 optimization)
+    pub video_bitrate: String,          // "15M"
+    pub audio_bitrate: String,          // "256k"
+    pub gop_frames: u32,                // 96 frames (4s @ 24fps)
+    pub hwaccel: Option<HwAccelConfig>, // Hardware acceleration config
 }
 
 impl Default for TranscodeConfig {
@@ -22,8 +26,9 @@ impl Default for TranscodeConfig {
         Self {
             segment_duration: 4.0,
             video_bitrate: "15M".to_string(),
-            audio_bitrate: "192k".to_string(),
+            audio_bitrate: "256k".to_string(),
             gop_frames: 96,
+            hwaccel: None, // Will be set based on transcode_profile
         }
     }
 }
@@ -32,6 +37,20 @@ impl TranscodeConfig {
     /// Browser-optimized HLS config for maximum compatibility and quality
     pub fn browser() -> Self {
         Self::default()
+    }
+
+    /// Create config with hardware acceleration based on available encoders and transcode_profile
+    pub fn with_hwaccel(available_hwaccels: &[String], transcode_profile: Option<&str>) -> Self {
+        let hwaccel = HwAccelConfig::from_transcode_profile(available_hwaccels, transcode_profile);
+        tracing::info!(
+            "Using video encoder: {} (hardware: {})",
+            hwaccel.name(),
+            hwaccel.is_hardware()
+        );
+        Self {
+            hwaccel: Some(hwaccel),
+            ..Self::default()
+        }
     }
 }
 
@@ -249,9 +268,35 @@ impl HlsEngine {
         file_idx: usize,
         base_url: &str,
         query_str: &str,
+        subtitle_tracks: &[SubtitleTrack],
     ) -> String {
         let config = TranscodeConfig::browser();
         let mut m3u = String::from("#EXTM3U\n#EXT-X-VERSION:4\n");
+
+        // Subtitles Group
+        let subs_group_id = "subs";
+        let mut has_subtitles = false;
+
+        for (i, sub) in subtitle_tracks.iter().enumerate() {
+            has_subtitles = true;
+            let lang = "und"; // We don't have lang in SubtitleTrack yet, default to und
+            let name = &sub.name;
+            let is_default = if i == 0 { "YES" } else { "NO" };
+            let is_autoselect = "YES"; // Always autoselect for now to Ensure player sees them
+
+            // URI for VTT subtitles
+            // Uses the existing VTT endpoint: /{infoHash}/{fileIdx}/subtitles.vtt
+            // But we need to use the sub.id which is the file_idx for the subtitle file
+            let sub_uri = format!(
+                "{}/{}/{}/subtitles.vtt?{}",
+                base_url, info_hash, sub.id, query_str
+            );
+
+            m3u.push_str(&format!(
+                "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"{}\",LANGUAGE=\"{}\",NAME=\"{}\",DEFAULT={},AUTOSELECT={},URI=\"{}\"\n",
+                subs_group_id, lang, name, is_default, is_autoselect, sub_uri
+            ));
+        }
 
         // Collect audio streams from probe
         let audio_streams: Vec<&VideoStream> = probe
@@ -296,15 +341,25 @@ impl HlsEngine {
         let codecs = "avc1.640028,mp4a.40.2"; // High Profile Level 4.0
 
         if !audio_streams.is_empty() {
-            m3u.push_str(&format!(
-                "#EXT-X-STREAM-INF:BANDWIDTH={},CODECS=\"{}\",AUDIO=\"{}\"\n",
+            let mut line = format!(
+                "#EXT-X-STREAM-INF:BANDWIDTH={},CODECS=\"{}\",AUDIO=\"{}\"",
                 bandwidth, codecs, audio_group_id
-            ));
+            );
+            if has_subtitles {
+                line.push_str(&format!(",SUBTITLES=\"{}\"", subs_group_id));
+            }
+            m3u.push_str(&line);
+            m3u.push('\n');
         } else {
-            m3u.push_str(&format!(
-                "#EXT-X-STREAM-INF:BANDWIDTH={},CODECS=\"{}\"\n",
+            let mut line = format!(
+                "#EXT-X-STREAM-INF:BANDWIDTH={},CODECS=\"{}\"",
                 bandwidth, codecs
-            ));
+            );
+            if has_subtitles {
+                line.push_str(&format!(",SUBTITLES=\"{}\"", subs_group_id));
+            }
+            m3u.push_str(&line);
+            m3u.push('\n');
         }
 
         // Video stream playlist URL
@@ -376,6 +431,16 @@ impl HlsEngine {
         // Optimized for fast startup - 10MB/10s is enough for most video
         cmd.args(["-analyzeduration", "10000000", "-probesize", "10000000"]);
 
+        // Hardware acceleration INPUT flags (MUST be before -i)
+        if let Some(ref hw) = config.hwaccel {
+            if let Some(ref accel) = hw.hwaccel {
+                cmd.args(["-hwaccel", accel]);
+            }
+            if let Some(ref device) = hw.device {
+                cmd.args(["-hwaccel_device", device]);
+            }
+        }
+
         // HYBRID SEEKING APPROACH:
         // 1. Fast input seek to get close (keyframe before target)
         // 2. Output seek to precise position (ensures proper frame decoding)
@@ -415,26 +480,52 @@ impl HlsEngine {
         // Output mapping: video only
         cmd.args(["-map", "0:v:0", "-an", "-sn"]);
 
-        // Video filter: pixel format only (simplified for stability)
-        cmd.args(["-vf", "format=yuv420p"]);
+        // Video encoding: use hardware acceleration if configured, else software fallback
+        let is_hw_encoder = config
+            .hwaccel
+            .as_ref()
+            .map(|hw| hw.is_hardware())
+            .unwrap_or(false);
 
-        // Video encoding: libx264, ultrafast, zerolatency
-        cmd.args([
-            "-c:v",
-            "libx264",
-            "-preset:v",
-            "ultrafast",
-            "-profile:v",
-            "high",
-            "-tune:v",
-            "zerolatency",
-            "-level",
-            "51",
-        ]);
+        if let Some(ref hw) = config.hwaccel {
+            // Encoder (hwaccel flags already added before -i)
+            cmd.args(["-c:v", &hw.encoder]);
+
+            // Encoder-specific extra args (preset, rc, etc.)
+            for arg in &hw.extra_args {
+                cmd.arg(arg);
+            }
+
+            // For software encoders, add video filter and profile settings
+            if !hw.is_hardware() {
+                cmd.args(["-vf", "format=yuv420p"]);
+                cmd.args(["-profile:v", "high", "-level", "51"]);
+            }
+            // Hardware encoders don't need pix_fmt or profile settings
+        } else {
+            // Default software encoding fallback
+            cmd.args(["-vf", "format=yuv420p"]);
+            cmd.args([
+                "-c:v",
+                "libx264",
+                "-preset:v",
+                "veryfast",
+                "-profile:v",
+                "high",
+                "-tune:v",
+                "zerolatency",
+                "-level",
+                "51",
+            ]);
+        }
 
         // Fixed GOP for HLS V2 segment alignment
+        // Note: sc_threshold only works with software encoders
         let gop = config.gop_frames.to_string();
-        cmd.args(["-sc_threshold", "0", "-g", &gop, "-keyint_min", &gop]);
+        if !is_hw_encoder {
+            cmd.args(["-sc_threshold", "0"]);
+        }
+        cmd.args(["-g", &gop, "-keyint_min", &gop]);
 
         // Bitrate control (can be scaled here if needed, sticking to config for now)
         let video_bitrate_num = config

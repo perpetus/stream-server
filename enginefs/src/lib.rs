@@ -12,9 +12,11 @@ pub mod cache;
 pub mod engine;
 pub mod files;
 pub mod hls;
+pub mod hwaccel;
 pub mod metadata_cache;
 pub mod piece_cache;
 pub mod piece_waiter;
+pub mod subtitles;
 pub mod tracker_prober;
 pub mod trackers;
 

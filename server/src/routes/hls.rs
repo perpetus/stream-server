@@ -120,7 +120,12 @@ pub async fn master_playlist_by_url(
     let query_str = raw_query.as_deref().unwrap_or("");
 
     let playlist = enginefs::hls::HlsEngine::get_master_playlist(
-        &probe, &info_hash, file_idx, &base_url, query_str,
+        &probe,
+        &info_hash,
+        file_idx,
+        &base_url,
+        query_str,
+        &[],
     );
 
     (
@@ -166,6 +171,7 @@ pub async fn get_master_playlist(
     };
 
     let query_str = raw_query.as_deref().unwrap_or("");
+    let subtitle_tracks = engine.find_subtitle_tracks().await;
 
     let playlist = enginefs::hls::HlsEngine::get_master_playlist(
         &probe,
@@ -173,6 +179,7 @@ pub async fn get_master_playlist(
         file_idx,
         &format!("http://127.0.0.1:{}", port),
         query_str,
+        &subtitle_tracks,
     );
 
     (
@@ -368,7 +375,18 @@ async fn get_segment(
         None => return (StatusCode::NOT_FOUND, "Segment out of bounds").into_response(),
     };
 
-    let config = enginefs::hls::TranscodeConfig::browser();
+    // Get transcode_profile from settings and probe available hardware accelerators
+    let transcode_profile = {
+        let settings = state.settings.read().await;
+        settings.transcode_profile.clone()
+    };
+
+    // Probe available hardware accelerators (cached in practice via the system endpoint)
+    let available_hwaccels = crate::routes::system::probe_hwaccel().await;
+    let config = enginefs::hls::TranscodeConfig::with_hwaccel(
+        &available_hwaccels,
+        transcode_profile.as_deref(),
+    );
 
     // Dispatch to video or audio transcoding based on segment type
     let child = if let Some(audio_idx) = audio_track_idx {

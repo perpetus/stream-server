@@ -254,7 +254,7 @@ pub async fn hwaccel_profiler() -> impl IntoResponse {
     }))
 }
 
-async fn probe_hwaccel() -> Vec<String> {
+pub async fn probe_hwaccel() -> Vec<String> {
     let mut profiles = Vec::new();
     let output = match tokio::process::Command::new("ffmpeg")
         .args(["-hide_banner", "-encoders"])

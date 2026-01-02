@@ -1,11 +1,10 @@
 use crate::state::AppState;
 use axum::{
+    Json,
     extract::{Path, Query, State},
     response::{IntoResponse, Response},
-    Json,
 };
-use enginefs::backend::SubtitleTrack;
-use regex::Regex;
+use enginefs::backend::{SubtitleTrack, TorrentHandle};
 use serde_json::json;
 use tokio::io::AsyncReadExt;
 
@@ -30,7 +29,9 @@ pub async fn opensub_hash(
         if part.len() == 40 && hex::decode(part).is_ok() {
             info_hash = Some(part.to_string());
             if i + 1 < parts.len() {
-                if let Ok(idx) = parts[i + 1].parse::<usize>() {
+                // Strip query string if present (e.g., "0?tr=..." -> "0")
+                let file_part = parts[i + 1].split('?').next().unwrap_or("");
+                if let Ok(idx) = file_part.parse::<usize>() {
                     file_idx = Some(idx);
                 }
             }
@@ -112,24 +113,52 @@ pub async fn get_subtitles_vtt(
     Path((info_hash, file_idx)): Path<(String, usize)>,
 ) -> Response {
     if let Some(engine) = state.engine.get_engine(&info_hash).await {
+        // Check if this is an embedded subtitle track ID (>= 1000)
+        // For embedded subs, file_idx is actually the ID from find_subtitle_tracks
+        // We need to find the main video file index for extraction
+        if file_idx >= 1000 {
+            // Find the main video file (largest file)
+            let files = engine.handle.get_files().await;
+            if let Some((main_file_idx, _)) = files.iter().enumerate().max_by_key(|(_, f)| f.length)
+            {
+                // Determine track ID (offset by 1000)
+                let track_id = file_idx;
+
+                match engine
+                    .extract_embedded_subtitle(main_file_idx, track_id)
+                    .await
+                {
+                    Ok(content) => {
+                        // FFmpeg output is already VTT, but let's run it through our parser
+                        // to ensure consistent styling if needed, or just return as is.
+                        // For now, return as is since ffmpeg does a decent job.
+                        return Response::builder()
+                            .header("content-type", "text/vtt")
+                            .header("access-control-allow-origin", "*")
+                            .body(axum::body::Body::from(content))
+                            .unwrap();
+                    }
+                    Err(e) => {
+                        return Response::builder()
+                            .status(500)
+                            .body(axum::body::Body::from(format!("Extraction failed: {}", e)))
+                            .unwrap();
+                    }
+                }
+            }
+        }
+
+        // Regular external file handling
         if let Some(mut file) = engine.get_file(file_idx, 0, 0).await {
             let mut content = String::new();
             if file.read_to_string(&mut content).await.is_ok() {
-                // Convert to VTT if needed
-                let mut vtt_content = String::new();
-                if !content.trim_start().starts_with("WEBVTT") {
-                    vtt_content.push_str("WEBVTT\n\n");
-                }
-
-                // Replace comma timestamps with dots: 00:00:00,000 -> 00:00:00.000
-                // Using regex for safety.
-                // Pattern: (\d{2}:\d{2}:\d{2}),(\d{3})
-                let re = Regex::new(r"(\d{2}:\d{2}:\d{2}),(\d{3})").unwrap();
-                let converted = re.replace_all(&content, "$1.$2");
-                vtt_content.push_str(&converted);
+                // Use the new subtitle parser which handles SRT, ASS, and VTT
+                // with proper styling preservation
+                let vtt_content = enginefs::subtitles::convert_to_vtt(&content);
 
                 return Response::builder()
                     .header("content-type", "text/vtt")
+                    .header("access-control-allow-origin", "*")
                     .body(axum::body::Body::from(vtt_content))
                     .unwrap();
             }
@@ -185,19 +214,13 @@ pub async fn proxy_subtitles_vtt(Query(query): Query<ProxySubtitlesQuery>) -> Re
         }
     };
 
-    // Convert to VTT if needed
-    let mut vtt_content = String::new();
-    if !content.trim_start().starts_with("WEBVTT") {
-        vtt_content.push_str("WEBVTT\n\n");
-    }
-
-    // Replace comma timestamps with dots: 00:00:00,000 -> 00:00:00.000
-    let re = Regex::new(r"(\d{2}:\d{2}:\d{2}),(\d{3})").unwrap();
-    let converted = re.replace_all(&content, "$1.$2");
-    vtt_content.push_str(&converted);
+    // Use the new subtitle parser which handles SRT, ASS, and VTT
+    // with proper styling preservation
+    let vtt_content = enginefs::subtitles::convert_to_vtt(&content);
 
     Response::builder()
         .header("content-type", "text/vtt")
+        .header("access-control-allow-origin", "*")
         .body(axum::body::Body::from(vtt_content))
         .unwrap()
 }
