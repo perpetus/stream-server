@@ -1,4 +1,6 @@
+#[cfg(target_os = "windows")]
 use chrono::{Datelike, Local};
+#[cfg(target_os = "windows")]
 use std::env;
 
 fn main() {
