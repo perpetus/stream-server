@@ -674,6 +674,11 @@ impl LibtorrentHandle {
         ffi::handle_clear_piece_deadlines(self.inner.pin_mut())
     }
 
+    /// Set piece priority (0=skip, 1=low, 4=normal, 7=highest)
+    pub fn set_piece_priority(&mut self, piece: i32, priority: i32) {
+        ffi::handle_set_piece_priority(self.inner.pin_mut(), piece, priority)
+    }
+
     /// Check if piece is downloaded
     pub fn have_piece(&self, piece: i32) -> bool {
         ffi::handle_have_piece(&self.inner, piece)

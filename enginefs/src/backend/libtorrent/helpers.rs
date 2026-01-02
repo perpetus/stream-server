@@ -56,6 +56,22 @@ pub(super) async fn read_piece_from_disk(
     let overlap_end = piece_global_end.min(file_global_end);
     let overlap_size = overlap_end - overlap_start;
 
+    // CRITICAL FIX: Only cache FULL pieces.
+    // Partial pieces (at file boundaries) cause cache inconsistency because
+    // the reader logic assumes cache data represents the starting from piece_global_start.
+    // If we cache a partial chunk starting at file_global_start, the offset calculation is wrong.
+    // Exception: Last piece of torrent may be smaller naturally.
+    if overlap_size < piece_length {
+        // Check if this is truly a partial overlap (edge piece)
+        // If it's just the last piece of the torrent, it might be fine, but for simplicity
+        // and safety, we skip caching any non-full-length chunk.
+        // This means we won't prefetch edge pieces, which is acceptable collateral damage.
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "Skipping partial piece caching to preserve consistency",
+        ));
+    }
+
     // Convert to file-relative offset
     let file_relative_offset = overlap_start - file_global_start;
 

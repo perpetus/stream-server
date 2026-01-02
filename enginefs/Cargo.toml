@@ -29,7 +29,9 @@ anyhow = "1.0"
 moka = { version = "0.12.11", features = ["future"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
 urlencoding = "2.1"
-bumpalo = "3.19.1"
+bumpalo = { version = "3.19", features = ["collections"] }
+memmap2 = "0.9.9"
+parking_lot = "0.12.5"
 
 [features]
 default = ["libtorrent"]

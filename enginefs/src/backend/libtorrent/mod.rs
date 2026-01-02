@@ -33,6 +33,8 @@ pub struct LibtorrentBackend {
     stream_counter: Arc<std::sync::atomic::AtomicUsize>,
     /// In-memory piece cache for fast streaming
     piece_cache: Arc<crate::piece_cache::PieceCacheManager>,
+    /// Registry of wakers waiting for pieces to finish downloading
+    piece_waiter: Arc<crate::piece_waiter::PieceWaiterRegistry>,
 }
 
 impl LibtorrentBackend {
@@ -84,6 +86,8 @@ impl LibtorrentBackend {
             piece_cache_config,
         ));
 
+        let piece_waiter = Arc::new(crate::piece_waiter::PieceWaiterRegistry::new());
+
         let backend = Self {
             session: Arc::new(RwLock::new(session)),
             save_path,
@@ -91,6 +95,7 @@ impl LibtorrentBackend {
             config,
             stream_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             piece_cache,
+            piece_waiter,
         };
         backend.start_monitor_task();
         Ok(backend)
@@ -119,6 +124,8 @@ impl LibtorrentBackend {
             piece_cache_config,
         ));
 
+        let piece_waiter = Arc::new(crate::piece_waiter::PieceWaiterRegistry::new());
+
         let backend = Self {
             session: Arc::new(RwLock::new(session)),
             save_path,
@@ -126,6 +133,7 @@ impl LibtorrentBackend {
             config,
             stream_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             piece_cache,
+            piece_waiter,
         };
         backend.start_monitor_task();
         Ok(backend)
@@ -177,13 +185,15 @@ impl LibtorrentBackend {
     }
     fn start_monitor_task(&self) {
         // === FAST ALERT PUMP ===
-        // Process alerts every 100ms for minimal latency on piece caching
-        // This is CRITICAL for streaming - reduces cache latency from 2s to ~100ms
+        // Process alerts every 5ms for minimal latency on piece notifications
+        // This is CRITICAL for streaming - wakes waiting streams immediately when pieces finish
         let alert_session = self.session.clone();
         let alert_piece_cache = self.piece_cache.clone();
+        let alert_piece_waiter = self.piece_waiter.clone();
 
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
+            // REDUCED to 5ms for instant piece notifications
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(5));
 
             // Alert type constants
             const PIECE_FINISHED_ALERT_TYPE: i32 = 69;
@@ -196,12 +206,16 @@ impl LibtorrentBackend {
                 let alerts = s.pop_alerts();
 
                 for alert in alerts {
-                    // Handle piece_finished_alert: Request piece data from libtorrent
+                    // Handle piece_finished_alert: Notify waiters and request piece data
                     if alert.alert_type == PIECE_FINISHED_ALERT_TYPE && alert.piece_index >= 0 {
+                        // NOTIFY WAITERS IMMEDIATELY - wakes all streams waiting for this piece
+                        alert_piece_waiter
+                            .notify_piece_finished(&alert.info_hash, alert.piece_index);
+
                         if let Ok(mut handle) = s.find_torrent(&alert.info_hash) {
                             let _ = handle.read_piece(alert.piece_index);
                             tracing::trace!(
-                                "Fast-alert: Requested piece {} for {}",
+                                "Fast-alert: Piece {} finished for {}",
                                 alert.piece_index,
                                 alert.info_hash
                             );
@@ -257,17 +271,11 @@ impl LibtorrentBackend {
 
                     // --- Metadata Initialization Logic ---
                     if status.has_metadata {
-                        let priorities = handle.get_file_priorities();
-                        if !priorities.is_empty() && priorities.iter().all(|&p| p == 4) {
-                            tracing::info!(
-                                "Monitor: Metadata acquired for '{}' ({} files). Resetting all priorities to 0 (skip).",
-                                status.name,
-                                priorities.len()
-                            );
-                            for (i, _) in priorities.iter().enumerate() {
-                                handle.set_file_priority(i as i32, 0);
-                            }
-                        }
+                        // NOTE: We no longer reset priorities here!
+                        // Priorities are already set to 0 in add_torrent().
+                        // Resetting here was causing race conditions with get_file_reader()
+                        // which sets priorities for streaming. This was the root cause of
+                        // "WAITING for piece 0" with 0 download speed.
 
                         // Instant Loading Part 3: Save Metadata to Cache
                         let info_hash = handle.info_hash();
@@ -284,6 +292,15 @@ impl LibtorrentBackend {
                                 }
                             }
                         }
+                    }
+
+                    // --- Auto-Pause Finished Torrents ---
+                    if status.is_finished && !status.is_paused {
+                        tracing::info!(
+                            "Monitor: Torrent '{}' finished. Pausing to save resources.",
+                            status.name
+                        );
+                        handle.pause();
                     }
 
                     // --- PeerSearch Logic ---
@@ -361,8 +378,19 @@ impl LibtorrentBackend {
         }
     }
 
+    /// Enable or disable streaming mode
+    /// Currently a no-op - upload limiting was causing peer deprioritization
+    pub async fn set_streaming_mode(&self, _enabled: bool) {
+        // DISABLED: Upload limiting causes peers to deprioritize us due to tit-for-tat
+        // Even 100KB/s wasn't enough - let uploads run freely
+        // The download speed benefit wasn't worth the peer reciprocity cost
+    }
+
     /// Resume all paused torrents (called when streaming ends)
     pub async fn resume_all_torrents(&self) {
+        // Disable streaming mode (restore upload bandwidth)
+        self.set_streaming_mode(false).await;
+
         let session = self.session.read().await;
         let torrents = session.get_torrents();
 
@@ -504,6 +532,7 @@ impl TorrentBackend for LibtorrentBackend {
             config: self.config.clone(),
             stream_counter: self.stream_counter.clone(),
             piece_cache: self.piece_cache.clone(),
+            piece_waiter: self.piece_waiter.clone(),
         })
     }
 
@@ -517,6 +546,7 @@ impl TorrentBackend for LibtorrentBackend {
                 config: self.config.clone(),
                 stream_counter: self.stream_counter.clone(),
                 piece_cache: self.piece_cache.clone(),
+                piece_waiter: self.piece_waiter.clone(),
             }),
             Err(_) => None,
         }

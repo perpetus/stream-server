@@ -24,6 +24,8 @@ pub struct LibtorrentTorrentHandle {
     pub(crate) stream_counter: Arc<std::sync::atomic::AtomicUsize>,
     /// In-memory piece cache for fast streaming
     pub(crate) piece_cache: Arc<crate::piece_cache::PieceCacheManager>,
+    /// Registry of wakers waiting for pieces to finish downloading
+    pub(crate) piece_waiter: Arc<crate::piece_waiter::PieceWaiterRegistry>,
 }
 
 #[async_trait::async_trait]
@@ -151,17 +153,25 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
             is_complete
         );
 
-        // Set file priorities: Requested file = 1, Others = 0 (Skip)
+        // CRITICAL: Resume torrent if paused!
+        // Torrent may have been paused after being marked "finished" when all files had priority 0
+        let status = handle.status();
+        if status.is_paused {
+            tracing::info!("get_file_reader: Resuming paused torrent for streaming");
+            handle.resume();
+        }
+
+        // Set file priorities: Requested file = 4, Others = 0 (Skip)
         // This ensures all bandwidth goes to the stream
         let all_files = handle.files();
         for (idx, f) in all_files.iter().enumerate() {
             if idx == file_idx {
                 tracing::debug!(
-                    "get_file_reader: Setting PRIORITY 1 (LOW) for file idx={} name={}",
+                    "get_file_reader: Setting PRIORITY 4 (NORMAL) for file idx={} name={}",
                     idx,
                     f.path
                 );
-                handle.set_file_priority(idx as i32, 1);
+                handle.set_file_priority(idx as i32, 4);
             } else {
                 tracing::debug!(
                     "get_file_reader: Setting PRIORITY 0 (SKIP) for file idx={} name={}",
@@ -178,44 +188,46 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
         // These should NOT modify piece priorities as they would conflict with playback
         let skip_prioritization = priority == 255 || is_complete;
 
+        // File size is needed for both prioritization and seek type detection
+        let file_size = file_info.size as u64;
+
+        // =========================================================================
+        // SEEK TYPE DETECTION with Priority Bands
+        // =========================================================================
+        // | Band     | Deadline   | Use Case                                     |
+        // |----------|------------|----------------------------------------------|
+        // | URGENT   | 0-200ms    | Initial playback (first request, offset=0)  |
+        // | CRITICAL | 300-500ms  | User-initiated seeks (scrubbing)            |
+        // | NORMAL   | 1000-1200ms| Prefetch/buffer expansion                   |
+        // | DEFERRED | 2000-3000ms| Container metadata (moov/Cues at end)       |
+        // =========================================================================
+
+        #[derive(Debug, Clone, Copy)]
+        enum SeekType {
+            InitialPlayback,   // offset=0, first request
+            ContainerMetadata, // near end of file, seeking for moov/Cues
+            UserScrub,         // user is seeking mid-video
+        }
+
+        let seek_type = {
+            if start_offset == 0 {
+                SeekType::InitialPlayback
+            } else {
+                // Near end of file = container metadata (last 10MB or last 5%)
+                let end_threshold = file_size
+                    .saturating_sub(10 * 1024 * 1024)
+                    .max(file_size * 95 / 100);
+                if start_offset >= end_threshold {
+                    SeekType::ContainerMetadata
+                } else {
+                    SeekType::UserScrub
+                }
+            }
+        };
+
         if !skip_prioritization {
             // Calculate actual start piece
             actual_start_piece = ((global_file_offset + start_offset) / piece_length) as i32;
-            let file_size = file_info.size as u64;
-
-            // =========================================================================
-            // SEEK TYPE DETECTION with Priority Bands
-            // =========================================================================
-            // | Band     | Deadline   | Use Case                                     |
-            // |----------|------------|----------------------------------------------|
-            // | URGENT   | 0-200ms    | Initial playback (first request, offset=0)  |
-            // | CRITICAL | 300-500ms  | User-initiated seeks (scrubbing)            |
-            // | NORMAL   | 1000-1200ms| Prefetch/buffer expansion                   |
-            // | DEFERRED | 2000-3000ms| Container metadata (moov/Cues at end)       |
-            // =========================================================================
-
-            #[derive(Debug, Clone, Copy)]
-            enum SeekType {
-                InitialPlayback,   // offset=0, first request
-                ContainerMetadata, // near end of file, seeking for moov/Cues
-                UserScrub,         // user is seeking mid-video
-            }
-
-            let seek_type = {
-                if start_offset == 0 {
-                    SeekType::InitialPlayback
-                } else {
-                    // Near end of file = container metadata (last 10MB or last 5%)
-                    let end_threshold = file_size
-                        .saturating_sub(10 * 1024 * 1024)
-                        .max(file_size * 95 / 100);
-                    if start_offset >= end_threshold {
-                        SeekType::ContainerMetadata
-                    } else {
-                        SeekType::UserScrub
-                    }
-                }
-            };
 
             // CRITICAL FIX: Only clear deadlines for non-container-metadata requests
             // Container metadata requests should ADD priorities, not replace them
@@ -273,10 +285,12 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
                 download_speed as f64 / 1_000_000.0
             );
 
-            // Set piece deadlines with staircase pattern
+            // Set piece PRIORITY and DEADLINE with staircase pattern
+            // CRITICAL: Both are needed! Priority 7 = highest, deadline = time constraint
             for i in 0..window_size {
                 let p = actual_start_piece + i;
                 if p <= last_piece {
+                    handle.set_piece_priority(p, 7); // Highest priority - ESSENTIAL for download
                     let deadline = adjusted_deadline + i * 10;
                     handle.set_piece_deadline(p, deadline);
                 }
@@ -296,18 +310,27 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
                 }
             }
 
-            // CRITICAL FIX: Always ensure head pieces (0-7) remain prioritized
-            // This guarantees playback can start regardless of metadata seeks
-            // Don't log every time to avoid spam (only on initial playback)
-            for i in 0..8 {
-                let p = first_piece + i;
-                if p <= last_piece && !handle.have_piece(p) {
-                    // Use staircase: 0, 10, 20... ms to maintain order
-                    // Only set if not already doing initial playback (avoids double-setting)
-                    if !matches!(seek_type, SeekType::InitialPlayback)
-                        || actual_start_piece != first_piece
-                    {
-                        handle.set_piece_deadline(p, i * 10);
+            // HEAD PIECE PROTECTION: Only for InitialPlayback and ContainerMetadata
+            // - InitialPlayback: Already prioritizes head pieces, ensures staircase order
+            // - ContainerMetadata: Seeking to end for moov/Cues, but still needs head for playback
+            // - UserScrub: Does NOT need head pieces - user is playing from a different position
+            //   The player already has container info cached from previous requests
+            if matches!(
+                seek_type,
+                SeekType::InitialPlayback | SeekType::ContainerMetadata
+            ) {
+                for i in 0..8 {
+                    let p = first_piece + i;
+                    if p <= last_piece && !handle.have_piece(p) {
+                        handle.set_piece_priority(p, 7); // ESSENTIAL - without this pieces won't download
+                        // Use staircase: 0, 10, 20... ms to maintain order
+                        // For ContainerMetadata: always set URGENT deadlines
+                        // For InitialPlayback: only set if not already at head (avoids double-setting)
+                        if matches!(seek_type, SeekType::ContainerMetadata)
+                            || actual_start_piece != first_piece
+                        {
+                            handle.set_piece_deadline(p, (i as i32) * 10);
+                        }
                     }
                 }
             }
@@ -347,6 +370,29 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
             .stream_counter
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
+        // Create mmap for completed files for zero-copy reads
+        let mmap = if is_complete && file_path.exists() {
+            std::fs::File::open(&file_path)
+                .and_then(|f| unsafe { memmap2::Mmap::map(&f) })
+                .map(|m| {
+                    tracing::info!(
+                        "get_file_reader: Using mmap for completed file (size={})",
+                        m.len()
+                    );
+                    m
+                })
+                .ok()
+        } else {
+            None
+        };
+
+        // Map local SeekType to stream's SeekType for deterministic handling
+        let initial_seek_type = match seek_type {
+            SeekType::InitialPlayback => super::stream::SeekType::InitialPlayback,
+            SeekType::ContainerMetadata => super::stream::SeekType::ContainerMetadata,
+            SeekType::UserScrub => super::stream::SeekType::UserScrub,
+        };
+
         Ok(Box::new(LibtorrentFileStream {
             file: opened_file,
             file_path,
@@ -367,6 +413,11 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
             info_hash: self.info_hash.clone(),
             cached_piece_data: None,
             last_prefetch_piece: -1,
+            requested_piece_via_api: std::collections::HashSet::new(),
+            mmap,
+            piece_waiter: self.piece_waiter.clone(),
+            seek_type: initial_seek_type,
+            file_size,
         }))
     }
 
@@ -506,41 +557,50 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
             // Set file priorities: target file = 1, all others = 0 (skip)
             for (idx, _) in files.iter().enumerate() {
                 if idx == file_idx {
-                    handle.set_file_priority(idx as i32, 1); // Low priority - let piece deadlines drive urgency
+                    handle.set_file_priority(idx as i32, 4); // Normal priority - let piece deadlines drive urgency
                 } else {
                     handle.set_file_priority(idx as i32, 0);
                 }
             }
 
-            // Phase 1: Initial prioritization for fast startup
-            // ONLY prioritize first pieces - NOT Cues at end!
-            // MKV can play without Cues for sequential playback
-            // Cues will be fetched later in background for seeking
-            let total_pieces = (last_piece - first_piece + 1) as i32;
-
-            // First 3 pieces get deadline=0 (immediate)
-            for i in 0..total_pieces.min(3) {
+            // REMOVED: First-8-pieces prioritization was causing seeks to fail
+            // because it set highest priority on pieces 0-7 even when seeking to piece 118.
+            // Prioritization now happens ONLY in get_file_reader() which knows the actual offset.
+            //
+            // SAFETY NET: Set low-urgency deadlines on first 8 pieces as fallback.
+            // These will be overridden by get_file_reader() with proper URGENT (0ms) deadlines.
+            // But if there's any delay before get_file_reader() runs, this ensures SOMETHING
+            // starts downloading immediately after file switch (fixes 95%+ download issue).
+            for i in 0..8 {
                 let p = first_piece + i;
-                handle.set_piece_deadline(p, 0);
+                if p <= last_piece && !handle.have_piece(p) {
+                    handle.set_piece_priority(p, 7); // Highest priority
+                    handle.set_piece_deadline(p, 5000); // 5 second fallback deadline
+                }
             }
-            // Next 5 pieces get deadline=100ms (soon after)
-            for i in 3..total_pieces.min(8) {
-                let p = first_piece + i;
-                handle.set_piece_deadline(p, 100);
+            let _total_pieces = (last_piece - first_piece + 1) as i32;
+
+            // PRE-WARM CACHE: If first 8 pieces are already complete, request them via read_piece
+            // This populates moka cache immediately for zero-latency first read
+            // Only prewarm if they're already available (don't wait for download)
+            let prewarm_count = 8;
+            let is_prewarm_complete =
+                (0..prewarm_count).all(|i| handle.have_piece(first_piece + i));
+            if is_prewarm_complete {
+                tracing::info!(
+                    "prepare_file_for_streaming: File head complete, pre-warming {} pieces",
+                    prewarm_count
+                );
+                for i in 0..prewarm_count {
+                    let _ = handle.read_piece(first_piece + i);
+                }
             }
 
-            // DO NOT prioritize last pieces (Cues) here!
-            // This allows playback to start faster while Cues are fetched in background
-
-            // RE-ENABLE sequential download for concentrated bandwidth
-            // Combined with deadline=0 on first 3 pieces ensures:
-            // 1. First 3 pieces get highest priority via deadline=0
-            // 2. Sequential download keeps bandwidth focused on adjacent pieces
-            // 3. Prevents "rarest first" from spreading bandwidth across torrent
-            handle.set_sequential_download(true);
+            // DO NOT prioritize pieces here - let get_file_reader() handle it
+            // since it knows the actual seek offset
 
             tracing::info!(
-                "prepare_file_for_streaming: Prioritized first 8 pieces, sequential ON (concentrated bandwidth)",
+                "prepare_file_for_streaming: Ready (prioritization deferred to get_file_reader)",
             );
 
             (
@@ -639,6 +699,27 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
             "prepare_file_for_streaming: Ready for playback (non-blocking) - Total setup time: {:?}",
             overall_start.elapsed()
         );
+        Ok(())
+    }
+
+    async fn clear_file_streaming(&self, file_idx: usize) -> anyhow::Result<()> {
+        let session = self.session.read().await;
+        let mut handle = session
+            .find_torrent(&self.info_hash)
+            .map_err(|e| anyhow!("Torrent not found: {}", e))?;
+
+        // Set file priority to 0 (skip) - no more pieces will be downloaded for this file
+        handle.set_file_priority(file_idx as i32, 0);
+
+        // Clear all piece deadlines to stop prioritizing this file's pieces
+        handle.clear_piece_deadlines();
+
+        tracing::info!(
+            "clear_file_streaming: Cleared streaming state for file {} in {}",
+            file_idx,
+            self.info_hash
+        );
+
         Ok(())
     }
 }

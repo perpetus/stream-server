@@ -150,6 +150,10 @@ pub async fn get_master_playlist(
         }
     };
 
+    // --- Stream Lifecycle: Notify start and focus bandwidth for HLS ---
+    state.engine.on_stream_start(&info_hash, file_idx).await;
+    state.engine.focus_torrent(&info_hash).await;
+
     let port = 11470;
     let stream_url = format!(
         "http://127.0.0.1:{}/stream/{}/{}",

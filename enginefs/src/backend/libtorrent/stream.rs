@@ -6,6 +6,20 @@ use std::sync::Arc;
 use super::helpers::read_piece_from_disk;
 use crate::backend::priorities::{EngineCacheConfig, calculate_priorities};
 
+/// Type of seek operation - determines priority behavior
+/// Used for DETERMINISTIC seek detection instead of heuristic piece jumps
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum SeekType {
+    /// Normal sequential reading (no seek)
+    Sequential,
+    /// Initial playback (offset=0 on first request)
+    InitialPlayback,
+    /// User scrubbing to a new position
+    UserScrub,
+    /// Container metadata read (moov, Cues at end of file)
+    ContainerMetadata,
+}
+
 pub(crate) struct LibtorrentFileStream {
     pub(crate) file: Option<tokio::fs::File>, // Made optional - file may not exist yet
     pub(crate) file_path: PathBuf,            // Path to file for lazy opening
@@ -14,6 +28,9 @@ pub(crate) struct LibtorrentFileStream {
     pub(crate) last_piece: i32,
     pub(crate) piece_length: u64,
     pub(crate) file_offset: u64,
+    // For multi-file torrents:
+    // We used to calculate file-relative offsets here, but now we enforce FULL pieces in cache.
+    // The offset logic has been simplified to: (file_offset + pos) % piece_length
     pub(crate) current_pos: u64,
     pub(crate) is_complete: bool,
     pub(crate) last_priorities_piece: i32, // Track last piece we set priorities for
@@ -31,6 +48,16 @@ pub(crate) struct LibtorrentFileStream {
     pub(crate) cached_piece_data: Option<(i32, Arc<Vec<u8>>, u64)>,
     /// Last piece we triggered prefetch for (to avoid repeated requests)
     pub(crate) last_prefetch_piece: i32,
+    /// Track pieces we've requested via read_piece() API to avoid duplicate requests
+    pub(crate) requested_piece_via_api: std::collections::HashSet<i32>,
+    /// Memory-mapped file for zero-copy reads on completed files
+    pub(crate) mmap: Option<memmap2::Mmap>,
+    /// Registry of wakers waiting for pieces to finish downloading
+    pub(crate) piece_waiter: Arc<crate::piece_waiter::PieceWaiterRegistry>,
+    /// Current seek type for DETERMINISTIC priority handling
+    pub(crate) seek_type: SeekType,
+    /// File size for container metadata detection
+    pub(crate) file_size: u64,
 }
 
 impl LibtorrentFileStream {
@@ -54,36 +81,37 @@ impl LibtorrentFileStream {
             return;
         }
 
-        if self.last_priorities_piece != -1 {
-            let old_start = self.last_priorities_piece;
-            // We clear a reasonably large window around the old position to ensure no dangling high priorities.
-            // If the jump is small, we just clear the old window.
-            // If the jump is large, we should probably clear the whole file's deadlines to be safe,
-            // but only if we are the only stream. However, libtorrent handles multiple deadlines,
-            // so clearing pieces we know we don't need anymore is always safe.
-
-            let old_window_end = old_start + 250; // Increased to match new max window
-
-            for p in old_start..=old_window_end {
-                if p >= self.first_piece && p <= self.last_piece {
-                    // Clear if it's outside the NEW window
-                    // New window is roughly [current_piece, current_piece + 250]
-                    let in_new_window = p >= current_piece && p <= current_piece + 250;
-                    if !in_new_window {
-                        self.handle.set_piece_deadline(p, 0);
-                    }
-                }
+        // DETERMINISTIC SEEK HANDLING: Use tracked SeekType instead of piece-jump heuristics
+        match self.seek_type {
+            SeekType::Sequential | SeekType::InitialPlayback => {
+                // Sequential read or initial playback - just extend window, no cleanup
+                tracing::trace!(
+                    "set_priorities: {:?} at piece {} - extending window",
+                    self.seek_type,
+                    current_piece
+                );
             }
-        } else {
-            // This is likely a SEEK or INITIAL start.
-            // If we don't know the last window, but we want to be clean,
-            // we could clear the entire file range.
-            // However, to avoid breaking concurrent streams, we only clear if it's a "large" file
-            // and we want to ensure any previous streaming by this same Handle is cleaned up.
-            for p in self.first_piece..=self.last_piece {
-                self.handle.set_piece_deadline(p, 0);
+            SeekType::ContainerMetadata => {
+                // Container metadata read - ADD priorities, but preserve head pieces
+                // This is critical: don't wipe out piece 0-7 priorities when reading moov/Cues
+                tracing::debug!(
+                    "set_priorities: ContainerMetadata at piece {} - preserving head priorities",
+                    current_piece
+                );
+                // Don't clear deadlines - this is the key fix for container metadata!
+            }
+            SeekType::UserScrub => {
+                // User scrub - full reset for new playback position
+                tracing::debug!(
+                    "set_priorities: UserScrub to piece {} - resetting all priorities",
+                    current_piece
+                );
+                self.handle.clear_piece_deadlines();
             }
         }
+
+        // After handling the seek, reset to sequential for subsequent reads
+        self.seek_type = SeekType::Sequential;
 
         self.last_priorities_piece = current_piece;
 
@@ -103,7 +131,7 @@ impl LibtorrentFileStream {
         // Use centralized priorities calculation
         // Calculate dynamic EMA for download speed to avoid priority oscillations
         let status = self.handle.status();
-        let total_pieces = status.num_pieces;
+        let _total_pieces = status.num_pieces; // Unused, kept for potential future use
         let current_speed = status.download_rate as f64;
 
         // Alpha of 0.2 means 20% weight to new sample, ~5 samples to converge
@@ -115,7 +143,7 @@ impl LibtorrentFileStream {
 
         let priorities = calculate_priorities(
             current_piece,
-            total_pieces,
+            self.last_piece + 1, // Use file's piece range, not torrent total
             self.piece_length,
             &self.cache_config,
             self.priority,
@@ -129,7 +157,10 @@ impl LibtorrentFileStream {
         let jitter = (self.stream_id % 10) as i32 * 5; // Up to 50ms jitter
 
         for item in priorities {
-            if item.piece_idx <= self.last_piece && !self.handle.have_piece(item.piece_idx) {
+            if item.piece_idx >= self.first_piece
+                && item.piece_idx <= self.last_piece
+                && !self.handle.have_piece(item.piece_idx)
+            {
                 let shared_deadline = if item.deadline == 0 {
                     0
                 } else if item.deadline >= 100000 {
@@ -154,6 +185,27 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
         let pos = self.current_pos;
         self.set_priorities(pos);
 
+        // MMAP FAST PATH: If we have mmap, serve directly from memory (zero-copy)
+        if let Some(ref mmap) = self.mmap {
+            let offset = pos as usize;
+            let available = mmap.len().saturating_sub(offset);
+            let to_read = buf.remaining().min(available);
+
+            if to_read > 0 {
+                buf.put_slice(&mmap[offset..offset + to_read]);
+                self.current_pos += to_read as u64;
+
+                if pos == 0 || pos % (10 * 1024 * 1024) == 0 {
+                    tracing::debug!(
+                        "poll_read: Served {} bytes via MMAP (zero-copy, pos={})",
+                        to_read,
+                        pos
+                    );
+                }
+            }
+            return std::task::Poll::Ready(Ok(()));
+        }
+
         // Calculate which piece we need
         let piece = if self.piece_length > 0 {
             ((self.file_offset + pos) / self.piece_length) as i32
@@ -161,20 +213,9 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
             -1
         };
 
-        // For multi-file torrents, we need to calculate the file-relative offset
-        // where the cached piece data starts. This is determined by the overlap
-        // between the piece's global range and this file's range.
-        //
-        // piece_global_start = piece * piece_length
-        // file_global_start = file_offset
-        // overlap_start = max(piece_global_start, file_global_start)
-        // file_relative_start = overlap_start - file_global_start
-        let calculate_file_relative_start =
-            |piece_idx: i32, piece_len: u64, file_off: u64| -> u64 {
-                let piece_global_start = piece_idx as u64 * piece_len;
-                let overlap_start = piece_global_start.max(file_off);
-                overlap_start - file_off
-            };
+        // For multi-file torrents:
+        // We used to calculate file-relative offsets here, but now we enforce FULL pieces in cache.
+        // The offset logic has been simplified to: (file_offset + pos) % piece_length
 
         // MEMORY-FIRST READING: Check if we have this piece in our local cache
         if piece >= 0 {
@@ -186,9 +227,10 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
 
             if have_cached {
                 // Serve from local cache - FASTEST PATH
-                if let Some((_, data, file_relative_start)) = &self.cached_piece_data {
-                    // Calculate offset into cached data: current file position - where cached data starts
-                    let offset_in_cached = pos.saturating_sub(*file_relative_start) as usize;
+                if let Some((_, data, _)) = &self.cached_piece_data {
+                    // Calculate offset into cached data: Global pos % piece_length
+                    // We assume cached data is always FULL piece (aligned to global piece start)
+                    let offset_in_cached = ((self.file_offset + pos) % self.piece_length) as usize;
                     let available = data.len().saturating_sub(offset_in_cached);
                     let to_read = buf.remaining().min(available);
 
@@ -210,20 +252,22 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
             }
 
             // Try to get from moka cache (check synchronously)
-            let cache = self.piece_cache.clone();
-            let info_hash = self.info_hash.clone();
+            // OPTIMIZATION: Use reference directly, avoid clone for lookup
             if let Some(piece_data) =
-                futures::executor::block_on(cache.get_piece(&info_hash, piece))
+                futures::executor::block_on(self.piece_cache.get_piece(&self.info_hash, piece))
             {
-                // Calculate file_relative_start for this piece
-                let file_relative_start =
-                    calculate_file_relative_start(piece, self.piece_length, self.file_offset);
+                // CRITICAL FIX: Ensure correct offset for Multi-File Torrents
+                // We now ensure (in helpers.rs) that only FULL pieces are cached.
+                // This means the cache data ALWAYS starts at piece_global_start.
+                //
+                // Global pos = file_offset + pos
+                // Offset in piece = Global pos % piece_length
+                let offset_in_cached = ((self.file_offset + pos) % self.piece_length) as usize;
 
-                // Cache hit! Store locally for fast repeated access
-                self.cached_piece_data = Some((piece, piece_data.clone(), file_relative_start));
+                // Store locally. We use 0 for file_relative_start because we calculate
+                // offset dynamically now, but we keep the field to satisfy the type.
+                self.cached_piece_data = Some((piece, piece_data.clone(), 0));
 
-                // Calculate offset into cached data
-                let offset_in_cached = pos.saturating_sub(file_relative_start) as usize;
                 let available = piece_data.len().saturating_sub(offset_in_cached);
                 let to_read = buf.remaining().min(available);
 
@@ -240,21 +284,34 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
                 }
 
                 // === READ-AHEAD PREFETCH ===
-                // Pre-fetch next 3 pieces into moka cache for fast access
+                // ADAPTIVE: Prefetch count based on download speed
+                // Fast downloads = more prefetch, slow = less to avoid wasting cache
                 if piece != self.last_prefetch_piece {
                     self.last_prefetch_piece = piece;
-                    let prefetch_cache = cache.clone();
-                    let prefetch_info_hash = info_hash.clone();
+                    // Clone only what's needed for the async prefetch task
+                    let prefetch_cache = self.piece_cache.clone();
+                    let prefetch_info_hash = self.info_hash.clone();
                     let prefetch_handle = self.handle.clone();
                     let file_path = self.file_path.clone();
                     let piece_len = self.piece_length;
                     let file_offset = self.file_offset;
                     let last_piece = self.last_piece;
 
+                    // ADAPTIVE PREFETCH COUNT:
+                    // >10 MB/s = 8 pieces, >5 MB/s = 5 pieces, >1 MB/s = 3 pieces, else 2
+                    let prefetch_count: i32 = if self.download_speed_ema > 10_000_000.0 {
+                        8 // Very fast: prefetch 8 pieces (~32MB at 4MB pieces)
+                    } else if self.download_speed_ema > 5_000_000.0 {
+                        5 // Fast: prefetch 5 pieces
+                    } else if self.download_speed_ema > 1_000_000.0 {
+                        3 // Medium: prefetch 3 pieces
+                    } else {
+                        2 // Slow/starting: minimal prefetch
+                    };
+
                     // Spawn background prefetch task
                     tokio::spawn(async move {
-                        const PREFETCH_COUNT: i32 = 3;
-                        for i in 1..=PREFETCH_COUNT {
+                        for i in 1..=prefetch_count {
                             let next_piece = piece + i;
                             if next_piece > last_piece {
                                 break;
@@ -297,35 +354,50 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
 
         // Not in cache - check if piece is available in libtorrent
         if piece >= 0 && !self.handle.have_piece(piece) {
+            // NOTIFICATION-BASED WAITING: Register waker to be notified when piece finishes
+            // This is more efficient than polling - we get woken immediately when
+            // piece_finished_alert fires instead of polling every 5ms
+            self.piece_waiter
+                .register(&self.info_hash, piece, cx.waker().clone());
+
+            // FALLBACK TIMEOUT: Also schedule a timeout wake in case notification is missed
+            // (e.g., race condition where piece finishes between have_piece and register)
+            let waker = cx.waker().clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                waker.wake();
+            });
+
             // Log download status periodically to help debug stalled downloads
             if pos % (1024 * 1024) == 0 {
                 let status = self.handle.status();
-                tracing::warn!(
-                    "poll_read: WAITING for piece {} (pos={}, peers={}, speed={:.1}MB/s, state={:?})",
+                tracing::debug!(
+                    "poll_read: WAITING for piece {} (pos={}, peers={}, speed={:.1}MB/s)",
                     piece,
                     pos,
                     status.num_peers,
-                    status.download_rate as f64 / 1_000_000.0,
-                    status.state
+                    status.download_rate as f64 / 1_000_000.0
                 );
             }
 
-            // ULTRA-FAST POLLING for first 3 pieces to minimize time-to-first-frame
-            // After that, use adaptive delay based on download speed
-            let pieces_from_start = piece - self.first_piece;
-            let delay_ms = if pieces_from_start < 3 {
-                5 // Critical startup pieces: poll every 5ms
-            } else if self.download_speed_ema > 5_000_000.0 {
-                15 // Fast download: check frequently (>5MB/s)
-            } else if self.download_speed_ema > 1_000_000.0 {
-                25 // Medium: moderate polling (1-5MB/s)
-            } else {
-                50 // Slow/starting: reduce CPU usage
-            };
+            return std::task::Poll::Pending;
+        }
 
+        // MEMORY-FIRST OPTIMIZATION: Piece is available on disk but not in our cache
+        // Request it via read_piece() API - libtorrent may have it in ITS memory cache
+        // This is faster than disk I/O on our side
+        if piece >= 0 && !self.requested_piece_via_api.contains(&piece) {
+            let _ = self.handle.read_piece(piece);
+            self.requested_piece_via_api.insert(piece);
+            tracing::trace!(
+                "poll_read: Requested piece {} via read_piece API (memory-first)",
+                piece
+            );
+
+            // Wait briefly for the alert handler to populate our cache
             let waker = cx.waker().clone();
             tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 waker.wake();
             });
             return std::task::Poll::Pending;
@@ -392,23 +464,40 @@ impl tokio::io::AsyncSeek for LibtorrentFileStream {
         mut self: std::pin::Pin<&mut Self>,
         position: std::io::SeekFrom,
     ) -> std::io::Result<()> {
+        // Calculate target position
+        let new_pos = match position {
+            std::io::SeekFrom::Start(pos) => pos,
+            std::io::SeekFrom::Current(delta) => (self.current_pos as i64 + delta).max(0) as u64,
+            std::io::SeekFrom::End(delta) => {
+                // Now we have file_size, we can handle End seeks
+                (self.file_size as i64 + delta).max(0) as u64
+            }
+        };
+
+        // DETERMINISTIC: Detect seek type based on target position
+        let end_threshold = self
+            .file_size
+            .saturating_sub(10 * 1024 * 1024)
+            .max(self.file_size * 95 / 100);
+
+        self.seek_type = if new_pos >= end_threshold {
+            SeekType::ContainerMetadata
+        } else {
+            SeekType::UserScrub
+        };
+
+        tracing::debug!(
+            "start_seek: {} -> {} ({:?})",
+            self.current_pos,
+            new_pos,
+            self.seek_type
+        );
+
         // If file is open, delegate to it
         if let Some(ref mut file) = self.file {
             std::pin::Pin::new(file).start_seek(position)
         } else {
-            // File not open yet - just calculate the new position
-            // We'll handle actual seeking when file opens
-            let new_pos = match position {
-                std::io::SeekFrom::Start(pos) => pos,
-                std::io::SeekFrom::Current(delta) => (self.current_pos as i64 + delta) as u64,
-                std::io::SeekFrom::End(_) => {
-                    // Can't seek from end without file size
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        "Cannot seek from end without file",
-                    ));
-                }
-            };
+            // File not open yet - just update position
             self.current_pos = new_pos;
             Ok(())
         }
@@ -430,10 +519,9 @@ impl tokio::io::AsyncSeek for LibtorrentFileStream {
                         -1
                     };
 
-                    // Optimization: Only clear and reset priorities if we moved to a new piece window
+                    // Let set_priorities handle priority changes based on SeekType
+                    // Don't clear deadlines here - set_priorities does it deterministically
                     if piece_idx != self.last_priorities_piece {
-                        self.handle.clear_piece_deadlines();
-                        self.last_priorities_piece = -1;
                         self.set_priorities(pos);
                     }
                     std::task::Poll::Ready(Ok(pos))

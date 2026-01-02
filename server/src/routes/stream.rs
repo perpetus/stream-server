@@ -18,6 +18,7 @@ struct StreamGuard<S> {
     inner: S,
     engine: Arc<crate::state::AppState>,
     info_hash: String,
+    file_idx: usize,
     notified: bool,
 }
 
@@ -39,11 +40,16 @@ impl<S> Drop for StreamGuard<S> {
             self.notified = true;
             let engine = self.engine.clone();
             let info_hash = self.info_hash.clone();
+            let file_idx = self.file_idx;
 
             // Spawn a task to notify stream end since Drop is sync
             tokio::spawn(async move {
-                engine.engine.on_stream_end(&info_hash).await;
-                tracing::debug!("StreamGuard: Notified stream end for {}", info_hash);
+                engine.engine.on_stream_end(&info_hash, file_idx).await;
+                tracing::debug!(
+                    "StreamGuard: Notified stream end for {} file_idx={}",
+                    info_hash,
+                    file_idx
+                );
             });
         }
     }
@@ -105,7 +111,7 @@ pub async fn stream_video(
     };
 
     // --- Stream Lifecycle: Notify start and focus bandwidth ---
-    state.engine.on_stream_start(&info_hash).await;
+    state.engine.on_stream_start(&info_hash, idx).await;
     state.engine.focus_torrent(&info_hash).await;
 
     // Parse start offset from Range header for prioritization
@@ -246,15 +252,16 @@ pub async fn stream_video(
         let reader = tokio::io::AsyncReadExt::take(file, content_length);
 
         // Use ReaderStream to convert AsyncRead to Stream for Axum Body
-        // OPTIMIZATION: Use 64KB buffer (vs default 8KB) to reduce poll_read overhead
-        // and set_priorities calculation frequency in the backend.
-        let base_stream = tokio_util::io::ReaderStream::with_capacity(reader, 65536);
+        // OPTIMIZATION: Use 256KB buffer for improved throughput with large pieces
+        // Larger buffer = fewer poll_read calls = less priority calculation overhead
+        let base_stream = tokio_util::io::ReaderStream::with_capacity(reader, 262144);
 
         // Wrap with StreamGuard to notify when stream ends
         let guarded_stream = StreamGuard {
             inner: base_stream,
             engine: Arc::new(state.clone()),
             info_hash: info_hash.clone(),
+            file_idx: idx,
             notified: false,
         };
         let body = Body::from_stream(guarded_stream);

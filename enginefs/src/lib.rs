@@ -14,6 +14,7 @@ pub mod files;
 pub mod hls;
 pub mod metadata_cache;
 pub mod piece_cache;
+pub mod piece_waiter;
 pub mod tracker_prober;
 pub mod trackers;
 
@@ -54,8 +55,11 @@ pub struct BackendEngineFS<B: TorrentBackend> {
     tracker_manager: Arc<crate::trackers::TrackerManager>,
     pub cache_dir: std::path::PathBuf,
     pub download_dir: std::path::PathBuf,
-    /// Track active streams per info_hash for single-file prioritization
+    /// Track active streams per info_hash for legacy compatibility
     active_streams: Arc<RwLock<HashMap<String, usize>>>,
+    /// Tracks the currently active streamed file (info_hash, file_idx)
+    /// Only ONE file should be actively downloading at any time
+    active_file: Arc<RwLock<Option<(String, usize)>>>,
 }
 
 #[cfg(all(feature = "librqbit", not(feature = "libtorrent")))]
@@ -104,6 +108,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             cache_dir,
             download_dir: download_dir.clone(),
             active_streams: Arc::new(RwLock::new(HashMap::new())),
+            active_file: Arc::new(RwLock::new(None)),
         };
 
         let engines_clone = engines.clone();
@@ -210,36 +215,95 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         engines.keys().cloned().collect()
     }
 
-    /// Called when a stream starts for a torrent
-    /// Tracks active streams and can be used to implement single-file prioritization
-    pub async fn on_stream_start(&self, info_hash: &str) {
-        let mut streams = self.active_streams.write().await;
-        let count = streams.entry(info_hash.to_lowercase()).or_insert(0);
-        *count += 1;
+    /// Called when a stream starts for a torrent file
+    /// Implements exclusive single-file downloading - only ONE file downloads at a time
+    pub async fn on_stream_start(&self, info_hash: &str, file_idx: usize) {
+        let info_hash = info_hash.to_lowercase();
 
-        tracing::debug!(
-            "Stream started for {}, active stream count: {}",
+        // Check if a different file was previously active and clear its priorities
+        {
+            let mut active = self.active_file.write().await;
+            if let Some((prev_hash, prev_idx)) = active.take() {
+                if prev_hash != info_hash || prev_idx != file_idx {
+                    tracing::info!(
+                        "Switching stream: clearing priorities for previous file {} idx={}",
+                        prev_hash,
+                        prev_idx
+                    );
+                    // Clear priorities for the previous file
+                    self.clear_file_priorities(&prev_hash, prev_idx).await;
+                }
+            }
+            // Set the new active file
+            *active = Some((info_hash.clone(), file_idx));
+        }
+
+        // Also update legacy active_streams counter
+        {
+            let mut streams = self.active_streams.write().await;
+            let count = streams.entry(info_hash.clone()).or_insert(0);
+            *count += 1;
+        }
+
+        tracing::info!(
+            "Stream started for {} file_idx={} (exclusive mode)",
             info_hash,
-            *count
+            file_idx
         );
     }
 
-    /// Called when a stream ends for a torrent
-    pub async fn on_stream_end(&self, info_hash: &str) {
-        let mut streams = self.active_streams.write().await;
-        if let Some(count) = streams.get_mut(&info_hash.to_lowercase()) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                streams.remove(&info_hash.to_lowercase());
+    /// Called when a stream ends for a torrent file
+    pub async fn on_stream_end(&self, info_hash: &str, file_idx: usize) {
+        let info_hash = info_hash.to_lowercase();
+
+        // Clear active file if it matches
+        {
+            let mut active = self.active_file.write().await;
+            if let Some((ref h, idx)) = *active {
+                if h == &info_hash && idx == file_idx {
+                    tracing::info!(
+                        "Stream ended for {} file_idx={}, clearing active file",
+                        info_hash,
+                        file_idx
+                    );
+                    *active = None;
+                }
             }
         }
 
-        let remaining = streams.values().sum::<usize>();
+        // Update legacy active_streams counter
+        {
+            let mut streams = self.active_streams.write().await;
+            if let Some(count) = streams.get_mut(&info_hash) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    streams.remove(&info_hash);
+                }
+            }
+        }
+
+        let remaining = self.active_streams.read().await.values().sum::<usize>();
         tracing::debug!(
-            "Stream ended for {}, total active streams: {}",
+            "Stream ended for {} file_idx={}, total active streams: {}",
             info_hash,
+            file_idx,
             remaining
         );
+    }
+
+    /// Clear piece priorities for a file that is no longer being streamed
+    async fn clear_file_priorities(&self, info_hash: &str, file_idx: usize) {
+        if let Some(engine) = self.get_engine(info_hash).await {
+            // Set file priority to 0 (skip) and clear piece deadlines
+            if let Err(e) = engine.handle.clear_file_streaming(file_idx).await {
+                tracing::warn!(
+                    "Failed to clear file priorities for {} idx={}: {}",
+                    info_hash,
+                    file_idx,
+                    e
+                );
+            }
+        }
     }
 
     /// Get a reference to the backend for direct access
@@ -297,12 +361,21 @@ impl BackendEngineFS<LibtorrentBackend> {
     }
 
     /// Pause all torrents except the specified one to focus bandwidth on streaming
+    /// Also enables streaming mode (limits upload to maximize download)
     pub async fn focus_torrent(&self, target_info_hash: &str) {
+        // Enable streaming mode (limit uploads)
+        self.backend.set_streaming_mode(true).await;
         self.backend.focus_torrent(target_info_hash).await;
     }
 
     /// Resume all paused torrents (called when streaming ends)
+    /// Also disables streaming mode (restores normal upload)
     pub async fn resume_all_torrents(&self) {
         self.backend.resume_all_torrents().await;
+    }
+
+    /// Enable or disable streaming mode (limits uploads during streaming)
+    pub async fn set_streaming_mode(&self, enabled: bool) {
+        self.backend.set_streaming_mode(enabled).await;
     }
 }

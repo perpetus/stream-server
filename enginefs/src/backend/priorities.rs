@@ -174,8 +174,9 @@ pub fn calculate_priorities(
             // Normal Streaming
             if distance < 5 {
                 // CRITICAL HEAD: Very Strict Staircase
-                // 0, 50, 100, 150, 200
-                distance * 50
+                // 10, 60, 110, 160, 210
+                // We add 10ms base to ensure deadline is non-zero (0 = ASAP/highest priority in libtorrent)
+                10 + (distance * 50)
             } else if distance < head_window {
                 // HEAD WINDOW: Linear staircase
                 250 + ((distance - 5) * 50)
@@ -226,9 +227,9 @@ mod tests {
 
         assert_eq!(priorities.len(), 35);
 
-        // Verify deadlines - now more aggressive (0, 50, 100...)
-        assert_eq!(priorities[0].deadline, 0); // distance 0 * 50
-        assert_eq!(priorities[1].deadline, 50); // distance 1 * 50
+        // Verify deadlines - now more aggressive
+        assert_eq!(priorities[0].deadline, 10); // distance 0 * 50 + 10
+        assert_eq!(priorities[1].deadline, 60); // distance 1 * 50 + 10
     }
 
     #[test]
@@ -250,9 +251,9 @@ mod tests {
         assert_eq!(priorities.len(), 80);
 
         // Head - Strict Staircase
-        assert_eq!(priorities[0].deadline, 0);
-        assert_eq!(priorities[1].deadline, 50);
-        assert_eq!(priorities[2].deadline, 100);
+        assert_eq!(priorities[0].deadline, 10);
+        assert_eq!(priorities[1].deadline, 60);
+        assert_eq!(priorities[2].deadline, 110);
     }
 
     #[test]
@@ -272,7 +273,7 @@ mod tests {
         assert_eq!(priorities.len(), 20);
 
         // Verify clamp effect
-        assert_eq!(priorities[0].deadline, 0);
+        assert_eq!(priorities[0].deadline, 10);
         assert_eq!(priorities[19].piece_idx, 19);
     }
 

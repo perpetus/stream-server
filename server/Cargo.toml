@@ -59,7 +59,7 @@ bytes = "1.11.0"
 axum-server = { version = "0.8.0", features = ["tls-rustls"] }
 ssdp-client = "2.1.0"
 tao = "0.34.5"
-tray-icon = "0.21.2"
+tray-icon = { version = "0.21.2", default-features = false }
 fslock = "0.2.1"
 open = "5.3.3"
 image = "0.25.9"

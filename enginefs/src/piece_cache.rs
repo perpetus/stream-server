@@ -64,6 +64,8 @@ pub struct PieceCacheManager {
     config: PieceCacheConfig,
     /// Track which pieces have been written to disk
     disk_written: Arc<RwLock<HashSet<(String, i32)>>>,
+    /// Track in-flight read_piece requests to avoid duplicates
+    pending_requests: Arc<RwLock<HashSet<(String, i32)>>>,
 }
 
 impl PieceCacheManager {
@@ -101,6 +103,7 @@ impl PieceCacheManager {
             cache,
             config,
             disk_written: Arc::new(RwLock::new(HashSet::new())),
+            pending_requests: Arc::new(RwLock::new(HashSet::new())),
         }
     }
 
@@ -111,6 +114,12 @@ impl PieceCacheManager {
         let data = Arc::new(data);
 
         self.cache.insert(key.clone(), data.clone()).await;
+
+        // Clear from pending requests since it's now cached
+        {
+            let mut pending = self.pending_requests.write().await;
+            pending.remove(&key);
+        }
 
         debug!(
             "PieceCache: Stored piece {} for {} ({} bytes) - memory-first",
@@ -197,6 +206,21 @@ impl PieceCacheManager {
         // Check disk written set (fast check without I/O)
         let disk_written = self.disk_written.read().await;
         disk_written.contains(&key)
+    }
+
+    /// Mark a piece as pending (returns false if already pending)
+    /// Used for request coalescing - prevents duplicate read_piece() calls
+    pub async fn mark_pending(&self, info_hash: &str, piece_idx: i32) -> bool {
+        let key = (info_hash.to_lowercase(), piece_idx);
+        let mut pending = self.pending_requests.write().await;
+        pending.insert(key)
+    }
+
+    /// Check if a piece request is already pending
+    pub async fn is_pending(&self, info_hash: &str, piece_idx: i32) -> bool {
+        let key = (info_hash.to_lowercase(), piece_idx);
+        let pending = self.pending_requests.read().await;
+        pending.contains(&key)
     }
 
     /// Get cache statistics

@@ -20,8 +20,8 @@ public:
     
     Z7_COM_UNKNOWN_IMP_1(IInStream)
 public:
-    STDMETHOD(Read)(void *data, UInt32 size, UInt32 *processedSize);
-    STDMETHOD(Seek)(Int64 offset, UInt32 seekOrigin, UInt64 *newPosition);
+    Z7_COM7F_IMF(Read(void *data, UInt32 size, UInt32 *processedSize));
+    Z7_COM7F_IMF(Seek(Int64 offset, UInt32 seekOrigin, UInt64 *newPosition));
     
     RustInStream(void* ptr) : rust_reader_ptr(ptr) {}
     virtual ~RustInStream() {}
@@ -38,16 +38,16 @@ public:
 
     // IProgress
 public:
-    STDMETHOD(SetTotal)(UInt64 total);
-    STDMETHOD(SetCompleted)(const UInt64 *completeValue);
+    Z7_COM7F_IMF(SetTotal(UInt64 total));
+    Z7_COM7F_IMF(SetCompleted(const UInt64 *completeValue));
 
     // IArchiveExtractCallback
-    STDMETHOD(GetStream)(UInt32 index, ISequentialOutStream **outStream, Int32 askExtractMode);
-    STDMETHOD(PrepareOperation)(Int32 askExtractMode);
-    STDMETHOD(SetOperationResult)(Int32 resultEOperationResult);
+    Z7_COM7F_IMF(GetStream(UInt32 index, ISequentialOutStream **outStream, Int32 askExtractMode));
+    Z7_COM7F_IMF(PrepareOperation(Int32 askExtractMode));
+    Z7_COM7F_IMF(SetOperationResult(Int32 resultEOperationResult));
 
     // ICryptoGetTextPassword
-    STDMETHOD(CryptoGetTextPassword)(BSTR *password);
+    Z7_COM7F_IMF(CryptoGetTextPassword(BSTR *password));
 
     RustExtractCallback(void* ptr, UInt32 idx) : rust_callback_ptr(ptr), targetIndex(idx) {}
     virtual ~RustExtractCallback() {}

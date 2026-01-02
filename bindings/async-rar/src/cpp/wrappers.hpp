@@ -1,5 +1,10 @@
 #pragma once
 
+
+#if (defined(__unix__) || defined(__linux__) || defined(__APPLE__)) && !defined(_UNIX)
+#define _UNIX
+#endif
+
 #if defined(_WIN32) || defined(_WIN64)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -9,11 +14,11 @@
 #include <cstdint>
 #include <cstring>
 
-inline int RARProcessFileW_Wrapper(HANDLE hArcData, int Operation, uint16_t *DestPath, uint16_t *DestName) {
+inline int RARProcessFileW_Wrapper(void* hArcData, int Operation, uint16_t *DestPath, uint16_t *DestName) {
     return RARProcessFileW(hArcData, Operation, reinterpret_cast<wchar_t*>(DestPath), reinterpret_cast<wchar_t*>(DestName));
 }
 
-inline void RARSetCallback_Wrapper(HANDLE hArcData, void* Callback, long long UserData) {
+inline void RARSetCallback_Wrapper(void* hArcData, void* Callback, long long UserData) {
     RARSetCallback(hArcData, reinterpret_cast<UNRARCALLBACK>(Callback), static_cast<LPARAM>(UserData));
 }
 
@@ -77,7 +82,7 @@ inline void* RAROpenArchiveEx_Wrapper(RAROpenArchiveDataEx_Wrapper* OpenData) {
     return h;
 }
 
-inline int RARReadHeaderEx_Wrapper(HANDLE hArcData, RARHeaderDataEx_Wrapper* HeaderData) {
+inline int RARReadHeaderEx_Wrapper(void* hArcData, RARHeaderDataEx_Wrapper* HeaderData) {
     RARHeaderDataEx data = {};
     int res = RARReadHeaderEx(hArcData, &data);
     

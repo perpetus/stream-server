@@ -246,7 +246,10 @@ fn main() {
 
             // Unix: exclude threading files (CRITSECT_HANDLE not defined without RAR_SMP)
             if cfg!(not(windows)) {
-                if matches!(name, "threadmisc.cpp" | "threadpool.cpp") {
+                if matches!(
+                    name,
+                    "threadmisc.cpp" | "threadpool.cpp" | "motw.cpp" | "isnt.cpp"
+                ) {
                     return false;
                 }
             }
@@ -286,7 +289,20 @@ fn main() {
             .flag("-pthread")
             // Force include rar.hpp - UnRAR uses precompiled headers
             .flag("-include")
-            .flag("rar.hpp");
+            .flag("rar.hpp")
+            .flag("-Wno-unused-parameter")
+            .flag("-Wno-parentheses")
+            .flag("-Wno-dangling-else")
+            .flag("-Wno-sign-compare")
+            .flag("-Wno-unused-variable")
+            .flag("-Wno-unused-function")
+            .flag("-Wno-switch")
+            .flag("-Wno-unused-but-set-variable")
+            .flag("-Wno-misleading-indentation")
+            .flag("-Wno-catch-value")
+            .flag("-Wno-class-memaccess")
+            .flag("-Wno-comment")
+            .flag("-Wno-extra");
 
         #[cfg(target_os = "macos")]
         {

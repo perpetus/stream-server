@@ -1,8 +1,7 @@
 
-#define INITGUID
-#include <initguid.h>
 
 #include "Common/MyInitGuid.h"
+
 
 #include "7zip/IStream.h"
 #include "7zip/IPassword.h"

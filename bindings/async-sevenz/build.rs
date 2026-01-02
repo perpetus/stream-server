@@ -6,15 +6,26 @@ fn find_llvm_path() -> Option<PathBuf> {
         return None;
     }
 
-    let program_files = env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".to_string());
-    let program_files_x86 = env::var("ProgramFiles(x86)").unwrap_or_else(|_| r"C:\Program Files (x86)".to_string());
+    let program_files =
+        env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".to_string());
+    let program_files_x86 =
+        env::var("ProgramFiles(x86)").unwrap_or_else(|_| r"C:\Program Files (x86)".to_string());
 
     let search_paths = vec![
         format!(r"{}\LLVM\bin", program_files),
         format!(r"{}\LLVM\bin", program_files_x86),
-        format!(r"{}\Microsoft Visual Studio\2022\Community\VC\Tools\Llvm\x64\bin", program_files),
-        format!(r"{}\Microsoft Visual Studio\2022\Enterprise\VC\Tools\Llvm\x64\bin", program_files),
-        format!(r"{}\Microsoft Visual Studio\2022\Professional\VC\Tools\Llvm\x64\bin", program_files),
+        format!(
+            r"{}\Microsoft Visual Studio\2022\Community\VC\Tools\Llvm\x64\bin",
+            program_files
+        ),
+        format!(
+            r"{}\Microsoft Visual Studio\2022\Enterprise\VC\Tools\Llvm\x64\bin",
+            program_files
+        ),
+        format!(
+            r"{}\Microsoft Visual Studio\2022\Professional\VC\Tools\Llvm\x64\bin",
+            program_files
+        ),
         r"C:\ProgramData\chocolatey\bin".to_string(),
         r"C:\ProgramData\chocolatey\lib\llvm\tools\llvm\bin".to_string(),
     ];
@@ -25,7 +36,7 @@ fn find_llvm_path() -> Option<PathBuf> {
             return Some(p);
         }
     }
-    
+
     // Check scoop
     if let Ok(profile) = env::var("USERPROFILE") {
         let p = PathBuf::from(profile).join(r"scoop\apps\llvm\current\bin");
@@ -39,8 +50,10 @@ fn find_llvm_path() -> Option<PathBuf> {
 
 fn find_include_paths() -> Vec<PathBuf> {
     let mut includes = Vec::new();
-    let program_files = env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".to_string());
-    let program_files_x86 = env::var("ProgramFiles(x86)").unwrap_or_else(|_| r"C:\Program Files (x86)".to_string());
+    let program_files =
+        env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".to_string());
+    let program_files_x86 =
+        env::var("ProgramFiles(x86)").unwrap_or_else(|_| r"C:\Program Files (x86)".to_string());
 
     // 1. Find MSVC Includes
     let vs_editions = ["Enterprise", "Professional", "Community", "BuildTools"];
@@ -51,7 +64,10 @@ fn find_include_paths() -> Vec<PathBuf> {
         for edition in vs_editions {
             // Check both Program Files directories
             for root in &[&program_files, &program_files_x86] {
-                let p = PathBuf::from(format!(r"{}\Microsoft Visual Studio\{}\{}\VC\Tools\MSVC", root, year, edition));
+                let p = PathBuf::from(format!(
+                    r"{}\Microsoft Visual Studio\{}\{}\VC\Tools\MSVC",
+                    root, year, edition
+                ));
                 if p.exists() {
                     // Find latest version
                     if let Ok(entries) = std::fs::read_dir(&p) {
@@ -59,7 +75,7 @@ fn find_include_paths() -> Vec<PathBuf> {
                             .filter_map(Result::ok)
                             .filter(|e| e.path().is_dir())
                             .map(|e| e.path())
-                            .max() 
+                            .max()
                         {
                             let include = latest.join("include");
                             if include.exists() {
@@ -70,15 +86,19 @@ fn find_include_paths() -> Vec<PathBuf> {
                     }
                 }
             }
-            if msvc_path.is_some() { break; }
+            if msvc_path.is_some() {
+                break;
+            }
         }
-        if msvc_path.is_some() { break; }
+        if msvc_path.is_some() {
+            break;
+        }
     }
 
     if let Some(p) = msvc_path {
         includes.push(p);
     }
-    
+
     // 2. Find Windows SDK Includes
     let sdk_roots = vec![
         PathBuf::from(format!(r"{}\Windows Kits\10\Include", program_files_x86)),
@@ -103,7 +123,7 @@ fn find_include_paths() -> Vec<PathBuf> {
             }
         }
     }
-    
+
     includes
 }
 
@@ -118,7 +138,7 @@ fn main() {
                 env::set_var("LIBCLANG_PATH", path);
             }
         }
-        
+
         // Find and set include paths for autocxx/bindgen
         if env::var("INCLUDE").is_err() {
             let includes_sys = find_include_paths();
@@ -139,7 +159,7 @@ fn main() {
     }
 
     let root = PathBuf::from("vendor/7zip/CPP");
-    
+
     if !root.exists() {
         panic!("7-Zip source not found at {:?}. Please provide it.", root);
     }
@@ -150,7 +170,7 @@ fn main() {
         root.join("7zip"),
         root.join("Common"),
         root.parent().unwrap().join("C"), // Add ../C
-        PathBuf::from("src"), // Add src for cpp/wrappers.hpp
+        PathBuf::from("src"),             // Add src for cpp/wrappers.hpp
     ];
 
     // Core C++ files needed for 7z Format (Decoders + 7z handler)
@@ -158,18 +178,17 @@ fn main() {
     let mut files = vec![
         // Common
         root.join("Common/IntToString.cpp"),
-
         root.join("Common/MyString.cpp"),
         root.join("Common/StringConvert.cpp"),
         root.join("Common/MyVector.cpp"),
         root.join("Common/Wildcard.cpp"),
-        root.join("Common/C_FileIO.cpp"), 
+        root.join("Common/C_FileIO.cpp"),
         root.join("Common/NewHandler.cpp"),
         root.join("Common/StringToInt.cpp"),
+        root.join("Common/UTFConvert.cpp"),
+        root.join("Common/MyWindows.cpp"), // Needed for SysAllocStringLen on Linux
         // root.join("Common/CRC.cpp"), // Likely redundant if we include C/7zCrc.c or 7zip/Common/CrcReg.cpp
         root.join("Windows/PropVariant.cpp"),
-
-
         root.join("Windows/PropVariantConv.cpp"),
         root.join("Windows/System.cpp"),
         root.join("Windows/TimeUtils.cpp"),
@@ -180,7 +199,6 @@ fn main() {
         root.join("Windows/Synchronization.cpp"),
         root.join("Windows/ErrorMsg.cpp"),
         root.join("Windows/DLL.cpp"),
-        
         // 7-Zip C files (Parent directory)
         root.parent().unwrap().join("C/7zCrc.c"),
         root.parent().unwrap().join("C/7zCrcOpt.c"),
@@ -189,8 +207,6 @@ fn main() {
         root.parent().unwrap().join("C/7zAlloc.c"),
         root.parent().unwrap().join("C/7zStream.c"),
         root.parent().unwrap().join("C/CpuArch.c"),
-
-
         // 7zip Common
         root.join("7zip/Common/StreamUtils.cpp"),
         root.join("7zip/Common/FileStreams.cpp"),
@@ -206,16 +222,12 @@ fn main() {
         root.join("7zip/Common/StreamBinder.cpp"),
         root.join("7zip/Common/StreamObjects.cpp"),
         root.join("7zip/Common/UniqBlocks.cpp"),
-        root.join("7zip/Common/VirtThread.cpp"), 
-        
+        root.join("7zip/Common/VirtThread.cpp"),
         // Archive Common
         // root.join("7zip/Archive/Common/ParseProperties.cpp"), // Not needed for extraction
         // root.join("7zip/Archive/Common/OutStreamWithCRC.cpp"), // Not needed for extraction
         root.join("7zip/Archive/Common/HandlerOut.cpp"), // Needed for SetCommonProperty
         root.join("7zip/Archive/Common/CoderMixer2.cpp"),
-
-
-
         // 7z Archive Support (Extraction only)
         root.join("7zip/Archive/7z/7zDecode.cpp"),
         root.join("7zip/Archive/7z/7zExtract.cpp"),
@@ -232,20 +244,19 @@ fn main() {
         // root.join("7zip/Archive/7z/7zOut.cpp"), // Not needed for extraction
         // root.join("7zip/Archive/7z/7zEncode.cpp"), // Not needed for extraction
 
-        
         // Compress/Codecs (Needed for extraction)
-        // This is tricky. 7z uses a dynamic codec registration. 
+        // This is tricky. 7z uses a dynamic codec registration.
         // We might need to include specific codec files or link against a bigger library.
         // For now, let's include basic ones.
         // COPY, LZMA, LZMA2, BCJ, BCJ2, ARM, AES, etc.
-         // NOTE: These are often in C directory outside CPP?
-         // 7-Zip mixes C and C++.
+        // NOTE: These are often in C directory outside CPP?
+        // 7-Zip mixes C and C++.
     ];
-    
-    // We also need C files from C directory? 
+
+    // We also need C files from C directory?
     // Usually 7-Zip wraps C code.
     // The "unity build" approach of `7z.dll` project file is usually the reference.
-    
+
     // For now, let's start with our wrappers and see what links.
     // files.push(PathBuf::from("src/cpp/stream.cpp")); // Moved to autocxx build
     files.push(PathBuf::from("src/cpp/guids.cpp"));
@@ -261,7 +272,6 @@ fn main() {
         .define("Z7_EXTRACT_ONLY", None) // Exclude encoding functionality
         .define("_REENTRANT", None);
 
-
     if cfg!(target_os = "windows") {
         builder.define("ENV_MSVC", None);
         builder.flag_if_supported("/EHsc");
@@ -269,7 +279,7 @@ fn main() {
         builder.define("ENV_UNIX", None);
         builder.define("_POSIX", None);
     }
-    
+
     builder.compile("sevenz_cpp");
 
     if cfg!(target_os = "windows") {
@@ -279,7 +289,6 @@ fn main() {
         println!("cargo:rustc-link-lib=dylib=uuid");
     }
 
-
     // Autocxx
     // Add explicitly found includes
     let extra_includes_refs: Vec<&str> = extra_includes.iter().map(|s| s.as_str()).collect();
@@ -288,15 +297,15 @@ fn main() {
         .extra_clang_args(&extra_includes_refs)
         .build()
         .expect("autocxx failed");
-        
+
     b.flag_if_supported("-std=c++17");
-    
+
     if cfg!(target_os = "windows") {
         b.flag_if_supported("/EHsc");
     }
 
     b.file("src/cpp/stream.cpp") // Compile stream.cpp here to access rust/cxx.h
-     .compile("sevenz_autocxx");
+        .compile("sevenz_autocxx");
 
     println!("cargo:rerun-if-changed=src/ffi.rs");
     println!("cargo:rerun-if-changed=src/cpp/stream.cpp");

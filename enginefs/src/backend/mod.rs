@@ -55,6 +55,9 @@ pub trait TorrentHandle: Send + Sync + Clone {
     /// This should be called BEFORE probing the file with ffprobe.
     /// Returns Ok(()) when initial pieces are available, or Err on timeout.
     async fn prepare_file_for_streaming(&self, file_idx: usize) -> Result<()>;
+    /// Clear streaming state for a file (set priority to 0, clear piece deadlines).
+    /// Called when switching to a different file to ensure exclusive downloading.
+    async fn clear_file_streaming(&self, file_idx: usize) -> Result<()>;
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
