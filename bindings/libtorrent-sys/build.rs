@@ -12,6 +12,7 @@ fn main() {
     // Add our C++ wrapper
     build
         .file("cpp/wrapper.cpp")
+        .file("cpp/memory_storage.cpp")
         .std("c++17")
         .flag_if_supported("-Wno-unused-parameter")
         .flag_if_supported("-Wno-missing-field-initializers");
@@ -20,14 +21,14 @@ fn main() {
     // System packages (e.g., Arch Linux) usually don't need this specific ABI version 3
     if using_vcpkg {
         build.define("TORRENT_ABI_VERSION", "3");
-        
+
         // Ensure static linking definitions are present for vcpkg builds
         // These are critical for both Windows and Linux to avoid linker errors
         build.define("TORRENT_LINKING_STATIC", None);
         build.define("BOOST_ASIO_STATIC_LINK", None);
         build.define("BOOST_ASIO_SEPARATE_COMPILATION", None);
     }
-    
+
     build.define("TORRENT_USE_OPENSSL", None);
 
     if cfg!(target_os = "windows") {
@@ -42,6 +43,8 @@ fn main() {
     println!("cargo:rerun-if-changed=src/lib.rs");
     println!("cargo:rerun-if-changed=cpp/wrapper.cpp");
     println!("cargo:rerun-if-changed=cpp/wrapper.h");
+    println!("cargo:rerun-if-changed=cpp/memory_storage.hpp");
+    println!("cargo:rerun-if-changed=cpp/memory_storage.cpp");
 }
 
 /// Returns (include_paths, using_vcpkg)
@@ -55,9 +58,10 @@ fn find_libtorrent() -> (Vec<std::path::PathBuf>, bool) {
     {
         Ok(lib) => {
             // Check if this is a vcpkg-installed library by looking at the path
-            let is_vcpkg = lib.include_paths.iter().any(|p| {
-                p.to_string_lossy().contains("vcpkg_installed")
-            });
+            let is_vcpkg = lib
+                .include_paths
+                .iter()
+                .any(|p| p.to_string_lossy().contains("vcpkg_installed"));
             return (lib.include_paths, is_vcpkg);
         }
         Err(e) => {
@@ -67,13 +71,12 @@ fn find_libtorrent() -> (Vec<std::path::PathBuf>, bool) {
 
     // Configure vcpkg crate
     let triplet_env = std::env::var("VCPKGRS_TRIPLET").ok();
-    let triplet_ref = triplet_env.as_deref().unwrap_or_else(|| {
-        if cfg!(target_os = "windows") {
-            "x64-windows-static"
-        } else {
-            "x64-linux"
-        }
-    });
+    let default_triplet = if cfg!(target_os = "windows") {
+        "x64-windows-static"
+    } else {
+        "x64-linux"
+    };
+    let triplet_ref = triplet_env.as_deref().unwrap_or(default_triplet);
 
     unsafe {
         std::env::set_var("VCPKGRS_DYNAMIC", "0");
@@ -99,7 +102,7 @@ fn find_libtorrent() -> (Vec<std::path::PathBuf>, bool) {
         let include_path = std::path::PathBuf::from(installed_dir)
             .join(triplet_ref)
             .join("include");
-        
+
         if include_path.exists() {
             // If we found it manually, we also need to tell cargo where the libs are
             let lib_path = include_path.parent().unwrap().join("lib");
@@ -124,4 +127,3 @@ fn find_libtorrent() -> (Vec<std::path::PathBuf>, bool) {
 
     panic!("Could not find libtorrent.\nErrors:\n{}", errors);
 }
-

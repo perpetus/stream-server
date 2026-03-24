@@ -304,6 +304,8 @@ mod ffi {
         // Session lifecycle
         // ------------------------------------------------------------------------
         fn create_session(settings: &SessionSettings) -> Result<UniquePtr<Session>>;
+        /// Create session with memory-only storage (no disk writes when cache_size=0)
+        fn create_session_memory_only(settings: &SessionSettings) -> Result<UniquePtr<Session>>;
         fn session_abort(session: Pin<&mut Session>);
         fn session_pause(session: Pin<&mut Session>);
         fn session_resume(session: Pin<&mut Session>);
@@ -461,6 +463,15 @@ mod ffi {
         fn handle_get_metadata(handle: &TorrentHandle) -> Vec<u8>;
         fn make_magnet_uri(handle: &TorrentHandle) -> String;
         fn libtorrent_version() -> String;
+
+        fn get_piece_finished_alert_type() -> i32;
+        fn get_read_piece_alert_type() -> i32;
+        fn get_metadata_received_alert_type() -> i32;
+        fn get_hash_failed_alert_type() -> i32;
+
+        /// Read piece data directly from memory storage, bypassing libtorrent's
+        /// internal read_piece() which fails with custom disk interfaces.
+        fn memory_read_piece_direct(piece: i32) -> Vec<u8>;
     }
 }
 
@@ -482,6 +493,13 @@ impl LibtorrentSession {
     /// Create a new libtorrent session with the given settings
     pub fn new(settings: SessionSettings) -> Result<Self, cxx::Exception> {
         let inner = ffi::create_session(&settings)?;
+        Ok(Self { inner })
+    }
+
+    /// Create a new session with memory-only storage (no disk writes)
+    /// Use this when cache_size = 0 to avoid any disk I/O
+    pub fn new_memory_only(settings: SessionSettings) -> Result<Self, cxx::Exception> {
+        let inner = ffi::create_session_memory_only(&settings)?;
         Ok(Self { inner })
     }
 

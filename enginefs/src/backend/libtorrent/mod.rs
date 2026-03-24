@@ -69,8 +69,14 @@ impl LibtorrentBackend {
             settings.download_rate_limit
         );
 
-        let session = LibtorrentSession::new(settings)
-            .map_err(|e| anyhow!("Failed to create libtorrent session: {}", e))?;
+        // Always use memory-only storage - pieces stay in RAM during streaming
+        // Disk caching happens separately after stream completion (see Phase 3)
+        let session = LibtorrentSession::new_memory_only(settings)
+            .map_err(|e| anyhow!("Failed to create memory-only libtorrent session: {}", e))?;
+        tracing::info!(
+            "LibtorrentBackend: Memory-only mode (streaming-first, cache_size={})",
+            config.cache.size
+        );
 
         std::fs::create_dir_all(&save_path)?;
 
@@ -107,8 +113,10 @@ impl LibtorrentBackend {
         settings: SessionSettings,
         config: crate::backend::BackendConfig,
     ) -> Result<Self> {
-        let session = LibtorrentSession::new(settings)
-            .map_err(|e| anyhow!("Failed to create libtorrent session: {}", e))?;
+        // Always use memory-only storage - pieces stay in RAM during streaming
+        let session = LibtorrentSession::new_memory_only(settings)
+            .map_err(|e| anyhow!("Failed to create memory-only libtorrent session: {}", e))?;
+        tracing::info!("LibtorrentBackend: Memory-only mode (streaming-first)");
 
         std::fs::create_dir_all(&save_path)?;
 
@@ -195,9 +203,9 @@ impl LibtorrentBackend {
             // REDUCED to 5ms for instant piece notifications
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(5));
 
-            // Alert type constants
-            const PIECE_FINISHED_ALERT_TYPE: i32 = 69;
-            const READ_PIECE_ALERT_TYPE: i32 = 45;
+            // Fetch accurate alert types directly from C++ libtorrent
+            let piece_finished_alert_type = libtorrent_sys::get_piece_finished_alert_type();
+            let hash_failed_alert_type = libtorrent_sys::get_hash_failed_alert_type();
 
             loop {
                 interval.tick().await;
@@ -206,41 +214,54 @@ impl LibtorrentBackend {
                 let alerts = s.pop_alerts();
 
                 for alert in alerts {
-                    // Handle piece_finished_alert: Notify waiters and request piece data
-                    if alert.alert_type == PIECE_FINISHED_ALERT_TYPE && alert.piece_index >= 0 {
-                        // NOTIFY WAITERS IMMEDIATELY - wakes all streams waiting for this piece
-                        alert_piece_waiter
-                            .notify_piece_finished(&alert.info_hash, alert.piece_index);
+                    // Log hash failures to detect starvation and bad piece validations
+                    if alert.alert_type == hash_failed_alert_type {
+                        tracing::error!(
+                            "hash_failed_alert piece={} info_hash={} message={}",
+                            alert.piece_index,
+                            alert.info_hash,
+                            alert.message
+                        );
+                    }
 
-                        if let Ok(mut handle) = s.find_torrent(&alert.info_hash) {
-                            let _ = handle.read_piece(alert.piece_index);
-                            tracing::trace!(
-                                "Fast-alert: Piece {} finished for {}",
+                    // Handle piece_finished_alert: read piece data directly from memory storage
+                    // We bypass libtorrent's read_piece() which fails with custom disk interfaces
+                    // due to "invalid piece index in slot list" errors.
+                    if alert.alert_type == piece_finished_alert_type && alert.piece_index >= 0 {
+                        tracing::info!(
+                            "piece_finished_alert piece={} info_hash={}",
+                            alert.piece_index,
+                            alert.info_hash,
+                        );
+
+                        let piece_data = libtorrent_sys::memory_read_piece_direct(alert.piece_index);
+                        if !piece_data.is_empty() {
+                            let info_hash = alert.info_hash.clone();
+                            let piece_idx = alert.piece_index;
+                            let cache = alert_piece_cache.clone();
+                            let waiter = alert_piece_waiter.clone();
+
+                            tokio::spawn(async move {
+                                cache.put_piece(&info_hash, piece_idx, piece_data).await;
+                                waiter.notify_piece_finished(&info_hash, piece_idx);
+                                tracing::info!(
+                                    "Direct-read: Cached piece {} for {}",
+                                    piece_idx,
+                                    info_hash
+                                );
+                            });
+                        } else {
+                            tracing::warn!(
+                                "piece_finished_alert: memory_read_piece_direct returned empty for piece={} info_hash={}",
                                 alert.piece_index,
-                                alert.info_hash
+                                alert.info_hash,
                             );
+                        }    // Still notify waiters so they can retry
+                            alert_piece_waiter
+                                .notify_piece_finished(&alert.info_hash, alert.piece_index);
                         }
                     }
-
-                    // Handle read_piece_alert: Cache piece data in memory immediately
-                    if alert.alert_type == READ_PIECE_ALERT_TYPE && !alert.piece_data.is_empty() {
-                        let info_hash = alert.info_hash.clone();
-                        let piece_idx = alert.piece_index;
-                        let piece_data = alert.piece_data.clone();
-                        let cache = alert_piece_cache.clone();
-
-                        // Cache synchronously for fastest path (data is already in memory)
-                        tokio::spawn(async move {
-                            cache.put_piece(&info_hash, piece_idx, piece_data).await;
-                            tracing::debug!(
-                                "Fast-alert: Cached piece {} for {}",
-                                piece_idx,
-                                info_hash
-                            );
-                        });
-                    }
                 }
-            }
         });
 
         // === SLOW MONITOR ===
@@ -399,6 +420,21 @@ impl LibtorrentBackend {
                 if let Ok(mut handle) = session.find_torrent(&status.info_hash) {
                     tracing::info!("Resuming torrent {}", status.info_hash);
                     handle.resume();
+                }
+            }
+        }
+    }
+
+    /// Pause all torrents (called when no active streams remain)
+    pub async fn pause_all_torrents(&self) {
+        let session = self.session.read().await;
+        let torrents = session.get_torrents();
+
+        for status in torrents {
+            if !status.is_paused {
+                if let Ok(mut handle) = session.find_torrent(&status.info_hash) {
+                    tracing::info!("Pausing torrent {} (no active streams)", status.info_hash);
+                    handle.pause();
                 }
             }
         }

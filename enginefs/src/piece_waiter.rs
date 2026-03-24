@@ -1,7 +1,7 @@
 //! Piece waiter registry for notification-based streaming
 //!
 //! Instead of polling have_piece(), streams register their waker here.
-//! When piece_finished_alert fires, we wake all waiters for that piece.
+//! Once piece bytes are cached and readable, we wake all waiters for that piece.
 
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -29,7 +29,7 @@ impl PieceWaiterRegistry {
         self.waiters.write().entry(key).or_default().push(waker);
     }
 
-    /// Called when piece_finished_alert fires - wake all waiters for this piece
+    /// Called once piece data is readable from cache - wake all waiters for this piece
     pub fn notify_piece_finished(&self, info_hash: &str, piece: i32) {
         let key = (info_hash.to_lowercase(), piece);
         if let Some(waker_list) = self.waiters.write().remove(&key) {
