@@ -1,6 +1,6 @@
 [package]
 name = "async-rar"
-version = "0.1.0"
+version = "0.1.1-beta.1"
 edition = "2024"
 description = "Async Rust bindings for UnRAR"
 license = "MIT"
