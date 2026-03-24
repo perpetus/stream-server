@@ -8,6 +8,9 @@ use tokio::sync::RwLock;
 use crate::backend::{
     BackendFileInfo, EngineStats, FileStreamTrait, TorrentHandle as TorrentHandleTrait,
     metadata::MetadataInspector,
+    priorities::{
+        MAX_STARTUP_PIECES, MIN_STARTUP_BYTES, MIN_STARTUP_PIECES, container_metadata_start,
+    },
 };
 use libtorrent_sys::LibtorrentSession;
 
@@ -159,6 +162,9 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
         if status.is_paused {
             tracing::info!("get_file_reader: Resuming paused torrent for streaming");
             handle.resume();
+            // Force reannounce to quickly re-acquire peers after pause
+            handle.force_reannounce();
+            handle.force_dht_announce();
         }
 
         // Set file priorities: Requested file = 4, Others = 0 (Skip)
@@ -214,9 +220,7 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
                 SeekType::InitialPlayback
             } else {
                 // Near end of file = container metadata (last 10MB or last 5%)
-                let end_threshold = file_size
-                    .saturating_sub(10 * 1024 * 1024)
-                    .max(file_size * 95 / 100);
+                let end_threshold = container_metadata_start(file_size);
                 if start_offset >= end_threshold {
                     SeekType::ContainerMetadata
                 } else {
@@ -256,16 +260,27 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
             // AGGRESSIVE FOCUS: Keep window sizes small to concentrate bandwidth
             let (base_deadline, window_size, label) = match seek_type {
                 SeekType::InitialPlayback => {
-                    // URGENT: deadline=0 on just 5 pieces max for immediate playback
-                    (0, 5, "URGENT")
+                    // URGENT: Calculate window based on file size and target bytes
+                    // Calculate pieces needed, capping at 10% of file to avoid
+                    // excessive buffering on small files
+                    let max_startup_bytes = file_size / 20; // Max 5% of file
+                    let effective_target =
+                        MIN_STARTUP_BYTES.min(max_startup_bytes).max(piece_length);
+
+                    let pieces_needed = effective_target
+                        .saturating_add(piece_length.saturating_sub(1))
+                        / piece_length;
+                    let pieces_needed =
+                        (pieces_needed as i32).clamp(MIN_STARTUP_PIECES, MAX_STARTUP_PIECES);
+                    (0, pieces_needed, "URGENT")
                 }
                 SeekType::UserScrub => {
                     // CRITICAL: 300ms for user seeks, small window
-                    (300, 5, "CRITICAL")
+                    (300, 4, "CRITICAL")
                 }
                 SeekType::ContainerMetadata => {
-                    // Container metadata - lower priority, small window
-                    (1000, 3, "CONTAINER-INDEX")
+                    // Container metadata - high priority, small window
+                    (100, 2, "CONTAINER-INDEX")
                 }
             };
 
@@ -296,30 +311,37 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
                 }
             }
 
-            // For initial playback, also prioritize container index at end
-            // Use DEFERRED deadline so it doesn't compete with playback
+            // PRE-REQUEST first piece via read_piece API if already downloaded
+            // If the piece is already downloaded, read_piece() will load it from 
+            // memory storage into the cache. If NOT downloaded, skip - the 
+            // piece_finished_alert handler will call read_piece() when it's ready.
+            if handle.have_piece(actual_start_piece) {
+                let _ = handle.read_piece(actual_start_piece);
+            }
+
+            // For initial playback, tail metadata should only start after the head window
+            // is already in flight so the first frame is not delayed by end-of-file work.
             if matches!(seek_type, SeekType::InitialPlayback) {
                 if last_piece > actual_start_piece + window_size {
                     tracing::debug!(
-                        "get_file_reader: Also prioritizing last 2 pieces for container index (DEFERRED)"
+                        "get_file_reader: Deferring tail metadata deadlines until after startup"
                     );
-                    handle.set_piece_deadline(last_piece, 2000);
+                    handle.set_piece_deadline(last_piece, 1_200);
                     if last_piece > 0 {
-                        handle.set_piece_deadline(last_piece - 1, 2000);
+                        handle.set_piece_deadline(last_piece - 1, 1_250);
                     }
                 }
             }
 
-            // HEAD PIECE PROTECTION: Only for InitialPlayback and ContainerMetadata
+            // HEAD PIECE PROTECTION: Only for InitialPlayback
             // - InitialPlayback: Already prioritizes head pieces, ensures staircase order
-            // - ContainerMetadata: Seeking to end for moov/Cues, but still needs head for playback
             // - UserScrub: Does NOT need head pieces - user is playing from a different position
             //   The player already has container info cached from previous requests
             if matches!(
                 seek_type,
-                SeekType::InitialPlayback | SeekType::ContainerMetadata
+                SeekType::InitialPlayback
             ) {
-                for i in 0..8 {
+                for i in 0..MAX_STARTUP_PIECES {
                     let p = first_piece + i;
                     if p <= last_piece && !handle.have_piece(p) {
                         handle.set_piece_priority(p, 7); // ESSENTIAL - without this pieces won't download
@@ -344,47 +366,11 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
             );
         }
 
-        // Get file path (file may not exist yet for incomplete torrents)
-        let file_path = PathBuf::from(&file_info.absolute_path);
-
-        // Try to open file if it exists - don't block waiting for it
-        // poll_read will handle lazy opening
-        let opened_file = if file_path.exists() {
-            tracing::debug!("get_file_reader: opening file {:?}", file_path);
-            tokio::fs::File::open(&file_path).await.ok()
-        } else {
-            tracing::debug!(
-                "get_file_reader: file does not exist yet, will open lazily: {:?}",
-                file_path
-            );
-            None
-        };
-
-        tracing::debug!(
-            "get_file_reader: Calculated global offset for file {}: {}",
-            file_idx,
-            global_file_offset
-        );
+        // Memory-only mode: no disk files to open or mmap
 
         let stream_id = self
             .stream_counter
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-
-        // Create mmap for completed files for zero-copy reads
-        let mmap = if is_complete && file_path.exists() {
-            std::fs::File::open(&file_path)
-                .and_then(|f| unsafe { memmap2::Mmap::map(&f) })
-                .map(|m| {
-                    tracing::info!(
-                        "get_file_reader: Using mmap for completed file (size={})",
-                        m.len()
-                    );
-                    m
-                })
-                .ok()
-        } else {
-            None
-        };
 
         // Map local SeekType to stream's SeekType for deterministic handling
         let initial_seek_type = match seek_type {
@@ -394,15 +380,13 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
         };
 
         Ok(Box::new(LibtorrentFileStream {
-            file: opened_file,
-            file_path,
             handle: handle.clone(),
             first_piece,
             last_piece,
             piece_length,
-            file_offset: global_file_offset, // Use the true global offset
+            file_offset: global_file_offset,
             current_pos: 0,
-            is_complete, // Use actual completion status
+            is_complete,
             last_priorities_piece: if !is_complete { actual_start_piece } else { -1 },
             cache_config: self.config.cache.clone(),
             priority,
@@ -413,11 +397,13 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
             info_hash: self.info_hash.clone(),
             cached_piece_data: None,
             last_prefetch_piece: -1,
-            requested_piece_via_api: std::collections::HashSet::new(),
-            mmap,
+            requested_piece_via_api: std::collections::HashMap::new(),
             piece_waiter: self.piece_waiter.clone(),
             seek_type: initial_seek_type,
             file_size,
+            created_at: std::time::Instant::now(),
+            first_read_logged: false,
+            first_wait_logged: false,
         }))
     }
 
@@ -481,7 +467,13 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
             if let Some(file_info) = files.get(file_idx) {
                 // Construct full path: save_path + file.path
                 let full_path = self.save_path.join(&file_info.path);
-                return Some(full_path.to_string_lossy().to_string());
+                if full_path.is_file() {
+                    return Some(full_path.to_string_lossy().to_string());
+                }
+                tracing::debug!(
+                    "get_file_path: No on-disk file available for {} (memory-only mode)",
+                    full_path.display()
+                );
             }
         }
         None
@@ -522,7 +514,7 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
         }
 
         // Phase 2: Set file priorities and reactive metadata inspection
-        let (first_piece, last_piece, piece_length, file_offset, file_length, name) = {
+        let (first_piece, last_piece, piece_length, file_offset, file_length, name, needs_end_metadata) = {
             let session = self.session.read().await;
             let mut handle = session
                 .find_torrent(&self.info_hash)
@@ -567,15 +559,15 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
             // because it set highest priority on pieces 0-7 even when seeking to piece 118.
             // Prioritization now happens ONLY in get_file_reader() which knows the actual offset.
             //
-            // SAFETY NET: Set low-urgency deadlines on first 8 pieces as fallback.
+            // SAFETY NET: Set low-urgency deadlines on the first few pieces as fallback.
             // These will be overridden by get_file_reader() with proper URGENT (0ms) deadlines.
             // But if there's any delay before get_file_reader() runs, this ensures SOMETHING
             // starts downloading immediately after file switch (fixes 95%+ download issue).
-            for i in 0..8 {
+            for i in 0..MAX_STARTUP_PIECES {
                 let p = first_piece + i;
                 if p <= last_piece && !handle.have_piece(p) {
-                    handle.set_piece_priority(p, 7); // Highest priority
-                    handle.set_piece_deadline(p, 5000); // 5 second fallback deadline
+                    // Safety net: very low urgency to give metadata inspector a head start
+                    handle.set_piece_deadline(p, 3000 + i * 25);
                 }
             }
             let _total_pieces = (last_piece - first_piece + 1) as i32;
@@ -583,7 +575,7 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
             // PRE-WARM CACHE: If first 8 pieces are already complete, request them via read_piece
             // This populates moka cache immediately for zero-latency first read
             // Only prewarm if they're already available (don't wait for download)
-            let prewarm_count = 8;
+            let prewarm_count = MAX_STARTUP_PIECES;
             let is_prewarm_complete =
                 (0..prewarm_count).all(|i| handle.have_piece(first_piece + i));
             if is_prewarm_complete {
@@ -591,12 +583,29 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
                     "prepare_file_for_streaming: File head complete, pre-warming {} pieces",
                     prewarm_count
                 );
-                for i in 0..prewarm_count {
-                    let _ = handle.read_piece(first_piece + i);
-                }
+                let cache = self.piece_cache.clone();
+                let info_hash = self.info_hash.clone();
+                let waiter = self.piece_waiter.clone();
+                let fp = first_piece;
+                tokio::spawn(async move {
+                    for i in 0..prewarm_count {
+                        let piece_data = libtorrent_sys::memory_read_piece_direct(fp + i);
+                        if !piece_data.is_empty() {
+                            cache.put_piece(&info_hash, fp + i, piece_data).await;
+                            waiter.notify_piece_finished(&info_hash, fp + i);
+                        }
+                    }
+                    tracing::info!("prepare_file_for_streaming: Pre-warmed {} pieces", prewarm_count);
+                });
             }
 
-            // DO NOT prioritize pieces here - let get_file_reader() handle it
+            let name_lower = name.to_lowercase();
+            let needs_end_metadata = name_lower.ends_with(".mkv")
+                || name_lower.ends_with(".mp4")
+                || name_lower.ends_with(".webm")
+                || name_lower.ends_with(".mov");
+
+            // DO NOT prioritize other pieces here - let get_file_reader() handle it
             // since it knows the actual seek offset
 
             tracing::info!(
@@ -610,21 +619,36 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
                 file_offset,
                 file_length,
                 name,
+                needs_end_metadata,
             )
         }; // session lock released here
 
-        // Perform reactive metadata inspection in BACKGROUND
-        // DEFERRED: Wait 500ms before starting to give initial playback pieces a head start
-        // This ensures bandwidth is focused on pieces 0-2 before we start fetching moov/Cues
+        // Perform reactive metadata inspection in the background after startup gets the first shot.
         let this = self.clone();
         tokio::spawn(async move {
-            // CRITICAL: Delay metadata inspection to not compete with startup pieces
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            // Give startup pieces a clear head start before spending bandwidth on tail metadata.
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
 
             tracing::info!(
-                "Background Metadata Inspection: Starting for file {} (deferred 500ms)",
+                "Background Metadata Inspection: Starting for file {} (deferred 250ms)",
                 file_idx
             );
+
+            if needs_end_metadata && last_piece > first_piece {
+                let session = this.session.read().await;
+                if let Ok(mut handle) = session.find_torrent(&this.info_hash) {
+                    for i in 0..2 {
+                        let p = last_piece - i;
+                        if p >= first_piece && !handle.have_piece(p) {
+                            handle.set_piece_deadline(p, 150 + (i * 50) as i32);
+                        }
+                    }
+                    tracing::debug!(
+                        "Background Metadata Inspection: Primed tail pieces after startup window"
+                    );
+                }
+                drop(session);
+            }
 
             // This will find 'moov' atoms (MP4) or index areas (MKV) and prioritize them.
             if let Ok(mut reader) = this.get_file_reader(file_idx, 0, 255, None).await {
@@ -644,55 +668,21 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
 
                             for p in start_piece..=end_piece {
                                 if p >= first_piece && p <= last_piece {
-                                    // Downgrade metadata priority to 3000ms to let head pieces (0-200ms) win
-                                    handle.set_piece_deadline(p, 3000);
+                                    // CRITICAL: Player needs Cues/moov to start!
+                                    // Use 150ms deadline - right after piece 0
+                                    handle.set_piece_deadline(p, 150);
                                 }
                             }
                         }
                         tracing::info!(
-                            "Background Metadata Inspection: Prioritized {} critical metadata ranges (Deadline 3000ms)",
+                            "Background Metadata Inspection: Prioritized {} critical metadata ranges (Deadline 200ms)",
                             critical_ranges.len()
                         );
                     }
                 }
             }
 
-            // Phase 2.5: Find and prioritize actual keyframe positions from container index
-            // This reads Cues (MKV) or stss (MP4) to find where video keyframes are located
-            if let Ok(mut reader2) = this.get_file_reader(file_idx, 0, 255, None).await {
-                let keyframe_offsets = MetadataInspector::find_keyframe_offsets(
-                    &mut reader2,
-                    file_length as u64,
-                    &name,
-                )
-                .await;
-
-                if !keyframe_offsets.is_empty() {
-                    let session = this.session.read().await;
-                    if let Ok(mut handle) = session.find_torrent(&this.info_hash) {
-                        let mut keyframe_pieces = Vec::new();
-
-                        // Prioritize pieces containing the first 20 keyframes
-                        for offset in keyframe_offsets.iter().take(20) {
-                            let piece =
-                                ((file_offset as u64 + offset) / piece_length as u64) as i32;
-                            if piece >= first_piece
-                                && piece <= last_piece
-                                && !keyframe_pieces.contains(&piece)
-                            {
-                                // Downgrade keyframe priority to 3000ms
-                                handle.set_piece_deadline(piece, 3000);
-                                keyframe_pieces.push(piece);
-                            }
-                        }
-
-                        tracing::info!(
-                            "Background Metadata Inspection: Prioritized {} pieces containing keyframes (Deadline 3000ms)",
-                            keyframe_pieces.len()
-                        );
-                    }
-                }
-            }
+            // NOTE: Keyframe inspection removed - it was blocking for 15+ seconds.
         });
 
         tracing::info!(

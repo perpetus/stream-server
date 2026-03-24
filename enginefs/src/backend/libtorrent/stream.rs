@@ -1,10 +1,9 @@
 //! File stream implementation for libtorrent backend
 
-use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
-use super::helpers::read_piece_from_disk;
-use crate::backend::priorities::{EngineCacheConfig, calculate_priorities};
+use crate::backend::priorities::{EngineCacheConfig, calculate_priorities, container_metadata_start};
 
 /// Type of seek operation - determines priority behavior
 /// Used for DETERMINISTIC seek detection instead of heuristic piece jumps
@@ -21,19 +20,14 @@ pub(crate) enum SeekType {
 }
 
 pub(crate) struct LibtorrentFileStream {
-    pub(crate) file: Option<tokio::fs::File>, // Made optional - file may not exist yet
-    pub(crate) file_path: PathBuf,            // Path to file for lazy opening
     pub(crate) handle: libtorrent_sys::LibtorrentHandle,
     pub(crate) first_piece: i32,
     pub(crate) last_piece: i32,
     pub(crate) piece_length: u64,
     pub(crate) file_offset: u64,
-    // For multi-file torrents:
-    // We used to calculate file-relative offsets here, but now we enforce FULL pieces in cache.
-    // The offset logic has been simplified to: (file_offset + pos) % piece_length
     pub(crate) current_pos: u64,
     pub(crate) is_complete: bool,
-    pub(crate) last_priorities_piece: i32, // Track last piece we set priorities for
+    pub(crate) last_priorities_piece: i32,
     pub(crate) cache_config: EngineCacheConfig,
     pub(crate) priority: u8,
     pub(crate) bitrate: Option<u64>,
@@ -49,15 +43,19 @@ pub(crate) struct LibtorrentFileStream {
     /// Last piece we triggered prefetch for (to avoid repeated requests)
     pub(crate) last_prefetch_piece: i32,
     /// Track pieces we've requested via read_piece() API to avoid duplicate requests
-    pub(crate) requested_piece_via_api: std::collections::HashSet<i32>,
-    /// Memory-mapped file for zero-copy reads on completed files
-    pub(crate) mmap: Option<memmap2::Mmap>,
+    pub(crate) requested_piece_via_api: std::collections::HashMap<i32, Instant>,
     /// Registry of wakers waiting for pieces to finish downloading
     pub(crate) piece_waiter: Arc<crate::piece_waiter::PieceWaiterRegistry>,
     /// Current seek type for DETERMINISTIC priority handling
     pub(crate) seek_type: SeekType,
     /// File size for container metadata detection
     pub(crate) file_size: u64,
+    /// Stream creation time for startup instrumentation
+    pub(crate) created_at: Instant,
+    /// Whether we already logged the first successful read
+    pub(crate) first_read_logged: bool,
+    /// Whether we already logged the first startup wait
+    pub(crate) first_wait_logged: bool,
 }
 
 impl LibtorrentFileStream {
@@ -185,37 +183,12 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
         let pos = self.current_pos;
         self.set_priorities(pos);
 
-        // MMAP FAST PATH: If we have mmap, serve directly from memory (zero-copy)
-        if let Some(ref mmap) = self.mmap {
-            let offset = pos as usize;
-            let available = mmap.len().saturating_sub(offset);
-            let to_read = buf.remaining().min(available);
-
-            if to_read > 0 {
-                buf.put_slice(&mmap[offset..offset + to_read]);
-                self.current_pos += to_read as u64;
-
-                if pos == 0 || pos % (10 * 1024 * 1024) == 0 {
-                    tracing::debug!(
-                        "poll_read: Served {} bytes via MMAP (zero-copy, pos={})",
-                        to_read,
-                        pos
-                    );
-                }
-            }
-            return std::task::Poll::Ready(Ok(()));
-        }
-
         // Calculate which piece we need
         let piece = if self.piece_length > 0 {
             ((self.file_offset + pos) / self.piece_length) as i32
         } else {
             -1
         };
-
-        // For multi-file torrents:
-        // We used to calculate file-relative offsets here, but now we enforce FULL pieces in cache.
-        // The offset logic has been simplified to: (file_offset + pos) % piece_length
 
         // MEMORY-FIRST READING: Check if we have this piece in our local cache
         if piece >= 0 {
@@ -228,8 +201,6 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
             if have_cached {
                 // Serve from local cache - FASTEST PATH
                 if let Some((_, data, _)) = &self.cached_piece_data {
-                    // Calculate offset into cached data: Global pos % piece_length
-                    // We assume cached data is always FULL piece (aligned to global piece start)
                     let offset_in_cached = ((self.file_offset + pos) % self.piece_length) as usize;
                     let available = data.len().saturating_sub(offset_in_cached);
                     let to_read = buf.remaining().min(available);
@@ -237,6 +208,14 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
                     if to_read > 0 {
                         buf.put_slice(&data[offset_in_cached..offset_in_cached + to_read]);
                         self.current_pos += to_read as u64;
+                        if !self.first_read_logged {
+                            self.first_read_logged = true;
+                            tracing::info!(
+                                "startup: first direct-stream bytes ready after {:?} (piece={}, source=local-cache)",
+                                self.created_at.elapsed(),
+                                piece
+                            );
+                        }
 
                         if pos % (1024 * 1024) == 0 || pos < 4096 {
                             tracing::debug!(
@@ -247,25 +226,17 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
                             );
                         }
                     }
+                    self.requested_piece_via_api.remove(&piece);
                     return std::task::Poll::Ready(Ok(()));
                 }
             }
 
             // Try to get from moka cache (check synchronously)
-            // OPTIMIZATION: Use reference directly, avoid clone for lookup
             if let Some(piece_data) =
                 futures::executor::block_on(self.piece_cache.get_piece(&self.info_hash, piece))
             {
-                // CRITICAL FIX: Ensure correct offset for Multi-File Torrents
-                // We now ensure (in helpers.rs) that only FULL pieces are cached.
-                // This means the cache data ALWAYS starts at piece_global_start.
-                //
-                // Global pos = file_offset + pos
-                // Offset in piece = Global pos % piece_length
+                self.requested_piece_via_api.remove(&piece);
                 let offset_in_cached = ((self.file_offset + pos) % self.piece_length) as usize;
-
-                // Store locally. We use 0 for file_relative_start because we calculate
-                // offset dynamically now, but we keep the field to satisfy the type.
                 self.cached_piece_data = Some((piece, piece_data.clone(), 0));
 
                 let available = piece_data.len().saturating_sub(offset_in_cached);
@@ -274,6 +245,14 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
                 if to_read > 0 {
                     buf.put_slice(&piece_data[offset_in_cached..offset_in_cached + to_read]);
                     self.current_pos += to_read as u64;
+                    if !self.first_read_logged {
+                        self.first_read_logged = true;
+                        tracing::info!(
+                            "startup: first direct-stream bytes ready after {:?} (piece={}, source=piece-cache)",
+                            self.created_at.elapsed(),
+                            piece
+                        );
+                    }
 
                     tracing::debug!(
                         "poll_read: Served {} bytes from MOKA cache (piece {}, offset_in_cached={})",
@@ -283,65 +262,48 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
                     );
                 }
 
-                // === READ-AHEAD PREFETCH ===
-                // ADAPTIVE: Prefetch count based on download speed
-                // Fast downloads = more prefetch, slow = less to avoid wasting cache
+                // === READ-AHEAD PREFETCH (memory-only) ===
                 if piece != self.last_prefetch_piece {
                     self.last_prefetch_piece = piece;
-                    // Clone only what's needed for the async prefetch task
                     let prefetch_cache = self.piece_cache.clone();
                     let prefetch_info_hash = self.info_hash.clone();
                     let prefetch_handle = self.handle.clone();
-                    let file_path = self.file_path.clone();
-                    let piece_len = self.piece_length;
-                    let file_offset = self.file_offset;
                     let last_piece = self.last_piece;
 
-                    // ADAPTIVE PREFETCH COUNT:
-                    // >10 MB/s = 8 pieces, >5 MB/s = 5 pieces, >1 MB/s = 3 pieces, else 2
+                    // ADAPTIVE PREFETCH COUNT
                     let prefetch_count: i32 = if self.download_speed_ema > 10_000_000.0 {
-                        8 // Very fast: prefetch 8 pieces (~32MB at 4MB pieces)
+                        8
                     } else if self.download_speed_ema > 5_000_000.0 {
-                        5 // Fast: prefetch 5 pieces
+                        5
                     } else if self.download_speed_ema > 1_000_000.0 {
-                        3 // Medium: prefetch 3 pieces
+                        3
                     } else {
-                        2 // Slow/starting: minimal prefetch
+                        2
                     };
 
-                    // Spawn background prefetch task
+                    // Spawn background prefetch task (memory-only: read directly from storage)
                     tokio::spawn(async move {
                         for i in 1..=prefetch_count {
                             let next_piece = piece + i;
                             if next_piece > last_piece {
                                 break;
                             }
-
-                            // Check if already in cache
                             if prefetch_cache
                                 .has_piece(&prefetch_info_hash, next_piece)
                                 .await
                             {
                                 continue;
                             }
-
-                            // Check if piece is downloaded
                             if !prefetch_handle.have_piece(next_piece) {
                                 continue;
                             }
-
-                            // Read piece from disk into cache
-                            if let Ok(cached_data) =
-                                read_piece_from_disk(&file_path, next_piece, piece_len, file_offset)
-                                    .await
-                            {
-                                prefetch_cache
-                                    .put_piece(&prefetch_info_hash, next_piece, cached_data.data)
-                                    .await;
+                            // Read directly from memory storage (no libtorrent read_piece)
+                            let data = libtorrent_sys::memory_read_piece_direct(next_piece);
+                            if !data.is_empty() {
+                                prefetch_cache.put_piece(&prefetch_info_hash, next_piece, data).await;
                                 tracing::debug!(
-                                    "Read-ahead: prefetched piece {} into cache (file_rel_start={})",
-                                    next_piece,
-                                    cached_data.file_relative_start
+                                    "Read-ahead: cached piece {} directly from memory",
+                                    next_piece
                                 );
                             }
                         }
@@ -354,47 +316,71 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
 
         // Not in cache - check if piece is available in libtorrent
         if piece >= 0 && !self.handle.have_piece(piece) {
-            // NOTIFICATION-BASED WAITING: Register waker to be notified when piece finishes
-            // This is more efficient than polling - we get woken immediately when
-            // piece_finished_alert fires instead of polling every 5ms
+            // NOTIFICATION-BASED WAITING
             self.piece_waiter
                 .register(&self.info_hash, piece, cx.waker().clone());
 
-            // FALLBACK TIMEOUT: Also schedule a timeout wake in case notification is missed
-            // (e.g., race condition where piece finishes between have_piece and register)
             let waker = cx.waker().clone();
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 waker.wake();
             });
 
-            // Log download status periodically to help debug stalled downloads
             if pos % (1024 * 1024) == 0 {
                 let status = self.handle.status();
-                tracing::debug!(
-                    "poll_read: WAITING for piece {} (pos={}, peers={}, speed={:.1}MB/s)",
+                tracing::info!(
+                    "poll_read: WAITING for piece {} (pos={}, peers={}, speed={:.1}MB/s, paused={}, finished={})",
                     piece,
                     pos,
                     status.num_peers,
-                    status.download_rate as f64 / 1_000_000.0
+                    status.download_rate as f64 / 1_000_000.0,
+                    status.is_paused,
+                    status.is_finished
+                );
+            }
+            if pos == 0 && !self.first_wait_logged {
+                self.first_wait_logged = true;
+                let status = self.handle.status();
+                tracing::info!(
+                    "startup: waiting for first playable piece {} after {:?} (peers={}, paused={}, finished={})",
+                    piece,
+                    self.created_at.elapsed(),
+                    status.num_peers,
+                    status.is_paused,
+                    status.is_finished
                 );
             }
 
             return std::task::Poll::Pending;
         }
 
-        // MEMORY-FIRST OPTIMIZATION: Piece is available on disk but not in our cache
-        // Request it via read_piece() API - libtorrent may have it in ITS memory cache
-        // This is faster than disk I/O on our side
-        if piece >= 0 && !self.requested_piece_via_api.contains(&piece) {
-            let _ = self.handle.read_piece(piece);
-            self.requested_piece_via_api.insert(piece);
-            tracing::trace!(
-                "poll_read: Requested piece {} via read_piece API (memory-first)",
-                piece
-            );
+        // Piece is downloaded but not in cache — read directly from memory storage
+        if piece >= 0 && !self.requested_piece_via_api.contains_key(&piece) {
+            let piece_data = libtorrent_sys::memory_read_piece_direct(piece);
+            if !piece_data.is_empty() {
+                // Got data directly! Cache it and serve immediately on next poll.
+                let info_hash = self.info_hash.clone();
+                let cache = self.piece_cache.clone();
+                let waiter = self.piece_waiter.clone();
+                self.requested_piece_via_api.insert(piece, Instant::now());
+                tracing::info!(
+                    "poll_read: Direct read piece {} from memory storage ({} bytes)",
+                    piece,
+                    piece_data.len()
+                );
+                tokio::spawn(async move {
+                    cache.put_piece(&info_hash, piece, piece_data).await;
+                    waiter.notify_piece_finished(&info_hash, piece);
+                });
+            } else {
+                tracing::debug!(
+                    "poll_read: piece {} downloaded but not yet in memory storage",
+                    piece,
+                );
+                self.piece_waiter
+                    .register(&self.info_hash, piece, cx.waker().clone());
+            }
 
-            // Wait briefly for the alert handler to populate our cache
             let waker = cx.waker().clone();
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -403,59 +389,51 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
             return std::task::Poll::Pending;
         }
 
-        // Ensure file is open (lazy opening)
-        if self.file.is_none() {
-            if self.file_path.exists() {
-                match std::fs::File::open(&self.file_path) {
-                    Ok(std_file) => {
-                        self.file = Some(tokio::fs::File::from_std(std_file));
-                        tracing::debug!("poll_read: lazily opened file {:?}", self.file_path);
-                    }
-                    Err(e) => {
-                        tracing::debug!("poll_read: failed to open file: {}", e);
-                    }
+        // Piece was requested, waiting for cache to be populated
+        if piece >= 0 && self.requested_piece_via_api.contains_key(&piece) {
+            let should_rerequest = self
+                .requested_piece_via_api
+                .get(&piece)
+                .map(|requested_at| requested_at.elapsed() > std::time::Duration::from_millis(250))
+                .unwrap_or(false);
+            if should_rerequest {
+                tracing::warn!(
+                    "poll_read: piece {} still missing from cache after 250ms, re-reading from memory",
+                    piece
+                );
+                let piece_data = libtorrent_sys::memory_read_piece_direct(piece);
+                if !piece_data.is_empty() {
+                    let info_hash = self.info_hash.clone();
+                    let cache = self.piece_cache.clone();
+                    let waiter = self.piece_waiter.clone();
+                    tokio::spawn(async move {
+                        cache.put_piece(&info_hash, piece, piece_data).await;
+                        waiter.notify_piece_finished(&info_hash, piece);
+                    });
                 }
+                self.requested_piece_via_api.insert(piece, Instant::now());
             }
+            self.piece_waiter
+                .register(&self.info_hash, piece, cx.waker().clone());
+            tracing::trace!(
+                "poll_read: MEMORY-ONLY waiting for piece {} in cache (have_piece={})",
+                piece,
+                self.handle.have_piece(piece)
+            );
+            let waker = cx.waker().clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+                waker.wake();
+            });
+            return std::task::Poll::Pending;
         }
 
-        // If file is still not open, wait for it
-        let file = match self.file.as_mut() {
-            Some(f) => f,
-            None => {
-                tracing::debug!("poll_read: file not yet available, waiting...");
-                let waker = cx.waker().clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-                    waker.wake();
-                });
-                return std::task::Poll::Pending;
-            }
-        };
-
-        // Read from disk
-        let rem_before = buf.remaining();
-        match std::pin::Pin::new(file).poll_read(cx, buf) {
-            std::task::Poll::Ready(Ok(())) => {
-                let read = rem_before - buf.remaining();
-                if read > 0 {
-                    self.current_pos += read as u64;
-
-                    if pos % (1024 * 1024) == 0 || pos < 4096 {
-                        tracing::debug!(
-                            "poll_read: Read {} bytes from DISK. Pos={}",
-                            read,
-                            self.current_pos
-                        );
-                    }
-                }
-                std::task::Poll::Ready(Ok(()))
-            }
-            std::task::Poll::Pending => std::task::Poll::Pending,
-            std::task::Poll::Ready(Err(e)) => {
-                tracing::error!("poll_read: Error reading file: {}", e);
-                std::task::Poll::Ready(Err(e))
-            }
-        }
+        // Should not reach here
+        tracing::error!("poll_read: Unexpected state - piece={}, pos={}", piece, pos);
+        std::task::Poll::Ready(Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "Memory-only streaming: unexpected state in poll_read",
+        )))
     }
 }
 
@@ -468,17 +446,11 @@ impl tokio::io::AsyncSeek for LibtorrentFileStream {
         let new_pos = match position {
             std::io::SeekFrom::Start(pos) => pos,
             std::io::SeekFrom::Current(delta) => (self.current_pos as i64 + delta).max(0) as u64,
-            std::io::SeekFrom::End(delta) => {
-                // Now we have file_size, we can handle End seeks
-                (self.file_size as i64 + delta).max(0) as u64
-            }
+            std::io::SeekFrom::End(delta) => (self.file_size as i64 + delta).max(0) as u64,
         };
 
         // DETERMINISTIC: Detect seek type based on target position
-        let end_threshold = self
-            .file_size
-            .saturating_sub(10 * 1024 * 1024)
-            .max(self.file_size * 95 / 100);
+        let end_threshold = container_metadata_start(self.file_size);
 
         self.seek_type = if new_pos >= end_threshold {
             SeekType::ContainerMetadata
@@ -493,44 +465,30 @@ impl tokio::io::AsyncSeek for LibtorrentFileStream {
             self.seek_type
         );
 
-        // If file is open, delegate to it
-        if let Some(ref mut file) = self.file {
-            std::pin::Pin::new(file).start_seek(position)
-        } else {
-            // File not open yet - just update position
-            self.current_pos = new_pos;
-            Ok(())
-        }
+        // Memory-only mode: just update position, no file handle to seek
+        self.current_pos = new_pos;
+        // Invalidate local cached piece data since position changed
+        self.cached_piece_data = None;
+        Ok(())
     }
 
     fn poll_complete(
         mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
+        _cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<u64>> {
-        // If file is open, delegate to it
-        if let Some(ref mut file) = self.file {
-            match std::pin::Pin::new(file).poll_complete(cx) {
-                std::task::Poll::Ready(Ok(pos)) => {
-                    self.current_pos = pos;
+        // Memory-only mode: position is already set in start_seek
+        let pos = self.current_pos;
 
-                    let piece_idx = if self.piece_length > 0 {
-                        ((self.file_offset + pos) / self.piece_length) as i32
-                    } else {
-                        -1
-                    };
-
-                    // Let set_priorities handle priority changes based on SeekType
-                    // Don't clear deadlines here - set_priorities does it deterministically
-                    if piece_idx != self.last_priorities_piece {
-                        self.set_priorities(pos);
-                    }
-                    std::task::Poll::Ready(Ok(pos))
-                }
-                other => other,
-            }
+        let piece_idx = if self.piece_length > 0 {
+            ((self.file_offset + pos) / self.piece_length) as i32
         } else {
-            // File not open - return current position
-            std::task::Poll::Ready(Ok(self.current_pos))
+            -1
+        };
+
+        if piece_idx != self.last_priorities_piece {
+            self.set_priorities(pos);
         }
+
+        std::task::Poll::Ready(Ok(pos))
     }
 }

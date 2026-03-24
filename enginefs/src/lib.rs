@@ -9,6 +9,7 @@ use tracing::debug;
 
 pub mod backend;
 pub mod cache;
+pub mod disk_cache;
 pub mod engine;
 pub mod files;
 pub mod hls;
@@ -59,9 +60,13 @@ pub struct BackendEngineFS<B: TorrentBackend> {
     pub download_dir: std::path::PathBuf,
     /// Track active streams per info_hash for legacy compatibility
     active_streams: Arc<RwLock<HashMap<String, usize>>>,
+    /// Track active requests per specific streamed file so cleanup does not race probe retries.
+    active_file_streams: Arc<RwLock<HashMap<(String, usize), usize>>>,
     /// Tracks the currently active streamed file (info_hash, file_idx)
     /// Only ONE file should be actively downloading at any time
     active_file: Arc<RwLock<Option<(String, usize)>>>,
+    /// Optional disk cache for persisting completed files
+    disk_cache: Option<Arc<disk_cache::DiskCacheManager>>,
 }
 
 #[cfg(all(feature = "librqbit", not(feature = "libtorrent")))]
@@ -110,10 +115,13 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             cache_dir,
             download_dir: download_dir.clone(),
             active_streams: Arc::new(RwLock::new(HashMap::new())),
+            active_file_streams: Arc::new(RwLock::new(HashMap::new())),
             active_file: Arc::new(RwLock::new(None)),
+            disk_cache: None,
         };
 
         let engines_clone = engines.clone();
+        let backend_clone = efs.backend.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(60)).await;
@@ -137,9 +145,19 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
 
                 if !to_remove.is_empty() {
                     let mut write = engines_clone.write().await;
-                    for hash in to_remove {
+                    for hash in &to_remove {
                         debug!(info_hash = %hash, "Auto-removing inactive engine");
-                        write.remove(&hash);
+                        write.remove(hash);
+                    }
+                    drop(write);
+
+                    // Actually stop the torrents in the backend session
+                    for hash in to_remove {
+                        if let Err(e) = backend_clone.remove_torrent(&hash).await {
+                            tracing::warn!(info_hash = %hash, "Failed to remove torrent from backend: {}", e);
+                        } else {
+                            tracing::info!(info_hash = %hash, "Removed torrent from backend");
+                        }
                     }
                 }
             }
@@ -246,6 +264,11 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             let count = streams.entry(info_hash.clone()).or_insert(0);
             *count += 1;
         }
+        {
+            let mut streams = self.active_file_streams.write().await;
+            let count = streams.entry((info_hash.clone(), file_idx)).or_insert(0);
+            *count += 1;
+        }
 
         tracing::info!(
             "Stream started for {} file_idx={} (exclusive mode)",
@@ -258,21 +281,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     pub async fn on_stream_end(&self, info_hash: &str, file_idx: usize) {
         let info_hash = info_hash.to_lowercase();
 
-        // Clear active file if it matches
-        {
-            let mut active = self.active_file.write().await;
-            if let Some((ref h, idx)) = *active {
-                if h == &info_hash && idx == file_idx {
-                    tracing::info!(
-                        "Stream ended for {} file_idx={}, clearing active file",
-                        info_hash,
-                        file_idx
-                    );
-                    *active = None;
-                }
-            }
-        }
-
         // Update legacy active_streams counter
         {
             let mut streams = self.active_streams.write().await;
@@ -284,13 +292,93 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             }
         }
 
+        let file_streams_remaining = {
+            let mut streams = self.active_file_streams.write().await;
+            let key = (info_hash.clone(), file_idx);
+            if let Some(count) = streams.get_mut(&key) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    streams.remove(&key);
+                    0
+                } else {
+                    *count
+                }
+            } else {
+                0
+            }
+        };
+
+        if file_streams_remaining == 0 {
+            self.schedule_file_cleanup(info_hash.clone(), file_idx);
+        }
+
         let remaining = self.active_streams.read().await.values().sum::<usize>();
-        tracing::debug!(
-            "Stream ended for {} file_idx={}, total active streams: {}",
+        tracing::info!(
+            "Stream ended for {} file_idx={}, total active streams: {}, file streams remaining: {}",
             info_hash,
             file_idx,
-            remaining
+            remaining,
+            file_streams_remaining
         );
+    }
+
+    fn schedule_file_cleanup(&self, info_hash: String, file_idx: usize) {
+        let engines = self.engines.clone();
+        let active_file = self.active_file.clone();
+        let active_file_streams = self.active_file_streams.clone();
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+
+            let key = (info_hash.clone(), file_idx);
+            let still_active = {
+                let streams = active_file_streams.read().await;
+                streams.get(&key).copied().unwrap_or(0) > 0
+            };
+            if still_active {
+                tracing::debug!(
+                    "Skipping delayed cleanup for {} idx={} because a new stream started",
+                    info_hash,
+                    file_idx
+                );
+                return;
+            }
+
+            {
+                let mut active = active_file.write().await;
+                if let Some((ref h, idx)) = *active {
+                    if h == &info_hash && idx == file_idx {
+                        tracing::info!(
+                            "Delayed cleanup: clearing active file for {} file_idx={}",
+                            info_hash,
+                            file_idx
+                        );
+                        *active = None;
+                    }
+                }
+            }
+
+            let engine = {
+                let engines = engines.read().await;
+                engines.get(&info_hash).cloned()
+            };
+            if let Some(engine) = engine {
+                if let Err(e) = engine.handle.clear_file_streaming(file_idx).await {
+                    tracing::warn!(
+                        "Failed to clear file priorities for {} idx={}: {}",
+                        info_hash,
+                        file_idx,
+                        e
+                    );
+                } else {
+                    tracing::info!(
+                        "Delayed cleanup: cleared file priorities for {} idx={}",
+                        info_hash,
+                        file_idx
+                    );
+                }
+            }
+        });
     }
 
     /// Clear piece priorities for a file that is no longer being streamed
@@ -346,15 +434,25 @@ impl BackendEngineFS<LibtorrentBackend> {
         tracker_storage: Option<Arc<dyn crate::trackers::TrackerStorage>>,
     ) -> Result<Self> {
         let download_dir = root_dir.join("libtorrent-downloads");
+        let cache_size = config.cache.size;
         let backend = LibtorrentBackend::new(download_dir.clone(), config)?;
-        // For libtorrent we don't restore handles automatically yet in this simple impl
-        Ok(Self::new_with_backend_and_storage(
+
+        let mut efs = Self::new_with_backend_and_storage(
             backend,
             HashMap::new(),
             download_dir.clone(),
             download_dir,
             tracker_storage,
-        ))
+        );
+
+        // Set up disk cache for conditional file persistence
+        let disk_cache_dir = root_dir.join("disk-cache");
+        efs.disk_cache = Some(Arc::new(disk_cache::DiskCacheManager::new(
+            disk_cache_dir,
+            cache_size,
+        )));
+
+        Ok(efs)
     }
 
     /// Update session settings dynamically (called when user changes torrent profile)
@@ -374,6 +472,11 @@ impl BackendEngineFS<LibtorrentBackend> {
     /// Also disables streaming mode (restores normal upload)
     pub async fn resume_all_torrents(&self) {
         self.backend.resume_all_torrents().await;
+    }
+
+    /// Pause all torrents (called when no active streams remain)
+    pub async fn pause_all_torrents(&self) {
+        self.backend.pause_all_torrents().await;
     }
 
     /// Enable or disable streaming mode (limits uploads during streaming)

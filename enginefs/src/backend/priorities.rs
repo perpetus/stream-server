@@ -1,5 +1,24 @@
 use serde::{Deserialize, Serialize};
 
+/// Minimum bytes needed before playback can start
+/// Used to calculate initial piece window size
+/// Keep startup target small so playback can begin on the earliest pieces.
+pub const MIN_STARTUP_BYTES: u64 = 1 * 1024 * 1024; // 1MB
+
+/// Maximum pieces to prioritize at startup (prevents bandwidth scatter)
+pub const MAX_STARTUP_PIECES: i32 = 2;
+
+/// Minimum pieces to prioritize at startup (allows single-piece startup)
+pub const MIN_STARTUP_PIECES: i32 = 1;
+
+/// Start treating reads as "container metadata" when they fall in the last 10MB
+/// or the last 5% of the file, whichever starts earlier.
+pub fn container_metadata_start(file_size: u64) -> u64 {
+    file_size
+        .saturating_sub(10 * 1024 * 1024)
+        .min(file_size.saturating_mul(95) / 100)
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct EngineCacheConfig {
     pub size: u64,

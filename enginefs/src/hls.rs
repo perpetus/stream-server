@@ -61,6 +61,7 @@ pub struct VideoStream {
     pub codec_name: String, // "h264", "aac", etc.
     pub width: Option<u32>,
     pub height: Option<u32>,
+    pub channels: Option<u8>,
     pub bitrate: Option<u64>,
     pub fps: Option<f64>,
     pub lang: Option<String>,
@@ -124,23 +125,57 @@ impl AsyncRead for TranscodeStream {
 
 impl HlsEngine {
     pub async fn probe_video(file_path: &str) -> Result<ProbeResult> {
-        // Use ffmpeg -i with limited analysis to avoid reading entire file
-        // This is critical for HTTP streams to avoid thread starvation
+        // Start with a tiny probe budget so startup can happen quickly, then retry only
+        // when the first pass does not reveal enough metadata.
+        let attempts = [
+            (750_000u64, 512_000u64),
+            (2_000_000u64, 2_000_000u64),
+            (5_000_000u64, 5_000_000u64),
+        ];
 
+        for (attempt_idx, (analyzeduration, probesize)) in attempts.iter().copied().enumerate() {
+            let probe =
+                Self::probe_video_with_limits(file_path, analyzeduration, probesize).await?;
+            let has_streams = !probe.streams.is_empty();
+            let knows_container = probe.container != "unknown";
+            if has_streams && knows_container {
+                tracing::info!(
+                    "probe_video: resolved media info on attempt {} (analyzeduration={}, probesize={})",
+                    attempt_idx + 1,
+                    analyzeduration,
+                    probesize
+                );
+                return Ok(probe);
+            }
+            tracing::debug!(
+                "probe_video: escalating probe budget after attempt {} (streams={}, container={})",
+                attempt_idx + 1,
+                probe.streams.len(),
+                probe.container
+            );
+        }
+
+        Self::probe_video_with_limits(file_path, 5_000_000, 5_000_000).await
+    }
+
+    async fn probe_video_with_limits(
+        file_path: &str,
+        analyzeduration: u64,
+        probesize: u64,
+    ) -> Result<ProbeResult> {
         let mut cmd = Command::new("ffmpeg");
-        // CRITICAL: Limit probe size and duration for fast probing
-        // Otherwise ffmpeg may read large portions of the file
-        cmd.args([
-            "-analyzeduration",
-            "5000000", // 5 seconds max analysis
-            "-probesize",
-            "5000000", // 5MB max probe
-        ]);
+        cmd.arg("-analyzeduration").arg(analyzeduration.to_string());
+        cmd.arg("-probesize").arg(probesize.to_string());
         cmd.arg("-i").arg(file_path);
         cmd.stdout(Stdio::null());
         cmd.stderr(Stdio::piped());
 
-        tracing::debug!("Spawning ffmpeg probe command: {:?}", cmd);
+        tracing::debug!(
+            "Spawning ffmpeg probe command with analyzeduration={} probesize={} path={}",
+            analyzeduration,
+            probesize,
+            file_path
+        );
         let mut child = cmd.spawn().context("Failed to spawn ffmpeg")?;
         let stderr = child.stderr.take().context("Failed to capture stderr")?;
         let mut reader = BufReader::new(stderr).lines();
@@ -149,18 +184,16 @@ impl HlsEngine {
         let mut container = "unknown".to_string();
         let mut streams = Vec::new();
 
-        // Regexes matching the original JS parsing logic but adapted for Rust
         let re_duration = Regex::new(r"Duration: (\d{2}):(\d{2}):(\d{2}(\.\d+)?)")?;
-        let re_input = Regex::new(r"Input #0, ([^,]+),")?; // "Input #0, matroska,webm,"
+        let re_input = Regex::new(r"Input #0, ([^,]+),")?;
         let re_stream = Regex::new(r"Stream #\d+:(\d+)(?:\(([^)]+)\))?: (Video|Audio): ([^,]+)")?;
-        // Detailed stream parsing regexes
         let re_dim = Regex::new(r"(\d{3,4})x(\d{3,4})")?;
         let re_fps = Regex::new(r"(\d+(\.\d+)?) fps")?;
         let re_bitrate = Regex::new(r"(\d+) kb/s")?;
+        let re_channels = Regex::new(r"(\d+)\s+channels?")?;
 
         while let Ok(Some(line)) = reader.next_line().await {
             let line = line.trim();
-            // tracing::trace!("ffmpeg stderr: {}", line);
 
             if let Some(caps) = re_input.captures(line) {
                 if let Some(formats) = caps.get(1) {
@@ -186,15 +219,13 @@ impl HlsEngine {
                 let index: usize = caps[1].parse().unwrap_or(0);
                 let lang = caps.get(2).map(|m| m.as_str().to_string());
                 let type_str = caps[3].to_lowercase();
-
-                let raw_codec_desc = caps[4].to_string(); // e.g., "hevc (Main 10)"
+                let raw_codec_desc = caps[4].to_string();
                 let codec_name = raw_codec_desc
                     .split_whitespace()
                     .next()
                     .unwrap_or("unknown")
                     .to_lowercase();
 
-                // Extract profile from parens if present: "hevc (Main 10)" -> "Main 10"
                 let profile = if let Some(start) = raw_codec_desc.find('(') {
                     if let Some(end) = raw_codec_desc.find(')') {
                         if start < end {
@@ -212,28 +243,27 @@ impl HlsEngine {
                 let width = re_dim.captures(line).and_then(|c| c[1].parse().ok());
                 let height = re_dim.captures(line).and_then(|c| c[2].parse().ok());
                 let fps = re_fps.captures(line).and_then(|c| c[1].parse().ok());
+                let channels = parse_audio_channels(line, &re_channels);
                 let bitrate = re_bitrate
                     .captures(line)
                     .and_then(|c| c[1].parse().ok().map(|kb: u64| kb * 1000));
 
-                let is_default = line.contains("(default)");
-
                 streams.push(VideoStream {
                     index,
-                    codec_type: type_str.clone(),
-                    codec_name: codec_name.clone(),
+                    codec_type: type_str,
+                    codec_name,
                     width,
                     height,
+                    channels,
                     bitrate,
                     fps,
                     lang,
-                    is_default,
+                    is_default: line.contains("(default)"),
                     profile,
                 });
             }
         }
 
-        // We don't care about exit status being non-zero because ffmpeg -i without output always errors.
         let status = child.wait().await;
         tracing::debug!("ffmpeg probe finished with status: {:?}", status);
 
@@ -428,8 +458,8 @@ impl HlsEngine {
         // +genpts regenerates presentation timestamps
         cmd.args(["-fflags", "+genpts+discardcorrupt"]);
 
-        // Optimized for fast startup - 10MB/10s is enough for most video
-        cmd.args(["-analyzeduration", "10000000", "-probesize", "10000000"]);
+        // Keep the first segment responsive; the probe path already identifies the streams.
+        cmd.args(["-analyzeduration", "2000000", "-probesize", "2000000"]);
 
         // Hardware acceleration INPUT flags (MUST be before -i)
         if let Some(ref hw) = config.hwaccel {
@@ -585,8 +615,8 @@ impl HlsEngine {
         // Input flags (Global) - match video transcoding approach
         cmd.args(["-fflags", "+genpts+discardcorrupt"]);
 
-        // Optimized for fast startup - 5MB/5s is enough for audio headers
-        cmd.args(["-analyzeduration", "5000000", "-probesize", "5000000"]);
+        // Audio segments need only a small startup budget once the stream is identified.
+        cmd.args(["-analyzeduration", "1000000", "-probesize", "1000000"]);
 
         // HYBRID SEEKING APPROACH (same as video):
         // 1. Fast input seek to get close
@@ -655,4 +685,24 @@ impl HlsEngine {
 
         Ok(TranscodeProcess { inner: child })
     }
+}
+
+fn parse_audio_channels(line: &str, re_channels: &Regex) -> Option<u8> {
+    let line = line.to_lowercase();
+    if line.contains("mono") {
+        return Some(1);
+    }
+    if line.contains("stereo") {
+        return Some(2);
+    }
+    if line.contains("5.1") {
+        return Some(6);
+    }
+    if line.contains("7.1") {
+        return Some(8);
+    }
+    re_channels
+        .captures(&line)
+        .and_then(|caps| caps.get(1))
+        .and_then(|m| m.as_str().parse::<u8>().ok())
 }

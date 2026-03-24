@@ -16,9 +16,49 @@ pub struct ProbeQuery {
     pub media_url: String,
 }
 
+fn stremio_format_name(container: &str) -> String {
+    match container {
+        "matroska" | "webm" => "matroska,webm".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn stremio_probe_json(
+    info_hash: &str,
+    file_idx: usize,
+    probe: &enginefs::hls::ProbeResult,
+) -> serde_json::Value {
+    serde_json::json!({
+        "infoHash": info_hash,
+        "fileIdx": file_idx,
+        "format": {
+            "name": stremio_format_name(&probe.container)
+        },
+        "duration": probe.duration,
+        "streams": probe.streams.iter().map(|stream| {
+            serde_json::json!({
+                "index": stream.index,
+                "track": stream.codec_type,
+                "codec": stream.codec_name,
+                "channels": if stream.codec_type == "audio" { stream.channels.unwrap_or(2) } else { 0 },
+                "width": stream.width,
+                "height": stream.height,
+                "fps": stream.fps,
+                "bitrate": stream.bitrate,
+                "lang": stream.lang,
+                "default": stream.is_default,
+                "profile": stream.profile,
+            })
+        }).collect::<Vec<_>>()
+    })
+}
+
 /// Probe endpoint using mediaURL query parameter (for Stremio compatibility)
 /// GET /hlsv2/probe?mediaURL=http://127.0.0.1:11470/{infoHash}/{fileIdx}?
-pub async fn probe_by_url(Query(params): Query<ProbeQuery>) -> Response {
+pub async fn probe_by_url(
+    State(state): State<AppState>,
+    Query(params): Query<ProbeQuery>,
+) -> Response {
     let start = std::time::Instant::now();
     // Extract infoHash and fileIdx from the mediaURL
     // Format: http://127.0.0.1:11470/{infoHash}/{fileIdx}?
@@ -37,8 +77,18 @@ pub async fn probe_by_url(Query(params): Query<ProbeQuery>) -> Response {
         Err(_) => return (StatusCode::BAD_REQUEST, "Invalid file index").into_response(),
     };
 
-    // Run ffprobe directly on the mediaURL
-    let probe = match enginefs::hls::HlsEngine::probe_video(media_url).await {
+    let engine = match state.engine.get_or_add_engine(info_hash).await {
+        Ok(e) => e,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to load engine: {}", e),
+            )
+                .into_response();
+        }
+    };
+
+    let probe = match engine.get_probe_result(file_idx, media_url).await {
         Ok(p) => p,
         Err(e) => {
             return (
@@ -52,12 +102,7 @@ pub async fn probe_by_url(Query(params): Query<ProbeQuery>) -> Response {
     let elapsed = start.elapsed();
     tracing::info!("Probe request for {} took {:?}", media_url, elapsed);
 
-    Json(serde_json::json!({
-        "infoHash": info_hash,
-        "fileIdx": file_idx,
-        "duration": probe.duration,
-        "streams": probe.streams
-    }))
+    Json(stremio_probe_json(info_hash, file_idx, &probe))
     .into_response()
 }
 
@@ -71,6 +116,7 @@ pub struct HlsQuery {
 /// Master playlist endpoint using mediaURL query parameter (for Stremio compatibility)
 /// GET /hlsv2/{hash}/master.m3u8?mediaURL=http://127.0.0.1:11470/{infoHash}/{fileIdx}?
 pub async fn master_playlist_by_url(
+    State(state): State<AppState>,
     Path(_hash): Path<String>,
     _headers: axum::http::HeaderMap,
     axum::extract::Query(params): axum::extract::Query<HlsQuery>,
@@ -100,8 +146,18 @@ pub async fn master_playlist_by_url(
         }
     };
 
-    // Run ffprobe on the media URL
-    let probe = match enginefs::hls::HlsEngine::probe_video(media_url).await {
+    let engine = match state.engine.get_or_add_engine(info_hash).await {
+        Ok(e) => e,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to load engine: {}", e),
+            )
+                .into_response();
+        }
+    };
+
+    let probe = match engine.get_probe_result(file_idx, media_url).await {
         Ok(p) => p,
         Err(e) => {
             return (
@@ -144,6 +200,7 @@ pub async fn get_master_playlist(
     _headers: axum::http::HeaderMap,
     axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
 ) -> Response {
+    let request_start = std::time::Instant::now();
     let engine = match state.engine.get_or_add_engine(&info_hash).await {
         Ok(e) => e,
         Err(e) => {
@@ -180,6 +237,13 @@ pub async fn get_master_playlist(
         &format!("http://127.0.0.1:{}", port),
         query_str,
         &subtitle_tracks,
+    );
+
+    tracing::info!(
+        "startup: HLS master playlist ready in {:?} (streams={}, subtitles={})",
+        request_start.elapsed(),
+        probe.streams.len(),
+        subtitle_tracks.len()
     );
 
     (
@@ -320,6 +384,7 @@ async fn get_segment(
     segment: String,
     _raw_query: Option<String>,
 ) -> Response {
+    let request_start = std::time::Instant::now();
     let engine = match state.engine.get_or_add_engine(&info_hash).await {
         Ok(e) => e,
         Err(e) => {
@@ -437,6 +502,14 @@ async fn get_segment(
 
     let stream = ReaderStream::new(stdout);
     let body = Body::from_stream(stream);
+
+    tracing::info!(
+        "startup: HLS segment response ready in {:?} (segment={}, start={:.2}s, duration={:.2}s)",
+        request_start.elapsed(),
+        seg_index,
+        start,
+        duration
+    );
 
     // MPEG-TS content type for HLS segments
     (

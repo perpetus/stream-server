@@ -229,11 +229,11 @@ async fn run_server(
         // Stream routes - both patterns for compatibility
         .route(
             "/stream/{infoHash}/{fileIdx}",
-            get(routes::stream::stream_video).head(routes::stream::stream_video),
+            get(routes::stream::stream_video).head(routes::stream::head_stream_video),
         )
         .route(
             "/{infoHash}/{fileIdx}",
-            get(routes::stream::stream_video).head(routes::stream::stream_video),
+            get(routes::stream::stream_video).head(routes::stream::head_stream_video),
         )
         .route(
             "/subtitles.vtt",

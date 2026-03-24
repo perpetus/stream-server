@@ -48,6 +48,7 @@ impl<H: TorrentHandle> Engine<H> {
         file_idx: usize,
         fallback_url: &str,
     ) -> anyhow::Result<crate::hls::ProbeResult> {
+        let startup = Instant::now();
         tracing::info!(
             "[HLS STREAMING] Preparing file {} for HLS playback",
             file_idx
@@ -63,24 +64,33 @@ impl<H: TorrentHandle> Engine<H> {
         }
         drop(cache); // Release lock before potentially slow operations
 
-        // CRITICAL FIX: Prepare the file for streaming BEFORE probing
-        // This ensures the target file is prioritized and initial pieces are downloaded
-        // Without this, multi-file torrents fail because all files start at priority 0
+        let prepare_start = Instant::now();
         self.handle.prepare_file_for_streaming(file_idx).await?;
+        tracing::info!(
+            "startup: prepare_file_for_streaming completed in {:?} for probe file {}",
+            prepare_start.elapsed(),
+            file_idx
+        );
 
-        // CRITICAL: Prefer local file path over HTTP URL to avoid thread starvation
-        // When probing via HTTP loopback (e.g. http://127.0.0.1/stream/...),
-        // ffmpeg waits for HTTP data, but the server can't serve data because
-        // it's blocked waiting for the probe to finish. This creates a deadlock.
-        let probe_path = if let Some(local_path) = self.handle.get_file_path(file_idx).await {
-            tracing::info!("Probing via local file path: {}", local_path);
-            local_path
-        } else {
-            tracing::info!("Probing via HTTP URL (fallback): {}", fallback_url);
-            fallback_url.to_string()
-        };
+        let (probe_path, probe_source) =
+            if let Some(local_path) = self.handle.get_file_path(file_idx).await {
+                tracing::info!("Probing via local file path: {}", local_path);
+                (local_path, "local-file")
+            } else {
+                tracing::info!("Probing via HTTP URL (fallback): {}", fallback_url);
+                (fallback_url.to_string(), "stream-url")
+            };
 
+        let probe_start = Instant::now();
         let res = crate::hls::HlsEngine::probe_video(&probe_path).await?;
+        tracing::info!(
+            "startup: probe finished in {:?} via {} (streams={}, duration={:.2}s, total={:?})",
+            probe_start.elapsed(),
+            probe_source,
+            res.streams.len(),
+            res.duration,
+            startup.elapsed()
+        );
 
         // Re-acquire cache lock to store result
         let mut cache = self.probe_cache.lock().await;
@@ -199,6 +209,7 @@ impl<H: TorrentHandle> Engine<H> {
         start_offset: u64,
         priority: u8,
     ) -> Option<FileHandle<H>> {
+        let startup = Instant::now();
         tracing::info!(
             "[DIRECT STREAMING] Preparing file {} for direct playback (offset={})",
             file_idx,
@@ -236,19 +247,31 @@ impl<H: TorrentHandle> Engine<H> {
             );
         }
 
-        // CRITICAL: Prepare file for streaming BEFORE getting the reader.
-        // This ensures the file has priority and initial pieces are downloaded.
-        // Without this, direct stream requests fail because data isn't available.
+        let prepare_start = Instant::now();
         if let Err(e) = self.handle.prepare_file_for_streaming(file_idx).await {
             tracing::warn!("get_file: prepare_file_for_streaming failed: {}", e);
             // Continue anyway - the file reader will block on pieces as needed
+        } else {
+            tracing::info!(
+                "startup: direct prepare_file_for_streaming completed in {:?} for file {}",
+                prepare_start.elapsed(),
+                file_idx
+            );
         }
 
+        let reader_start = Instant::now();
         let reader = self
             .handle
             .get_file_reader(file_idx, start_offset, priority, bitrate.map(|b| b / 8))
             .await
             .ok()?;
+        tracing::info!(
+            "startup: get_file_reader returned in {:?} for file {} offset {} (total={:?})",
+            reader_start.elapsed(),
+            file_idx,
+            start_offset,
+            startup.elapsed()
+        );
 
         self.active_streams.fetch_add(1, Ordering::SeqCst);
 

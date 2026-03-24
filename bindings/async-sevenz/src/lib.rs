@@ -174,7 +174,7 @@ struct RustWriterContext {
 }
 
 #[no_mangle]
-pub extern "C" fn rust_write_cb(
+pub unsafe extern "C" fn rust_write_cb(
     ctx: *mut c_void,
     buf: *const c_void,
     size: autocxx::c_uint,

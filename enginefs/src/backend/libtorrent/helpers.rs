@@ -5,6 +5,7 @@ use libtorrent_sys::TorrentStatus;
 use std::path::PathBuf;
 
 /// Cached piece data with position metadata for correct offset calculation
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub(super) struct CachedPieceData {
     /// The actual piece data (may be partial for pieces spanning files)
@@ -17,6 +18,7 @@ pub(super) struct CachedPieceData {
 /// Read a piece from disk for prefetch caching
 /// Correctly handles multi-file torrents by accounting for file_offset
 /// Returns CachedPieceData containing both the data and its file-relative start position
+#[allow(dead_code)]
 pub(super) async fn read_piece_from_disk(
     file_path: &PathBuf,
     piece_idx: i32,

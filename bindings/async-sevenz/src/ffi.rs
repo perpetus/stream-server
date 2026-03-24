@@ -23,6 +23,7 @@ include_cpp! {
 }
 
 // Re-export generated items so they are directly in crate::ffi
+#[allow(clippy::module_inception)]
 pub use ffi::*;
 
 pub enum ReaderRequest {
@@ -43,7 +44,7 @@ pub struct RustReaderContext {
 }
 
 #[no_mangle]
-pub extern "C" fn rust_read_cb(
+pub unsafe extern "C" fn rust_read_cb(
     ctx: *mut c_void,
     buf: *mut c_void,
     size: u32,
@@ -70,7 +71,7 @@ pub extern "C" fn rust_read_cb(
 }
 
 #[no_mangle]
-pub extern "C" fn rust_seek_cb(
+pub unsafe extern "C" fn rust_seek_cb(
     ctx: *mut c_void,
     offset: i64,
     origin: u32,
