@@ -1,5 +1,5 @@
-use serde::Deserialize;
 use anyhow::Result;
+use serde::Deserialize;
 
 #[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "lowercase")]
@@ -17,10 +17,10 @@ pub struct NzbFile {
     pub date: Option<u64>,
     #[serde(rename = "@subject")]
     pub subject: String,
-    
+
     #[serde(rename = "groups")]
     pub groups: NzbGroups,
-    
+
     #[serde(rename = "segments")]
     pub segments: NzbSegments,
 }

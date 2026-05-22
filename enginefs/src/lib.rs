@@ -29,14 +29,14 @@ use crate::backend::librqbit::LibrqbitBackend;
 #[cfg(feature = "libtorrent")]
 use crate::backend::libtorrent::LibtorrentBackend;
 
-use crate::backend::{TorrentBackend, TorrentHandle, TorrentSource};
+use crate::backend::{BackendMemoryDiagnostics, TorrentBackend, TorrentHandle, TorrentSource};
 
 const ENGINE_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
 
 static START_TIME: OnceLock<Instant> = OnceLock::new();
 
-fn elapsed_secs() -> i64 {
-    START_TIME.get_or_init(Instant::now).elapsed().as_secs() as i64
+pub fn now_secs() -> u64 {
+    START_TIME.get_or_init(Instant::now).elapsed().as_secs()
 }
 
 const DEFAULT_TRACKERS: &[&str] = &[
@@ -67,6 +67,36 @@ pub struct BackendEngineFS<B: TorrentBackend> {
     active_file: Arc<RwLock<Option<(String, usize)>>>,
     /// Optional disk cache for persisting completed files
     disk_cache: Option<Arc<disk_cache::DiskCacheManager>>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ActiveFileStreamSnapshot {
+    pub info_hash: String,
+    pub file_idx: usize,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ActiveFileSnapshot {
+    pub info_hash: String,
+    pub file_idx: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct StreamActivitySnapshot {
+    pub uptime_secs: u64,
+    pub engine_count: usize,
+    pub engine_active_streams: usize,
+    pub active_streams: HashMap<String, usize>,
+    pub active_file_streams: Vec<ActiveFileStreamSnapshot>,
+    pub active_file: Option<ActiveFileSnapshot>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct EngineDiagnosticsSnapshot {
+    pub uptime_secs: u64,
+    pub streams: StreamActivitySnapshot,
+    pub memory: BackendMemoryDiagnostics,
 }
 
 #[cfg(all(feature = "librqbit", not(feature = "libtorrent")))]
@@ -122,22 +152,82 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
 
         let engines_clone = engines.clone();
         let backend_clone = efs.backend.clone();
+        let active_streams_clone = efs.active_streams.clone();
+        let active_file_streams_clone = efs.active_file_streams.clone();
+        let active_file_clone = efs.active_file.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(60)).await;
                 let mut to_remove = Vec::new();
-                let now = elapsed_secs();
+                let now = now_secs();
 
                 {
                     let read = engines_clone.read().await;
                     for (hash, engine) in read.iter() {
-                        let active = engine
+                        let engine_active_streams = engine
                             .active_streams
                             .load(std::sync::atomic::Ordering::SeqCst);
                         let last = engine
                             .last_accessed
                             .load(std::sync::atomic::Ordering::SeqCst);
-                        if (now - last) as u64 > ENGINE_TIMEOUT.as_secs() && active == 0 {
+                        let age_secs = now.saturating_sub(last);
+                        if age_secs <= ENGINE_TIMEOUT.as_secs() {
+                            continue;
+                        }
+
+                        let active_stream_count = {
+                            let streams = active_streams_clone.read().await;
+                            streams.get(hash).copied().unwrap_or(0)
+                        };
+                        let active_file_stream_count = {
+                            let streams = active_file_streams_clone.read().await;
+                            streams
+                                .iter()
+                                .filter(|((stream_hash, _), _)| stream_hash == hash)
+                                .map(|(_, count)| *count)
+                                .sum::<usize>()
+                        };
+                        let active_file_matches = {
+                            let active = active_file_clone.read().await;
+                            active
+                                .as_ref()
+                                .map(|(stream_hash, _)| stream_hash == hash)
+                                .unwrap_or(false)
+                        };
+
+                        let skip_reason = if engine_active_streams > 0 {
+                            Some("engine_active_streams")
+                        } else if active_stream_count > 0 {
+                            Some("active_streams")
+                        } else if active_file_stream_count > 0 {
+                            Some("active_file_streams")
+                        } else if active_file_matches {
+                            Some("active_file")
+                        } else {
+                            None
+                        };
+
+                        if let Some(skip_reason) = skip_reason {
+                            tracing::debug!(
+                                info_hash = %hash,
+                                age_secs,
+                                engine_active_streams,
+                                active_stream_count,
+                                active_file_stream_count,
+                                removed = false,
+                                skip_reason,
+                                "Skipping inactive-engine cleanup"
+                            );
+                        } else {
+                            tracing::debug!(
+                                info_hash = %hash,
+                                age_secs,
+                                engine_active_streams,
+                                active_stream_count,
+                                active_file_stream_count,
+                                removed = true,
+                                "Scheduling inactive-engine cleanup"
+                            );
                             to_remove.push(hash.clone());
                         }
                     }
@@ -154,9 +244,18 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                     // Actually stop the torrents in the backend session
                     for hash in to_remove {
                         if let Err(e) = backend_clone.remove_torrent(&hash).await {
-                            tracing::warn!(info_hash = %hash, "Failed to remove torrent from backend: {}", e);
+                            tracing::warn!(
+                                info_hash = %hash,
+                                error = %e,
+                                removed = false,
+                                "Failed to remove inactive torrent from backend"
+                            );
                         } else {
-                            tracing::info!(info_hash = %hash, "Removed torrent from backend");
+                            tracing::info!(
+                                info_hash = %hash,
+                                removed = true,
+                                "Removed inactive torrent from backend"
+                            );
                         }
                     }
                 }
@@ -192,9 +291,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
 
         let mut engines = self.engines.write().await;
         if let Some(engine) = engines.get(&info_hash) {
-            engine
-                .last_accessed
-                .store(elapsed_secs(), std::sync::atomic::Ordering::SeqCst);
+            engine.touch();
             return Ok(engine.clone());
         }
 
@@ -205,7 +302,11 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
 
     pub async fn get_engine(&self, info_hash: &str) -> Option<Arc<Engine<B::Handle>>> {
         let engines = self.engines.read().await;
-        engines.get(&info_hash.to_lowercase()).cloned()
+        let engine = engines.get(&info_hash.to_lowercase()).cloned();
+        if let Some(engine) = &engine {
+            engine.touch();
+        }
+        engine
     }
 
     pub async fn get_or_add_engine(&self, info_hash: &str) -> Result<Arc<Engine<B::Handle>>> {
@@ -235,10 +336,69 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         engines.keys().cloned().collect()
     }
 
+    pub async fn stream_activity_snapshot(&self) -> StreamActivitySnapshot {
+        let engines = self.engines.read().await;
+        let engine_count = engines.len();
+        let engine_active_streams = engines
+            .values()
+            .map(|engine| {
+                engine
+                    .active_streams
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            })
+            .sum();
+        drop(engines);
+
+        let active_streams = self.active_streams.read().await.clone();
+        let active_file_streams = self
+            .active_file_streams
+            .read()
+            .await
+            .iter()
+            .map(|((info_hash, file_idx), count)| ActiveFileStreamSnapshot {
+                info_hash: info_hash.clone(),
+                file_idx: *file_idx,
+                count: *count,
+            })
+            .collect();
+        let active_file = self
+            .active_file
+            .read()
+            .await
+            .as_ref()
+            .map(|(info_hash, file_idx)| ActiveFileSnapshot {
+                info_hash: info_hash.clone(),
+                file_idx: *file_idx,
+            });
+
+        StreamActivitySnapshot {
+            uptime_secs: now_secs(),
+            engine_count,
+            engine_active_streams,
+            active_streams,
+            active_file_streams,
+            active_file,
+        }
+    }
+
+    pub async fn diagnostics_snapshot(&self) -> EngineDiagnosticsSnapshot {
+        let streams = self.stream_activity_snapshot().await;
+        let memory = self.backend.memory_diagnostics().await;
+
+        EngineDiagnosticsSnapshot {
+            uptime_secs: now_secs(),
+            streams,
+            memory,
+        }
+    }
+
     /// Called when a stream starts for a torrent file
     /// Implements exclusive single-file downloading - only ONE file downloads at a time
     pub async fn on_stream_start(&self, info_hash: &str, file_idx: usize) {
         let info_hash = info_hash.to_lowercase();
+        if let Some(engine) = self.get_engine(&info_hash).await {
+            engine.touch();
+        }
 
         // Check if a different file was previously active and clear its priorities
         {

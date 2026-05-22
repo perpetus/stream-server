@@ -12,6 +12,7 @@ pub struct AppState {
     pub settings: Arc<RwLock<ServerSettings>>,
     pub settings_path: PathBuf,
     pub config_dir: PathBuf,
+    pub log_dir: PathBuf,
     pub local_index: LocalIndex,
     pub archive_cache: Arc<dashmap::DashMap<String, crate::archives::ArchiveSession>>,
     pub nzb_sessions: Arc<dashmap::DashMap<String, crate::archives::nzb::session::NzbSession>>,
@@ -21,13 +22,30 @@ pub struct AppState {
 impl AppState {
     #[allow(unused)]
     pub fn new(engine: Arc<EngineFS>, settings: ServerSettings, config_dir: PathBuf) -> Self {
-        Self::new_with_shared_settings(engine, Arc::new(RwLock::new(settings)), config_dir)
+        let log_dir = config_dir.join("logs");
+        Self::new_with_shared_settings_and_log_dir(
+            engine,
+            Arc::new(RwLock::new(settings)),
+            config_dir,
+            log_dir,
+        )
     }
 
+    #[allow(unused)]
     pub fn new_with_shared_settings(
         engine: Arc<EngineFS>,
         settings: Arc<RwLock<ServerSettings>>,
         config_dir: PathBuf,
+    ) -> Self {
+        let log_dir = config_dir.join("logs");
+        Self::new_with_shared_settings_and_log_dir(engine, settings, config_dir, log_dir)
+    }
+
+    pub fn new_with_shared_settings_and_log_dir(
+        engine: Arc<EngineFS>,
+        settings: Arc<RwLock<ServerSettings>>,
+        config_dir: PathBuf,
+        log_dir: PathBuf,
     ) -> Self {
         let settings_path = config_dir.join("settings.json");
 
@@ -36,6 +54,7 @@ impl AppState {
             settings,
             settings_path,
             config_dir,
+            log_dir,
             local_index: LocalIndex::new(),
             archive_cache: Arc::new(dashmap::DashMap::new()),
             nzb_sessions: Arc::new(dashmap::DashMap::new()),

@@ -25,6 +25,7 @@ struct TrackerInfo;
 struct AlertInfo;
 struct DhtStats;
 struct SessionStats;
+struct MemoryStorageStats;
 
 // ============================================================================
 // OPAQUE WRAPPER CLASSES
@@ -178,6 +179,9 @@ int32_t get_metadata_received_alert_type();
 int32_t get_hash_failed_alert_type();
 
 // Direct memory piece read — bypasses libtorrent's read_piece()
-rust::Vec<uint8_t> memory_read_piece_direct(int32_t piece);
+rust::Vec<uint8_t> memory_read_piece_direct(rust::Str info_hash, int32_t piece);
+void memory_label_last_unlabeled_storage(rust::Str info_hash);
+void memory_clear_torrent(rust::Str info_hash);
+MemoryStorageStats memory_storage_stats();
 
 } // namespace libtorrent_wrapper

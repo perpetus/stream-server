@@ -23,6 +23,13 @@ fn stremio_format_name(container: &str) -> String {
     }
 }
 
+fn hls_stream_url(port: u16, info_hash: &str, file_idx: usize) -> String {
+    format!(
+        "http://127.0.0.1:{}/stream/{}/{}?enginefs-intent=hls",
+        port, info_hash, file_idx
+    )
+}
+
 fn stremio_probe_json(
     info_hash: &str,
     file_idx: usize,
@@ -102,8 +109,7 @@ pub async fn probe_by_url(
     let elapsed = start.elapsed();
     tracing::info!("Probe request for {} took {:?}", media_url, elapsed);
 
-    Json(stremio_probe_json(info_hash, file_idx, &probe))
-    .into_response()
+    Json(stremio_probe_json(info_hash, file_idx, &probe)).into_response()
 }
 
 /// Query params for HLS endpoints
@@ -217,14 +223,14 @@ pub async fn get_master_playlist(
     state.engine.focus_torrent(&info_hash).await;
 
     let port = 11470;
-    let stream_url = format!(
-        "http://127.0.0.1:{}/stream/{}/{}",
-        port, info_hash, file_idx
-    );
+    let stream_url = hls_stream_url(port, &info_hash, file_idx);
 
     let probe = match engine.get_probe_result(file_idx, &stream_url).await {
         Ok(p) => p,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => {
+            state.engine.on_stream_end(&info_hash, file_idx).await;
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
     };
 
     let query_str = raw_query.as_deref().unwrap_or("");
@@ -245,6 +251,8 @@ pub async fn get_master_playlist(
         probe.streams.len(),
         subtitle_tracks.len()
     );
+
+    state.engine.on_stream_end(&info_hash, file_idx).await;
 
     (
         [
@@ -329,10 +337,7 @@ async fn get_stream_playlist(
     };
 
     let port = 11470;
-    let stream_url = format!(
-        "http://127.0.0.1:{}/stream/{}/{}",
-        port, info_hash, file_idx
-    );
+    let stream_url = hls_stream_url(port, &info_hash, file_idx);
     let probe = match engine.get_probe_result(file_idx, &stream_url).await {
         Ok(p) => p,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -417,10 +422,7 @@ async fn get_segment(
     };
 
     let port = 11470;
-    let stream_url = format!(
-        "http://127.0.0.1:{}/stream/{}/{}",
-        port, info_hash, file_idx
-    );
+    let stream_url = hls_stream_url(port, &info_hash, file_idx);
 
     // Get local file path for transcoding (HTTP seeking is unreliable)
     let transcode_input_path = engine
@@ -535,10 +537,7 @@ pub async fn get_probe(
     };
 
     let port = 11470;
-    let stream_url = format!(
-        "http://127.0.0.1:{}/stream/{}/{}",
-        port, info_hash, file_idx
-    );
+    let stream_url = hls_stream_url(port, &info_hash, file_idx);
     let probe = match engine.get_probe_result(file_idx, &stream_url).await {
         Ok(p) => p,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -556,10 +555,7 @@ pub async fn get_tracks(
     };
 
     let port = 11470;
-    let stream_url = format!(
-        "http://127.0.0.1:{}/stream/{}/{}",
-        port, info_hash, file_idx
-    );
+    let stream_url = hls_stream_url(port, &info_hash, file_idx);
     let probe = match engine.get_probe_result(file_idx, &stream_url).await {
         Ok(p) => p,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),

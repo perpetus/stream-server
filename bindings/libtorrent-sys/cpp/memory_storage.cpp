@@ -9,6 +9,7 @@
 #include <openssl/sha.h>
 
 #include <cstring>
+#include <algorithm>
 
 #include "rust/cxx.h"
 #include "libtorrent-sys/src/lib.rs.h"
@@ -84,6 +85,27 @@ memory_disk_io::get_all_storages() {
     result.push_back(st);
   }
   return result;
+}
+
+void memory_disk_io::label_last_unlabeled_storage(std::string const& info_hash) {
+  std::lock_guard<std::mutex> lock(m_mutex);
+  for (auto it = m_torrents.rbegin(); it != m_torrents.rend(); ++it) {
+    if (it->second && it->second->info_hash.empty()) {
+      it->second->info_hash = info_hash;
+      return;
+    }
+  }
+}
+
+void memory_disk_io::clear_torrent(std::string const& info_hash) {
+  std::lock_guard<std::mutex> lock(m_mutex);
+  for (auto it = m_torrents.begin(); it != m_torrents.end();) {
+    if (it->second && it->second->info_hash == info_hash) {
+      it = m_torrents.erase(it);
+    } else {
+      ++it;
+    }
+  }
 }
 
 // ============================================================================
@@ -387,13 +409,15 @@ memory_disk_io_constructor(lt::io_context &ioc,
   return std::make_unique<memory_disk_io>(ioc, counters);
 }
 
-rust::Vec<uint8_t> memory_read_piece_direct(int32_t piece) {
+rust::Vec<uint8_t> memory_read_piece_direct(rust::Str info_hash, int32_t piece) {
   rust::Vec<uint8_t> result;
+  std::string requested_hash(info_hash.data(), info_hash.size());
   std::lock_guard<std::mutex> lock(g_dio_mutex);
   if (!g_memory_disk_io) return result;
 
   auto storages = g_memory_disk_io->get_all_storages();
   for (auto& st : storages) {
+    if (!st || st->info_hash != requested_hash) continue;
     std::lock_guard<std::mutex> slock(st->mutex);
     auto it = st->pieces.find(lt::piece_index_t(piece));
     if (it != st->pieces.end()) {
@@ -410,6 +434,56 @@ rust::Vec<uint8_t> memory_read_piece_direct(int32_t piece) {
     }
   }
   return result;
+}
+
+void memory_label_last_unlabeled_storage(rust::Str info_hash) {
+  std::string hash(info_hash.data(), info_hash.size());
+  std::lock_guard<std::mutex> lock(g_dio_mutex);
+  if (g_memory_disk_io) {
+    g_memory_disk_io->label_last_unlabeled_storage(hash);
+  }
+}
+
+void memory_clear_torrent(rust::Str info_hash) {
+  std::string hash(info_hash.data(), info_hash.size());
+  std::lock_guard<std::mutex> lock(g_dio_mutex);
+  if (g_memory_disk_io) {
+    g_memory_disk_io->clear_torrent(hash);
+  }
+}
+
+MemoryStorageStats memory_storage_stats() {
+  MemoryStorageStats stats;
+  stats.total_bytes = 0;
+  stats.total_pieces = 0;
+  stats.total_read_bytes = 0;
+  stats.total_write_bytes = 0;
+  std::lock_guard<std::mutex> lock(g_dio_mutex);
+  if (!g_memory_disk_io) return stats;
+
+  stats.total_read_bytes = static_cast<uint64_t>(g_memory_disk_io->m_total_read.load());
+  stats.total_write_bytes = static_cast<uint64_t>(g_memory_disk_io->m_total_write.load());
+
+  auto storages = g_memory_disk_io->get_all_storages();
+  for (auto& st : storages) {
+    if (!st) continue;
+    MemoryStorageTorrentStats torrent_stats;
+    torrent_stats.info_hash = rust::String(st->info_hash);
+    {
+      std::lock_guard<std::mutex> slock(st->mutex);
+      torrent_stats.pieces = static_cast<uint64_t>(st->pieces.size());
+      uint64_t bytes = 0;
+      for (auto const& [piece, data] : st->pieces) {
+        bytes += static_cast<uint64_t>(data.size());
+      }
+      torrent_stats.bytes = bytes;
+    }
+    stats.total_bytes += torrent_stats.bytes;
+    stats.total_pieces += torrent_stats.pieces;
+    stats.torrents.push_back(std::move(torrent_stats));
+  }
+
+  return stats;
 }
 
 } // namespace libtorrent_wrapper

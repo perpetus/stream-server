@@ -20,6 +20,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod archives;
 mod cache_cleaner;
+mod diagnostics;
 mod ffmpeg_setup;
 mod local_addon;
 mod routes;
@@ -42,37 +43,72 @@ async fn run_server(
         (None, None)
     };
 
+    // Determine paths before logging so file diagnostics always land in the config directory.
+    let config_dir = dirs::config_dir()
+        .ok_or_else(|| anyhow::anyhow!("Could not find config directory"))?
+        .join("stremio-server");
+    let cache_dir = dirs::cache_dir()
+        .ok_or_else(|| anyhow::anyhow!("Could not find cache directory"))?
+        .join("stremio-server");
+    let log_dir = config_dir.join("logs");
+
+    // Ensure directories exist
+    tokio::fs::create_dir_all(&config_dir).await?;
+    tokio::fs::create_dir_all(&cache_dir).await?;
+    tokio::fs::create_dir_all(&log_dir).await?;
+
+    diagnostics::logging::init_process_start();
+    diagnostics::logging::install_panic_hook();
+
+    let log_writers = diagnostics::logging::open_log_writers(&log_dir)?;
+    let human_log_path = log_writers.human_path.clone();
+    let archive_log_path = log_writers.archive_path.clone();
+    let json_log_path = log_writers.json_path.clone();
+    let human_writer = log_writers.human_writer;
+    let archive_writer = log_writers.archive_writer;
+    let json_writer = log_writers.json_writer;
+    let guards = log_writers.guards;
+
     let registry = tracing_subscriber::registry().with(
         tracing_subscriber::EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| "server=info,tower_http=info,enginefs=info".into()),
     );
+    let human_file_layer = tracing_subscriber::fmt::layer()
+        .with_writer(human_writer)
+        .with_ansi(false);
+    let archive_file_layer = tracing_subscriber::fmt::layer()
+        .with_writer(archive_writer)
+        .with_ansi(false);
+    let json_file_layer = tracing_subscriber::fmt::layer()
+        .json()
+        .with_writer(json_writer)
+        .with_ansi(false);
 
-    if let Some(layer) = tui_log_layer {
-        registry.with(layer).init();
+    let init_result = if let Some(layer) = tui_log_layer {
+        registry
+            .with(human_file_layer)
+            .with(archive_file_layer)
+            .with(json_file_layer)
+            .with(layer)
+            .try_init()
     } else if std::io::stdout().is_terminal() {
         // Console logging when running in terminal
-        registry.with(tracing_subscriber::fmt::layer()).init();
-    } else {
-        // File logging when running without terminal (e.g., from Explorer/tray)
-        let log_dir = dirs::config_dir()
-            .map(|d| d.join("stremio-server"))
-            .unwrap_or_else(|| std::path::PathBuf::from("."));
-
-        // Create log filename with timestamp
-        let now = chrono::Local::now();
-        let log_filename = format!("server_{}.log", now.format("%Y-%m-%d_%H-%M-%S"));
-        let log_path = log_dir.join(&log_filename);
-        let file = std::fs::File::create(&log_path).expect("Failed to create log file");
-        let (non_blocking, _guard) = tracing_appender::non_blocking(file);
-        // Leak the guard to keep the writer alive for the program lifetime
-        std::mem::forget(_guard);
         registry
-            .with(
-                tracing_subscriber::fmt::layer()
-                    .with_writer(non_blocking)
-                    .with_ansi(false),
-            )
-            .init();
+            .with(human_file_layer)
+            .with(archive_file_layer)
+            .with(json_file_layer)
+            .with(tracing_subscriber::fmt::layer())
+            .try_init()
+    } else {
+        registry
+            .with(human_file_layer)
+            .with(archive_file_layer)
+            .with(json_file_layer)
+            .try_init()
+    };
+
+    if init_result.is_ok() {
+        diagnostics::logging::store_log_guards(guards);
     }
 
     // Check/Install FFmpeg on Windows
@@ -81,20 +117,18 @@ async fn run_server(
         tracing::warn!("FFmpeg setup failed: {}", e);
     }
 
-    // Determine paths
-    let config_dir = dirs::config_dir()
-        .ok_or_else(|| anyhow::anyhow!("Could not find config directory"))?
-        .join("stremio-server");
-    let cache_dir = dirs::cache_dir()
-        .ok_or_else(|| anyhow::anyhow!("Could not find cache directory"))?
-        .join("stremio-server");
-
-    // Ensure directories exist
-    tokio::fs::create_dir_all(&config_dir).await?;
-    tokio::fs::create_dir_all(&cache_dir).await?;
-
     tracing::info!("Config Dir: {:?}", config_dir);
     tracing::info!("Cache/Download Dir: {:?}", cache_dir);
+    tracing::info!("Log Dir: {:?}", log_dir);
+    diagnostics::logging::install_native_crash_handler(&log_dir);
+    diagnostics::logging::log_startup_context(
+        &config_dir,
+        &cache_dir,
+        &log_dir,
+        &human_log_path,
+        &archive_log_path,
+        &json_log_path,
+    );
 
     // Load settings from disk or use defaults
     // We ideally want settings in config_dir
@@ -144,20 +178,28 @@ async fn run_server(
     let engine = Arc::new(engine_fs);
 
     // Create state with the shared settings Arc
-    let state =
-        AppState::new_with_shared_settings(engine, settings_arc.clone(), config_dir.clone());
+    let state = AppState::new_with_shared_settings_and_log_dir(
+        engine,
+        settings_arc.clone(),
+        config_dir.clone(),
+        log_dir.clone(),
+    );
 
     // Start Cache Cleaner
     // Start Cache Cleaner
     cache_cleaner::start(Arc::new(state.clone()));
+    diagnostics::start_memory_sampler(state.clone());
 
     // Start SSDP Discovery
-    tokio::spawn(crate::ssdp::start_discovery(state.devices.clone()));
+    diagnostics::logging::spawn_logged(
+        "ssdp-discovery",
+        crate::ssdp::start_discovery(state.devices.clone()),
+    );
 
     // Start tray stats collection if tray is active
     if let Some(stats) = tray_stats {
         let engine_clone = state.engine.clone();
-        tokio::spawn(async move {
+        diagnostics::logging::spawn_logged("tray-stats", async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 let all_stats = engine_clone.get_all_statistics().await;
@@ -204,6 +246,9 @@ async fn run_server(
         .route("/heartbeat", get(routes::system::heartbeat))
         .route("/stats.json", get(routes::system::get_stats))
         .route("/network-info", get(routes::system::network_info))
+        .route("/diagnostics/memory", get(diagnostics::memory))
+        .route("/diagnostics/streams", get(diagnostics::streams))
+        .route("/diagnostics/crashes", get(diagnostics::crashes))
         .route(
             "/settings",
             get(routes::system::get_settings).post(routes::system::set_settings),
@@ -340,9 +385,9 @@ async fn run_server(
                 .await?;
 
         let https_addr = SocketAddr::from(([0, 0, 0, 0], 12470));
-        tokio::spawn(async move {
+        diagnostics::logging::spawn_logged("https-server", async move {
             if let Err(e) = axum_server::bind_rustls(https_addr, https_config)
-                .serve(https_app.into_make_service())
+                .serve(https_app.into_make_service_with_connect_info::<SocketAddr>())
                 .await
             {
                 tracing::error!("HTTPS server error: {}", e);
@@ -355,9 +400,12 @@ async fn run_server(
         );
     }
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown)
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await?;
 
     Ok(())
 }
@@ -472,7 +520,7 @@ fn main() -> anyhow::Result<()> {
                         tray::open_stremio_web();
                     }
                     tray::UserEvent::OpenLogs => {
-                        tray::open_config_folder();
+                        tray::open_log_folder();
                     }
                     tray::UserEvent::Restart => {
                         // Signal shutdown to current instance; loop will restart it since keep_running is true

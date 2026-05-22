@@ -1,18 +1,16 @@
 use crate::state::AppState;
 use axum::{
+    Json, Router,
     extract::{Path, Query},
-    http::{header, StatusCode},
+    http::{StatusCode, header},
     response::{IntoResponse, Response},
     routing::get,
-    Json, Router,
 };
 use serde::Deserialize;
 use serde_json::json;
 use std::process::Stdio;
 use tokio::process::Command;
 use tokio_util::io::ReaderStream;
-
-
 
 #[derive(Debug, Deserialize)]
 pub struct TranscodeParams {
@@ -114,7 +112,7 @@ pub async fn transcode(Query(params): Query<TranscodeParams>) -> Response {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to spawn ffmpeg: {}", e),
             )
-                .into_response()
+                .into_response();
         }
     };
 

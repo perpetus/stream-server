@@ -114,12 +114,23 @@ fn detect_format(content: &str) -> SubFormat {
 fn parse_srt(content: &str) -> Vec<SubtitleCue> {
     let mut cues = Vec::new();
 
-    // SRT block pattern: index, timestamp line, text lines
-    let block_pattern = Regex::new(
-        r"(?m)^\d+\s*\r?\n(\d{2}):(\d{2}):(\d{2}),(\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2}),(\d{3})\s*\r?\n([\s\S]*?)(?=\r?\n\r?\n\d+\s*\r?\n|\r?\n\r?\n*$|$)"
-    ).unwrap();
+    let timestamp_pattern =
+        Regex::new(r"^\s*(\d{2}):(\d{2}):(\d{2}),(\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2}),(\d{3})")
+            .unwrap();
+    let normalized = content.replace("\r\n", "\n").replace('\r', "\n");
 
-    for caps in block_pattern.captures_iter(content) {
+    for block in normalized.split("\n\n") {
+        let mut lines = block.lines();
+        let Some(_) = lines.next() else {
+            continue;
+        };
+        let Some(timestamp_line) = lines.next() else {
+            continue;
+        };
+        let Some(caps) = timestamp_pattern.captures(timestamp_line) else {
+            continue;
+        };
+
         let start_ms = parse_time_components(
             caps.get(1).map(|m| m.as_str()).unwrap_or("0"),
             caps.get(2).map(|m| m.as_str()).unwrap_or("0"),
@@ -134,7 +145,8 @@ fn parse_srt(content: &str) -> Vec<SubtitleCue> {
             caps.get(8).map(|m| m.as_str()).unwrap_or("0"),
         );
 
-        let text = caps.get(9).map(|m| m.as_str()).unwrap_or("").trim();
+        let text = lines.collect::<Vec<_>>().join("\n");
+        let text = text.trim();
 
         // Parse inline SRT styling tags
         let (clean_text, style) = parse_srt_styling(text);
@@ -195,12 +207,21 @@ fn parse_ass(content: &str) -> Vec<SubtitleCue> {
 fn parse_vtt(content: &str) -> Vec<SubtitleCue> {
     let mut cues = Vec::new();
 
-    // VTT timestamp pattern
     let cue_pattern = Regex::new(
-        r"(\d{2}):(\d{2}):(\d{2})\.(\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2})\.(\d{3})[^\n]*\n([\s\S]*?)(?=\n\n|\n*$)"
-    ).unwrap();
+        r"^\s*(\d{2}):(\d{2}):(\d{2})\.(\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2})\.(\d{3})",
+    )
+    .unwrap();
+    let normalized = content.replace("\r\n", "\n").replace('\r', "\n");
 
-    for caps in cue_pattern.captures_iter(content) {
+    for block in normalized.split("\n\n") {
+        let lines = block.lines().collect::<Vec<_>>();
+        let Some(timestamp_idx) = lines.iter().position(|line| line.contains("-->")) else {
+            continue;
+        };
+        let Some(caps) = cue_pattern.captures(lines[timestamp_idx]) else {
+            continue;
+        };
+
         let start_ms = parse_time_components(
             caps.get(1).map(|m| m.as_str()).unwrap_or("0"),
             caps.get(2).map(|m| m.as_str()).unwrap_or("0"),
@@ -215,10 +236,12 @@ fn parse_vtt(content: &str) -> Vec<SubtitleCue> {
             caps.get(8).map(|m| m.as_str()).unwrap_or("0"),
         );
 
-        let text = caps
-            .get(9)
-            .map(|m| m.as_str())
-            .unwrap_or("")
+        let text = lines
+            .iter()
+            .skip(timestamp_idx + 1)
+            .copied()
+            .collect::<Vec<_>>()
+            .join("\n")
             .trim()
             .to_string();
 

@@ -289,6 +289,22 @@ mod ffi {
         dht_nodes: i32,
     }
 
+    #[derive(Debug, Clone)]
+    struct MemoryStorageTorrentStats {
+        info_hash: String,
+        bytes: u64,
+        pieces: u64,
+    }
+
+    #[derive(Debug, Clone)]
+    struct MemoryStorageStats {
+        total_bytes: u64,
+        total_pieces: u64,
+        total_read_bytes: u64,
+        total_write_bytes: u64,
+        torrents: Vec<MemoryStorageTorrentStats>,
+    }
+
     // ============================================================================
     // EXTERN C++ - Functions implemented in C++
     // ============================================================================
@@ -471,7 +487,10 @@ mod ffi {
 
         /// Read piece data directly from memory storage, bypassing libtorrent's
         /// internal read_piece() which fails with custom disk interfaces.
-        fn memory_read_piece_direct(piece: i32) -> Vec<u8>;
+        fn memory_read_piece_direct(info_hash: &str, piece: i32) -> Vec<u8>;
+        fn memory_label_last_unlabeled_storage(info_hash: &str);
+        fn memory_clear_torrent(info_hash: &str);
+        fn memory_storage_stats() -> MemoryStorageStats;
     }
 }
 
@@ -695,6 +714,16 @@ impl LibtorrentHandle {
     /// Set piece priority (0=skip, 1=low, 4=normal, 7=highest)
     pub fn set_piece_priority(&mut self, piece: i32, priority: i32) {
         ffi::handle_set_piece_priority(self.inner.pin_mut(), piece, priority)
+    }
+
+    /// Current availability count for each piece.
+    pub fn piece_availability(&self) -> Vec<i32> {
+        ffi::handle_get_piece_availability(&self.inner)
+    }
+
+    /// Current libtorrent priority for each piece.
+    pub fn piece_priorities(&self) -> Vec<i32> {
+        ffi::handle_get_piece_priorities(&self.inner)
     }
 
     /// Check if piece is downloaded

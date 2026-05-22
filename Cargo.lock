@@ -188,7 +188,7 @@ dependencies = [
 
 [[package]]
 name = "async-rar"
-version = "0.1.0"
+version = "0.1.1-beta.2"
 dependencies = [
  "autocxx",
  "autocxx-build",
@@ -202,7 +202,7 @@ dependencies = [
 
 [[package]]
 name = "async-sevenz"
-version = "0.1.0"
+version = "0.1.1-beta.2"
 dependencies = [
  "autocxx",
  "autocxx-build",
@@ -1828,7 +1828,7 @@ dependencies = [
 
 [[package]]
 name = "enginefs"
-version = "0.1.0"
+version = "0.1.1-beta.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3755,7 +3755,7 @@ dependencies = [
 
 [[package]]
 name = "libtorrent-sys"
-version = "0.1.0"
+version = "0.1.1-beta.2"
 dependencies = [
  "cxx",
  "cxx-build",
@@ -4200,6 +4200,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e0826a989adedc2a244799e823aece04662b66609d96af8dff7ac6df9a8925d"
 
 [[package]]
+name = "ntapi"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3b335231dfd352ffb0f8017f3b6027a4917f7df785ea2143d8af2adc66980ae"
+dependencies = [
+ "winapi",
+]
+
+[[package]]
 name = "nu-ansi-term"
 version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4398,6 +4407,16 @@ dependencies = [
  "bitflags 2.10.0",
  "block2",
  "objc2",
+ "objc2-core-foundation",
+]
+
+[[package]]
+name = "objc2-io-kit"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33fafba39597d6dc1fb709123dfa8289d39406734be322956a69f0931c73bb15"
+dependencies = [
+ "libc",
  "objc2-core-foundation",
 ]
 
@@ -5835,7 +5854,7 @@ dependencies = [
 
 [[package]]
 name = "server"
-version = "0.1.0"
+version = "0.1.1-beta.2"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -5877,6 +5896,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "ssdp-client",
+ "sysinfo",
  "tao",
  "tar",
  "tempfile",
@@ -6171,6 +6191,20 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.111",
+]
+
+[[package]]
+name = "sysinfo"
+version = "0.37.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "16607d5caffd1c07ce073528f9ed972d88db15dd44023fa57142963be3feb11f"
+dependencies = [
+ "libc",
+ "memchr",
+ "ntapi",
+ "objc2-core-foundation",
+ "objc2-io-kit",
+ "windows 0.61.3",
 ]
 
 [[package]]
@@ -6742,6 +6776,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tracing-serde"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "704b1aeb7be0d0a84fc9828cae51dab5970fee5088f83d1dd7ee6f6246fc6ff1"
+dependencies = [
+ "serde",
+ "tracing-core",
+]
+
+[[package]]
 name = "tracing-subscriber"
 version = "0.3.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6751,12 +6795,15 @@ dependencies = [
  "nu-ansi-term",
  "once_cell",
  "regex-automata",
+ "serde",
+ "serde_json",
  "sharded-slab",
  "smallvec",
  "thread_local",
  "tracing",
  "tracing-core",
  "tracing-log",
+ "tracing-serde",
 ]
 
 [[package]]

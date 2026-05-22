@@ -1,10 +1,10 @@
-pub mod parser;
 pub mod nntp;
+pub mod parser;
 pub mod session;
 pub mod stream;
 
 use crate::archives::{ArchiveEntry, ArchiveReader, AsyncSeekableReader};
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use std::path::PathBuf;
 
 pub struct NzbHandler {
@@ -27,23 +27,29 @@ impl ArchiveReader for NzbHandler {
         // Read file content
         let content = tokio::fs::read_to_string(&self.path).await?;
         let nzb = parser::parse_nzb_xml(&content)?;
-        
+
         // Convert nzb files to archive entries
-        let entries = nzb.files.into_iter().map(|f| {
-            // Determine filename from subject? 
-            // Subject often looks like: "Category - Some.File.Name.mkv yEnc" or "File.Name.rar (1/10)"
-            // For now, use subject as path, or try to parse generic filename.
-            ArchiveEntry {
-                path: f.subject.clone(), // TODO: subject parsing
-                size: f.segments.segments.iter().map(|s| s.bytes).sum(),
-                is_dir: false,
-            }
-        }).collect();
-        
+        let entries = nzb
+            .files
+            .into_iter()
+            .map(|f| {
+                // Determine filename from subject?
+                // Subject often looks like: "Category - Some.File.Name.mkv yEnc" or "File.Name.rar (1/10)"
+                // For now, use subject as path, or try to parse generic filename.
+                ArchiveEntry {
+                    path: f.subject.clone(), // TODO: subject parsing
+                    size: f.segments.segments.iter().map(|s| s.bytes).sum(),
+                    is_dir: false,
+                }
+            })
+            .collect();
+
         Ok(entries)
     }
 
     async fn open_file(&self, _path: &str) -> Result<Box<dyn AsyncSeekableReader>> {
-        Err(anyhow!("Direct NZB file streaming from disk not fully implemented (requires NNTP connection details)"))
+        Err(anyhow!(
+            "Direct NZB file streaming from disk not fully implemented (requires NNTP connection details)"
+        ))
     }
 }

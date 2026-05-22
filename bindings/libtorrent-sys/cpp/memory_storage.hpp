@@ -19,6 +19,7 @@
 #include <map>
 #include <mutex>
 #include <memory>
+#include <string>
 #include <vector>
 
 namespace lt = libtorrent;
@@ -30,6 +31,7 @@ struct memory_torrent_storage {
     lt::file_storage files;
     int piece_length = 0;
     int num_pieces = 0;
+    std::string info_hash;
     
     // Map: piece_index -> piece_data (full piece buffer)
     std::map<lt::piece_index_t, std::vector<char>> pieces;
@@ -110,6 +112,8 @@ private:
 
 public:
     std::vector<std::shared_ptr<memory_torrent_storage>> get_all_storages();
+    void label_last_unlabeled_storage(std::string const& info_hash);
+    void clear_torrent(std::string const& info_hash);
     
     lt::io_context& m_ioc;
     lt::counters& m_counters;
@@ -131,6 +135,8 @@ std::unique_ptr<lt::disk_interface> memory_disk_io_constructor(
 
 // Direct memory piece read — bypasses libtorrent's read_piece() which
 // fails with custom disk interfaces due to slot list validation.
-rust::Vec<uint8_t> memory_read_piece_direct(int32_t piece);
+rust::Vec<uint8_t> memory_read_piece_direct(rust::Str info_hash, int32_t piece);
+void memory_label_last_unlabeled_storage(rust::Str info_hash);
+void memory_clear_torrent(rust::Str info_hash);
 
 } // namespace libtorrent_wrapper

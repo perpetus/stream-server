@@ -1,9 +1,11 @@
-use crate::backend::{EngineStats, PeerStat, SubtitleTrack, TorrentHandle};
+use crate::backend::{
+    EngineStats, PeerStat, SubtitleTrack, TorrentHandle, priorities::PlaybackIntent,
+};
 use crate::cache::DataCache;
 use anyhow::Context;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 use tokio::io::AsyncSeekExt;
 use tokio::sync::Mutex;
@@ -20,7 +22,7 @@ pub struct SeriesInfo {
 pub struct Engine<H: TorrentHandle> {
     pub info_hash: String,
     pub handle: H,
-    pub last_accessed: AtomicI64,
+    pub last_accessed: AtomicU64,
     pub active_streams: Arc<AtomicUsize>,
     pub probe_cache: Mutex<HashMap<usize, crate::hls::ProbeResult>>,
     pub data_cache: DataCache,
@@ -28,12 +30,10 @@ pub struct Engine<H: TorrentHandle> {
 
 impl<H: TorrentHandle> Engine<H> {
     pub fn new_with_handle(handle: H, info_hash: &str) -> Self {
-        let now_unix_timestamp = Instant::now().elapsed().as_secs() as i64;
-
         Self {
             info_hash: info_hash.to_string(),
             handle,
-            last_accessed: AtomicI64::new(now_unix_timestamp),
+            last_accessed: AtomicU64::new(crate::now_secs()),
             active_streams: Arc::new(AtomicUsize::new(0)),
             probe_cache: Mutex::new(HashMap::new()),
             data_cache: moka::future::Cache::builder()
@@ -41,6 +41,11 @@ impl<H: TorrentHandle> Engine<H> {
                 .max_capacity(64 * 1024 * 1024) // 64MB cache per engine
                 .build(),
         }
+    }
+
+    pub fn touch(&self) {
+        self.last_accessed
+            .store(crate::now_secs(), Ordering::SeqCst);
     }
 
     pub async fn get_probe_result(
@@ -169,8 +174,7 @@ impl<H: TorrentHandle> Engine<H> {
     }
 
     pub async fn get_statistics(&self) -> EngineStats {
-        self.last_accessed
-            .store(Instant::now().elapsed().as_secs() as i64, Ordering::SeqCst);
+        self.touch();
         let mut stats = self.handle.stats().await;
 
         let guessed_file_idx = self.guess_file_index(None).await.unwrap_or(0);
@@ -209,15 +213,35 @@ impl<H: TorrentHandle> Engine<H> {
         start_offset: u64,
         priority: u8,
     ) -> Option<FileHandle<H>> {
+        let intent = if priority == 255 {
+            PlaybackIntent::InternalProbe
+        } else if priority == 0 {
+            PlaybackIntent::Background
+        } else if start_offset == 0 {
+            PlaybackIntent::DirectInitial
+        } else {
+            PlaybackIntent::DirectSeek
+        };
+        self.get_file_with_intent(file_idx, start_offset, priority, intent)
+            .await
+    }
+
+    pub async fn get_file_with_intent(
+        self: &Arc<Self>,
+        file_idx: usize,
+        start_offset: u64,
+        priority: u8,
+        intent: PlaybackIntent,
+    ) -> Option<FileHandle<H>> {
         let startup = Instant::now();
         tracing::info!(
-            "[DIRECT STREAMING] Preparing file {} for direct playback (offset={})",
+            "[STREAMING] Preparing file {} for playback (offset={}, intent={:?})",
             file_idx,
-            start_offset
+            start_offset,
+            intent
         );
 
-        self.last_accessed
-            .store(Instant::now().elapsed().as_secs() as i64, Ordering::SeqCst);
+        self.touch();
 
         let files = self.handle.get_files().await;
         if file_idx >= files.len() {
@@ -247,22 +271,43 @@ impl<H: TorrentHandle> Engine<H> {
             );
         }
 
-        let prepare_start = Instant::now();
-        if let Err(e) = self.handle.prepare_file_for_streaming(file_idx).await {
-            tracing::warn!("get_file: prepare_file_for_streaming failed: {}", e);
-            // Continue anyway - the file reader will block on pieces as needed
+        if priority != 255
+            && start_offset == 0
+            && matches!(
+                intent,
+                PlaybackIntent::DirectInitial | PlaybackIntent::HlsInitial
+            )
+        {
+            let prepare_start = Instant::now();
+            if let Err(e) = self.handle.prepare_file_for_streaming(file_idx).await {
+                tracing::warn!("get_file: prepare_file_for_streaming failed: {}", e);
+                // Continue anyway - the file reader will block on pieces as needed
+            } else {
+                tracing::info!(
+                    "startup: direct prepare_file_for_streaming completed in {:?} for file {}",
+                    prepare_start.elapsed(),
+                    file_idx
+                );
+            }
         } else {
-            tracing::info!(
-                "startup: direct prepare_file_for_streaming completed in {:?} for file {}",
-                prepare_start.elapsed(),
-                file_idx
+            tracing::debug!(
+                "get_file: skipping prepare_file_for_streaming for file {} offset {} priority {}",
+                file_idx,
+                start_offset,
+                priority
             );
         }
 
         let reader_start = Instant::now();
         let reader = self
             .handle
-            .get_file_reader(file_idx, start_offset, priority, bitrate.map(|b| b / 8))
+            .get_file_reader(
+                file_idx,
+                start_offset,
+                priority,
+                bitrate.map(|b| b / 8),
+                intent,
+            )
             .await
             .ok()?;
         tracing::info!(
@@ -287,7 +332,7 @@ impl<H: TorrentHandle> Engine<H> {
         }
         let file_len = files[file_idx].length;
 
-        let file_opt = self.get_file(file_idx, 0, 0).await;
+        let file_opt = self.get_file(file_idx, 0, 255).await;
         let mut file = file_opt.context("failed to get file handle")?;
 
         let chunk_size = 65536u64;

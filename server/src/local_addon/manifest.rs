@@ -45,16 +45,28 @@ pub fn get_manifest() -> Manifest {
             Resource::Short("catalog".to_string()),
             Resource::Full(ResourceObject {
                 name: "meta".to_string(),
-                types: vec!["movie".to_string(), "series".to_string(), "other".to_string()],
+                types: vec![
+                    "movie".to_string(),
+                    "series".to_string(),
+                    "other".to_string(),
+                ],
                 id_prefixes: Some(vec!["local:".to_string(), "bt:".to_string()]),
             }),
             Resource::Full(ResourceObject {
                 name: "stream".to_string(),
-                types: vec!["movie".to_string(), "series".to_string(), "other".to_string()],
+                types: vec![
+                    "movie".to_string(),
+                    "series".to_string(),
+                    "other".to_string(),
+                ],
                 id_prefixes: Some(vec!["local:".to_string(), "bt:".to_string()]),
             }),
         ],
-        types: vec!["movie".to_string(), "series".to_string(), "other".to_string()],
+        types: vec![
+            "movie".to_string(),
+            "series".to_string(),
+            "other".to_string(),
+        ],
         catalogs: vec![
             Catalog {
                 r#type: "movie".to_string(),

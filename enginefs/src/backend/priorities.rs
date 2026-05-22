@@ -1,15 +1,21 @@
 use serde::{Deserialize, Serialize};
 
-/// Minimum bytes needed before playback can start
-/// Used to calculate initial piece window size
-/// Keep startup target small so playback can begin on the earliest pieces.
-pub const MIN_STARTUP_BYTES: u64 = 1 * 1024 * 1024; // 1MB
+/// Minimum bytes needed before playback can start.
+pub const MIN_STARTUP_BYTES: u64 = 16 * 1024 * 1024; // 16MB
 
-/// Maximum pieces to prioritize at startup (prevents bandwidth scatter)
-pub const MAX_STARTUP_PIECES: i32 = 2;
+/// Maximum pieces to prioritize before first byte is delivered.
+pub const MAX_STARTUP_PIECES: i32 = 4;
 
-/// Minimum pieces to prioritize at startup (allows single-piece startup)
-pub const MIN_STARTUP_PIECES: i32 = 1;
+/// Minimum pieces to prioritize before first byte is delivered.
+pub const MIN_STARTUP_PIECES: i32 = 2;
+
+/// Aggressive seek/read-ahead defaults. These are internal on purpose: tuning is
+/// driven by runtime measurements and logs rather than user-facing settings.
+pub const MIN_SEEK_HOT_PIECES: i32 = 24;
+pub const SEEK_IMMEDIATE_PIECES: i32 = 12;
+pub const MAX_HOT_PIECES: i32 = 96;
+pub const MAX_WARM_PIECES: i32 = 192;
+pub const BLOCKED_REPLAN_INTERVAL_MS: u64 = 250;
 
 /// Start treating reads as "container metadata" when they fall in the last 10MB
 /// or the last 5% of the file, whichever starts earlier.
@@ -17,6 +23,61 @@ pub fn container_metadata_start(file_size: u64) -> u64 {
     file_size
         .saturating_sub(10 * 1024 * 1024)
         .min(file_size.saturating_mul(95) / 100)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PlaybackIntent {
+    DirectInitial,
+    DirectSeek,
+    DirectSequential,
+    HlsInitial,
+    HlsSeek,
+    HlsSequential,
+    ContainerMetadata,
+    InternalProbe,
+    Background,
+}
+
+impl PlaybackIntent {
+    pub fn is_hls(self) -> bool {
+        matches!(self, Self::HlsInitial | Self::HlsSeek | Self::HlsSequential)
+    }
+
+    pub fn sequential_after_first_byte(self) -> Self {
+        match self {
+            Self::DirectInitial | Self::DirectSeek | Self::DirectSequential => {
+                Self::DirectSequential
+            }
+            Self::HlsInitial | Self::HlsSeek | Self::HlsSequential => Self::HlsSequential,
+            other => other,
+        }
+    }
+
+    pub fn seek_for_same_family(self) -> Self {
+        if self.is_hls() {
+            Self::HlsSeek
+        } else {
+            Self::DirectSeek
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MemoryPressure {
+    Normal,
+    High,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PriorityBand {
+    Immediate,
+    Hot,
+    Warm,
+    Metadata,
+    Background,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -34,25 +95,232 @@ impl Default for EngineCacheConfig {
     }
 }
 
-pub struct PriorityItem {
-    pub piece_idx: i32,
-    pub deadline: i32, // ms
+#[derive(Debug, Clone)]
+pub struct PriorityContext {
+    pub intent: PlaybackIntent,
+    pub current_piece: i32,
+    pub first_piece: i32,
+    pub last_piece: i32,
+    pub piece_length: u64,
+    pub file_size: u64,
+    pub bitrate_bytes_per_sec: Option<u64>,
+    pub download_rate_bytes_per_sec: u64,
+    pub peers: u64,
+    pub cache_size_bytes: u64,
+    pub memory_pressure: MemoryPressure,
+    pub consecutive_waits: u32,
+    pub first_byte_sent: bool,
 }
 
-/// Calculates piece priorities based on current position and cache configuration.
-///
-/// # Arguments
-/// * `current_piece` - The piece index corresponding to the current playback position.
-/// * `total_pieces` - Total number of pieces in the torrent.
-/// * `piece_length` - Size of one piece in bytes.
-/// * `config` - Cache configuration (size and enabled status).
-/// * `priority` - Priority level (0-255). 0 or 1 is normal, >1 is high priority.
-/// * `download_speed` - Current download speed in bytes/sec (used for dynamic buffering).
-/// * `bitrate` - Optional average bitrate of the content in bytes/sec.
-///
-/// # Returns
-/// A vector of `PriorityItem` containing (piece_idx, deadline).
-/// Deadlines are in milliseconds. 0 means no deadline (normal priority).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PriorityAssignment {
+    pub piece_idx: i32,
+    pub piece_priority: i32,
+    pub deadline: i32,
+    pub band: PriorityBand,
+}
+
+pub type PriorityItem = PriorityAssignment;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PriorityDecision {
+    pub assignments: Vec<PriorityAssignment>,
+    pub target_window_pieces: i32,
+    pub immediate_pieces: i32,
+    pub hot_window_pieces: i32,
+    pub warm_window_pieces: i32,
+    pub reason: String,
+}
+
+pub struct PlaybackPriorityPolicy;
+
+impl PlaybackPriorityPolicy {
+    pub fn decide(ctx: PriorityContext) -> PriorityDecision {
+        if ctx.piece_length == 0
+            || ctx.current_piece < ctx.first_piece
+            || ctx.last_piece < ctx.first_piece
+        {
+            return PriorityDecision {
+                assignments: Vec::new(),
+                target_window_pieces: 0,
+                immediate_pieces: 0,
+                hot_window_pieces: 0,
+                warm_window_pieces: 0,
+                reason: "invalid-context".to_string(),
+            };
+        }
+
+        let max_cache_pieces = if ctx.cache_size_bytes > 0 {
+            (ctx.cache_size_bytes / ctx.piece_length).max(1) as i32
+        } else {
+            MAX_HOT_PIECES
+        };
+        let remaining_pieces = ctx.last_piece.saturating_sub(ctx.current_piece) + 1;
+
+        let bitrate_ratio = ctx
+            .bitrate_bytes_per_sec
+            .filter(|bitrate| *bitrate > 0)
+            .map(|bitrate| ctx.download_rate_bytes_per_sec as f64 / bitrate as f64);
+
+        let mut reason = match ctx.intent {
+            PlaybackIntent::DirectInitial | PlaybackIntent::HlsInitial => "initial".to_string(),
+            PlaybackIntent::DirectSeek | PlaybackIntent::HlsSeek => "seek".to_string(),
+            PlaybackIntent::DirectSequential | PlaybackIntent::HlsSequential => {
+                "sequential".to_string()
+            }
+            PlaybackIntent::ContainerMetadata => "container-metadata".to_string(),
+            PlaybackIntent::InternalProbe => "internal-probe".to_string(),
+            PlaybackIntent::Background => "background".to_string(),
+        };
+
+        let (mut immediate, mut hot, mut warm) = match ctx.intent {
+            PlaybackIntent::DirectInitial | PlaybackIntent::HlsInitial if !ctx.first_byte_sent => {
+                let target_bytes = ctx
+                    .bitrate_bytes_per_sec
+                    .map(|bitrate| bitrate.saturating_mul(10))
+                    .unwrap_or(MIN_STARTUP_BYTES)
+                    .max(MIN_STARTUP_BYTES)
+                    .max(ctx.piece_length);
+                let pieces = target_bytes.saturating_add(ctx.piece_length.saturating_sub(1))
+                    / ctx.piece_length;
+                let pieces = (pieces as i32).clamp(MIN_STARTUP_PIECES, MAX_STARTUP_PIECES);
+                (pieces, pieces, 0)
+            }
+            PlaybackIntent::DirectInitial
+            | PlaybackIntent::DirectSequential
+            | PlaybackIntent::HlsInitial
+            | PlaybackIntent::HlsSequential => {
+                let mut hot = dynamic_hot_window(&ctx, bitrate_ratio);
+                if ctx.intent.is_hls() {
+                    hot = hot.min(48);
+                    reason.push_str("-hls-cap");
+                }
+                (2, hot, 32)
+            }
+            PlaybackIntent::DirectSeek | PlaybackIntent::HlsSeek => {
+                let mut hot = dynamic_hot_window(&ctx, bitrate_ratio).max(MIN_SEEK_HOT_PIECES);
+                let mut immediate = SEEK_IMMEDIATE_PIECES;
+                if ctx.consecutive_waits >= 3 {
+                    hot = (hot * 2).min(MAX_HOT_PIECES);
+                    immediate = (immediate * 2).min(hot);
+                    reason.push_str("-blocked-expand");
+                }
+                if ctx.intent.is_hls() && ctx.consecutive_waits < 3 {
+                    hot = hot.min(48);
+                    reason.push_str("-hls-cap");
+                }
+                (immediate, hot, 32)
+            }
+            PlaybackIntent::ContainerMetadata => (1, 2, 0),
+            PlaybackIntent::InternalProbe => (0, 2, 0),
+            PlaybackIntent::Background => (0, 4, 0),
+        };
+
+        if matches!(ctx.memory_pressure, MemoryPressure::High) {
+            hot = hot.min(if ctx.intent.is_hls() {
+                16
+            } else {
+                MIN_SEEK_HOT_PIECES
+            });
+            warm = 0;
+            reason.push_str("-memory-clamp");
+        }
+
+        if matches!(
+            ctx.intent,
+            PlaybackIntent::Background | PlaybackIntent::InternalProbe
+        ) {
+            warm = 0;
+        }
+
+        hot = hot
+            .clamp(0, MAX_HOT_PIECES)
+            .min(max_cache_pieces)
+            .min(remaining_pieces);
+        warm = warm
+            .clamp(0, MAX_WARM_PIECES)
+            .min(max_cache_pieces.saturating_sub(hot))
+            .min(remaining_pieces.saturating_sub(hot));
+        immediate = immediate.min(hot).max(0);
+
+        let target_window = hot + warm;
+        let mut assignments = Vec::with_capacity(target_window as usize);
+        for distance in 0..target_window {
+            let piece_idx = ctx.current_piece + distance;
+            if piece_idx > ctx.last_piece {
+                break;
+            }
+
+            let (band, piece_priority, deadline) = assignment_for(&ctx, distance, immediate, hot);
+            assignments.push(PriorityAssignment {
+                piece_idx,
+                piece_priority,
+                deadline,
+                band,
+            });
+        }
+
+        PriorityDecision {
+            assignments,
+            target_window_pieces: target_window,
+            immediate_pieces: immediate,
+            hot_window_pieces: hot,
+            warm_window_pieces: warm,
+            reason,
+        }
+    }
+}
+
+fn dynamic_hot_window(ctx: &PriorityContext, bitrate_ratio: Option<f64>) -> i32 {
+    let mut hot = if let Some(ratio) = bitrate_ratio {
+        if ratio >= 3.0 {
+            96
+        } else if ratio >= 1.5 {
+            48
+        } else if ratio >= 1.0 {
+            32
+        } else {
+            MIN_SEEK_HOT_PIECES
+        }
+    } else if ctx.download_rate_bytes_per_sec > 10 * 1024 * 1024 {
+        96
+    } else if ctx.download_rate_bytes_per_sec > 5 * 1024 * 1024 {
+        48
+    } else if ctx.download_rate_bytes_per_sec > 1024 * 1024 {
+        MIN_SEEK_HOT_PIECES
+    } else {
+        16
+    };
+
+    if let Some(bitrate) = ctx.bitrate_bytes_per_sec.filter(|bitrate| *bitrate > 0) {
+        let pieces_for_10s = ((bitrate.saturating_mul(10)) / ctx.piece_length).max(1) as i32;
+        hot = hot.max(pieces_for_10s);
+    }
+
+    if ctx.peers < 3 {
+        hot = hot.min(MIN_SEEK_HOT_PIECES);
+    }
+
+    hot
+}
+
+fn assignment_for(
+    ctx: &PriorityContext,
+    distance: i32,
+    immediate_pieces: i32,
+    hot_pieces: i32,
+) -> (PriorityBand, i32, i32) {
+    match ctx.intent {
+        PlaybackIntent::ContainerMetadata => (PriorityBand::Metadata, 4, 150 + distance * 50),
+        PlaybackIntent::InternalProbe => (PriorityBand::Background, 1, 1_000 + distance * 250),
+        PlaybackIntent::Background => (PriorityBand::Background, 1, 20_000 + distance * 200),
+        _ if distance < immediate_pieces => (PriorityBand::Immediate, 7, distance * 25),
+        _ if distance < hot_pieces => (PriorityBand::Hot, 4, 1_500 + distance * 150),
+        _ => (PriorityBand::Warm, 2, 10_000 + distance * 250),
+    }
+}
+
+/// Backward-compatible wrapper used by older callers and tests.
 pub fn calculate_priorities(
     current_piece: i32,
     total_pieces: i32,
@@ -62,267 +330,156 @@ pub fn calculate_priorities(
     download_speed: u64,
     bitrate: Option<u64>,
 ) -> Vec<PriorityItem> {
-    let mut priorities = Vec::new();
-
-    // Safety check
-    if piece_length == 0 || current_piece < 0 {
-        return priorities;
-    }
-
-    // 1. DYNAMIC WINDOW SIZING
-    // -----------------------------------------------------------------------
-
-    // Base "Urgent" Window: The absolute minimum we need to keep playback going.
-    // Default: 15 pieces (~15MB-60MB depending on piece size).
-    // If bitrate is known, ensure at least 15 seconds.
-    let mut urgent_base_pieces = 15;
-    if let Some(br) = bitrate {
-        let pieces_for_15s = ((br * 15) / piece_length) as i32;
-        urgent_base_pieces = urgent_base_pieces.max(pieces_for_15s);
-    }
-
-    // Proactive "Lookahead" Window:
-    // If we are downloading significantly faster than the bitrate, expadn the window
-    // to build a larger safety buffer.
-    let mut proactive_bonus_pieces = 0;
-    if let Some(br) = bitrate {
-        if download_speed > (br * 15 / 10) {
-            // 1.5x bitrate
-            // We have excess bandwidth. Expand window up to 60s ahead.
-            let pieces_for_45s = ((br * 45) / piece_length) as i32;
-            proactive_bonus_pieces = pieces_for_45s;
-        }
+    let intent = if priority >= 250 {
+        PlaybackIntent::InternalProbe
+    } else if priority >= 100 {
+        PlaybackIntent::DirectSeek
+    } else if priority == 0 {
+        PlaybackIntent::Background
     } else {
-        // Fallback if bitrate unknown: if speed > 5MB/s, add 20 pieces (~20MB)
-        if download_speed > 5 * 1024 * 1024 {
-            proactive_bonus_pieces = 20;
-        }
-    }
-
-    // Parameters for window sizing
-    let (mut urgent_window, buffer_window, max_buffer_pieces) = if config.enabled {
-        let max_pieces = (config.size / piece_length) as i32;
-
-        // Urgent = Base + Proactive
-        // But clamped to valid cache limits
-        let mut urgent = urgent_base_pieces + proactive_bonus_pieces;
-
-        // Cap urgent window to avoid insane values on huge cache
-        urgent = urgent.min(max_pieces).min(300); // Absolute max 300 pieces urgent
-
-        // Buffer: Fill the rest of the cache space, up to a limit
-        let remaining_for_buffer = max_pieces.saturating_sub(urgent);
-        let buffer = 15.min(remaining_for_buffer);
-        (urgent, buffer, max_pieces)
-    } else {
-        // Cache Disabled: Streaming Mode
-        // Use calculated values but clamp to a safe limit for strict streaming (e.g. 50 pieces max)
-        let urgent = (urgent_base_pieces + proactive_bonus_pieces).min(50);
-        (urgent, 0, urgent)
+        PlaybackIntent::DirectSequential
     };
 
-    let start_piece = current_piece;
-
-    // 2. DYNAMIC HEAD/DEADLINE CALCULATION
-    // -----------------------------------------------------------------------
-
-    // Calculate "Head Window": The extremely critical immediate future.
-    // We want this to be roughly 5-10 seconds of playback.
-    let target_buffer_seconds = 5;
-    let minimum_buffer_bytes = 5 * 1024 * 1024u64; // Minimum 5MB
-    let maximum_buffer_bytes = 50 * 1024 * 1024u64; // Maximum 50MB
-
-    let target_head_bytes = if let Some(br) = bitrate {
-        (br * target_buffer_seconds)
-            .max(minimum_buffer_bytes)
-            .min(maximum_buffer_bytes)
-    } else {
-        download_speed
-            .saturating_mul(target_buffer_seconds)
-            .max(minimum_buffer_bytes)
-            .min(maximum_buffer_bytes)
-    };
-
-    let mut head_window = (target_head_bytes / piece_length) as i32;
-    head_window = head_window.clamp(5, 250);
-
-    // Urgent window must be at least head window + some body
-    urgent_window = urgent_window.max(head_window + 15);
-
-    let total_window = urgent_window + buffer_window;
-    if total_window == 0 {
-        return priorities;
-    }
-
-    // Calculate end index (inclusive) based on length
-    let end_piece = (start_piece + total_window - 1).min(total_pieces - 1);
-
-    // Safety clamp for cache size
-    let allowed_end_piece = if max_buffer_pieces > 0 {
-        (start_piece + max_buffer_pieces - 1).min(total_pieces - 1)
-    } else {
-        start_piece - 1
-    };
-
-    let effective_end_piece = end_piece.min(allowed_end_piece);
-
-    // Dynamic Deadline Steps
-    // If usage is high (low buffer/health) or speed is low, we might need stricter deadlines.
-    // For now, we use a simple heuristic:
-    // If we have high speed, we can afford slightly looser deadlines to allow
-    // multiple peers to compete naturally?
-    // ACTUALLY: High speed usually comes from aggressive requesting.
-    // Let's stick to a robust default but allow specific overrides.
-
-    // We'll just use the standard step but ensure head is strict.
-    // The "Staircase" ensures order.
-
-    for p in start_piece..=effective_end_piece {
-        let distance = p - start_piece;
-
-        let deadline = if priority >= 250 {
-            // Internal Probes / Metadata parsing (Absolute priority)
-            50
-        } else if priority >= 100 {
-            // Seeking (High priority, tighter deadlines)
-            10 + (distance * 10)
-        } else if priority == 0 {
-            // Background pre-caching (Lazy deadlines)
-            20000 + (distance * 200)
-        } else {
-            // Normal Streaming
-            if distance < 5 {
-                // CRITICAL HEAD: Very Strict Staircase
-                // 10, 60, 110, 160, 210
-                // We add 10ms base to ensure deadline is non-zero (0 = ASAP/highest priority in libtorrent)
-                10 + (distance * 50)
-            } else if distance < head_window {
-                // HEAD WINDOW: Linear staircase
-                250 + ((distance - 5) * 50)
-            } else {
-                // BODY/TAIL
-                // If we are in the "proactive bonus" area (distance > urgent_base),
-                // we can be very relaxed.
-                let is_proactive_area = distance > urgent_base_pieces;
-
-                if is_proactive_area {
-                    // Relaxed deadlines (10s+) for lookahead
-                    10000 + (distance * 50)
-                } else {
-                    // Standard body
-                    5000 + (distance * 20)
-                }
-            }
-        };
-
-        priorities.push(PriorityItem {
-            piece_idx: p,
-            deadline,
-        });
-    }
-
-    priorities
+    PlaybackPriorityPolicy::decide(PriorityContext {
+        intent,
+        current_piece,
+        first_piece: 0,
+        last_piece: total_pieces.saturating_sub(1),
+        piece_length,
+        file_size: total_pieces.max(0) as u64 * piece_length,
+        bitrate_bytes_per_sec: bitrate,
+        download_rate_bytes_per_sec: download_speed,
+        peers: 8,
+        cache_size_bytes: if config.enabled { config.size } else { 0 },
+        memory_pressure: MemoryPressure::Normal,
+        consecutive_waits: 0,
+        first_byte_sent: true,
+    })
+    .assignments
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_cache_disabled_streaming_mode() {
-        let config = EngineCacheConfig {
-            size: 0,
-            enabled: false,
-        };
-        let piece_len = 1024 * 1024; // 1MB
-        // Speed 10MB/s. Bitrate None.
-        // Proactive bonus: 10MB > 5MB -> +20 pieces.
-        // Urgent Base: 15.
-        // Total Urgent: 35.
-        // Cache enabled=false -> buffer=0.
-        // Total = 35.
-        let priorities =
-            calculate_priorities(100, 1000, piece_len, &config, 1, 10 * 1024 * 1024, None);
-
-        assert_eq!(priorities.len(), 35);
-
-        // Verify deadlines - now more aggressive
-        assert_eq!(priorities[0].deadline, 10); // distance 0 * 50 + 10
-        assert_eq!(priorities[1].deadline, 60); // distance 1 * 50 + 10
+    fn base_context(intent: PlaybackIntent) -> PriorityContext {
+        PriorityContext {
+            intent,
+            current_piece: 100,
+            first_piece: 0,
+            last_piece: 999,
+            piece_length: 1024 * 1024,
+            file_size: 1000 * 1024 * 1024,
+            bitrate_bytes_per_sec: None,
+            download_rate_bytes_per_sec: 2 * 1024 * 1024,
+            peers: 10,
+            cache_size_bytes: 1024 * 1024 * 1024,
+            memory_pressure: MemoryPressure::Normal,
+            consecutive_waits: 0,
+            first_byte_sent: true,
+        }
     }
 
     #[test]
-    fn test_cache_enabled_normal_mode() {
-        let config = EngineCacheConfig {
-            size: 1024 * 1024 * 1024, // 1GB
-            enabled: true,
-        };
-        let piece_len = 1024 * 1024; // 1MB
-        // Speed 10MB/s -> target head window 5s = 50MB -> 50 pieces.
-        // Proactive bonus: 20 pieces.
-        // Urgent Base: 15 + 20 = 35.
-        // Urgent = max(35, head(50) + 15) = 65 pieces.
-        // Buffer window = 15 pieces.
-        // Total = 80 pieces.
-        let priorities =
-            calculate_priorities(0, 1000, piece_len, &config, 1, 10 * 1024 * 1024, None);
+    fn initial_before_first_byte_is_small() {
+        let mut ctx = base_context(PlaybackIntent::DirectInitial);
+        ctx.current_piece = 0;
+        ctx.first_byte_sent = false;
+        let decision = PlaybackPriorityPolicy::decide(ctx);
 
-        assert_eq!(priorities.len(), 80);
-
-        // Head - Strict Staircase
-        assert_eq!(priorities[0].deadline, 10);
-        assert_eq!(priorities[1].deadline, 60);
-        assert_eq!(priorities[2].deadline, 110);
+        assert!(decision.target_window_pieces >= MIN_STARTUP_PIECES);
+        assert!(decision.target_window_pieces <= MAX_STARTUP_PIECES);
+        assert_eq!(decision.assignments[0].deadline, 0);
+        assert_eq!(decision.assignments[0].piece_priority, 7);
     }
 
     #[test]
-    fn test_cache_enabled_small_cache_clamping() {
-        let piece_len = 10 * 1024 * 1024; // 10MB pieces
-        let config = EngineCacheConfig {
-            size: 200 * 1024 * 1024, // 200MB cache limit
-            enabled: true,
-        };
+    fn initial_after_first_byte_expands() {
+        let decision = PlaybackPriorityPolicy::decide(base_context(PlaybackIntent::DirectInitial));
 
-        // Max pieces = 200 / 10 = 20 pieces.
-        // Speed 10MB.
-        let priorities =
-            calculate_priorities(0, 1000, piece_len, &config, 1, 10 * 1024 * 1024, None);
-
-        // Should be fully clamped to 20 items (cache max)
-        assert_eq!(priorities.len(), 20);
-
-        // Verify clamp effect
-        assert_eq!(priorities[0].deadline, 10);
-        assert_eq!(priorities[19].piece_idx, 19);
+        assert!(decision.hot_window_pieces >= MIN_SEEK_HOT_PIECES);
+        assert_eq!(decision.assignments[0].band, PriorityBand::Immediate);
     }
 
     #[test]
-    fn test_bitrate_aware_window() {
-        let piece_len = 1024 * 1024; // 1MB
+    fn direct_seek_has_minimum_hot_window() {
+        let decision = PlaybackPriorityPolicy::decide(base_context(PlaybackIntent::DirectSeek));
+
+        assert!(decision.hot_window_pieces >= MIN_SEEK_HOT_PIECES);
+        assert_eq!(decision.immediate_pieces, SEEK_IMMEDIATE_PIECES);
+        assert_eq!(decision.assignments[0].piece_priority, 7);
+        assert_eq!(decision.assignments[3].piece_priority, 7);
+        assert_eq!(decision.assignments[4].piece_priority, 7);
+        assert_eq!(
+            decision.assignments[SEEK_IMMEDIATE_PIECES as usize - 1].piece_priority,
+            7
+        );
+        assert_eq!(
+            decision.assignments[SEEK_IMMEDIATE_PIECES as usize].piece_priority,
+            4
+        );
+    }
+
+    #[test]
+    fn fast_swarm_expands_seek_window() {
+        let mut ctx = base_context(PlaybackIntent::DirectSeek);
+        ctx.download_rate_bytes_per_sec = 12 * 1024 * 1024;
+        let decision = PlaybackPriorityPolicy::decide(ctx);
+
+        assert!(decision.hot_window_pieces >= 96);
+    }
+
+    #[test]
+    fn hls_window_is_capped_before_blocking() {
+        let mut ctx = base_context(PlaybackIntent::HlsSeek);
+        ctx.download_rate_bytes_per_sec = 12 * 1024 * 1024;
+        let decision = PlaybackPriorityPolicy::decide(ctx);
+
+        assert_eq!(decision.hot_window_pieces, 48);
+    }
+
+    #[test]
+    fn hls_blocking_can_expand_to_aggressive_window() {
+        let mut ctx = base_context(PlaybackIntent::HlsSeek);
+        ctx.download_rate_bytes_per_sec = 12 * 1024 * 1024;
+        ctx.consecutive_waits = 3;
+        let decision = PlaybackPriorityPolicy::decide(ctx);
+
+        assert!(decision.hot_window_pieces > 48);
+    }
+
+    #[test]
+    fn memory_pressure_clamps_window() {
+        let mut ctx = base_context(PlaybackIntent::DirectSeek);
+        ctx.download_rate_bytes_per_sec = 12 * 1024 * 1024;
+        ctx.memory_pressure = MemoryPressure::High;
+        let decision = PlaybackPriorityPolicy::decide(ctx);
+
+        assert_eq!(decision.hot_window_pieces, MIN_SEEK_HOT_PIECES);
+        assert_eq!(decision.warm_window_pieces, 0);
+    }
+
+    #[test]
+    fn internal_probe_uses_low_priority() {
+        let decision = PlaybackPriorityPolicy::decide(base_context(PlaybackIntent::InternalProbe));
+
+        assert!(
+            decision
+                .assignments
+                .iter()
+                .all(|item| item.piece_priority <= 1)
+        );
+    }
+
+    #[test]
+    fn compatibility_wrapper_still_returns_priorities() {
         let config = EngineCacheConfig {
-            size: 2 * 1024 * 1024 * 1024, // 2GB
+            size: 200 * 1024 * 1024,
             enabled: true,
         };
+        let priorities = calculate_priorities(0, 1000, 10 * 1024 * 1024, &config, 1, 0, None);
 
-        // High bitrate content (10MB/s = 80Mbps)
-        let bitrate = Some(10 * 1024 * 1024);
-        // Download speed 20MB/s (2x bitrate).
-        // Proactive bonus: Speed > 1.5*Br? Yes.
-        // Bonus = 45s @ 10MB/s = 450MB = 450 pieces.
-
-        // Urgent Base = 15s @ 10MB = 150 pieces.
-        // Urgent Total Calc = 150 + 450 = 600 pieces.
-        // CLAMP: max urgent is 300. So Urgent = 300.
-
-        // Head Window: 5s @ 10MB = 50 pieces. (Target head bytes uses bitrate if avail).
-        // Urgent = max(300, 50+15) = 300.
-
-        // Buffer = 15.
-        // Total = 315.
-
-        let priorities =
-            calculate_priorities(0, 1000, piece_len, &config, 1, 20 * 1024 * 1024, bitrate);
-
-        assert_eq!(priorities.len(), 315);
+        assert!(!priorities.is_empty());
+        assert_eq!(priorities[0].piece_idx, 0);
     }
 }

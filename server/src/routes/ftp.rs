@@ -1,11 +1,11 @@
 use crate::state::AppState;
 use axum::{
+    Router,
     body::Body,
     extract::{Path, Query},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::get,
-    Router,
 };
 use futures_util::StreamExt;
 use serde::Deserialize;
@@ -48,7 +48,7 @@ async fn stream_ftp(Path(filename): Path<String>, Query(params): Query<FtpQuery>
                 StatusCode::BAD_REQUEST,
                 format!("Failed to parse FTP body: {}", e),
             )
-                .into_response()
+                .into_response();
         }
     };
 
@@ -73,7 +73,7 @@ async fn stream_http(url: &str, filename: &str) -> Response {
                 StatusCode::BAD_GATEWAY,
                 format!("Failed to fetch URL: {}", e),
             )
-                .into_response()
+                .into_response();
         }
     };
 

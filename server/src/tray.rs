@@ -123,7 +123,7 @@ pub fn create_system_tray(event_loop: &EventLoop<UserEvent>) -> anyhow::Result<T
     let stats_item = MenuItem::new("↓ -- | ↑ -- | 0 peers", false, None);
 
     let open_item = MenuItem::new("Open Stremio Web", true, None);
-    let logs_item = MenuItem::new("Open Config Folder", true, None);
+    let logs_item = MenuItem::new("Open Logs Folder", true, None);
     let restart_item = MenuItem::new("Restart Server", true, None);
     let quit_item = MenuItem::new("Quit", true, None);
 
@@ -190,12 +190,12 @@ pub fn open_stremio_web() {
     }
 }
 
-pub fn open_config_folder() {
+pub fn open_log_folder() {
     if let Some(config_dir) = dirs::config_dir() {
-        let path = config_dir.join("stremio-server");
+        let path = config_dir.join("stremio-server").join("logs");
         match open::that(&path) {
-            Ok(_) => info!("Opened config folder: {:?}", path),
-            Err(e) => error!("Failed to open config folder: {}", e),
+            Ok(_) => info!("Opened logs folder: {:?}", path),
+            Err(e) => error!("Failed to open logs folder: {}", e),
         }
     } else {
         error!("Could not determine config directory");

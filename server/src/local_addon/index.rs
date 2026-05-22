@@ -1,7 +1,7 @@
+use crate::local_addon::parser::VideoMetadata;
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::sync::{Arc, RwLock};
-use crate::local_addon::parser::VideoMetadata;
 
 #[derive(Debug, Clone)]
 pub struct IndexItem {
@@ -42,16 +42,17 @@ impl LocalIndex {
             item.path.hash(&mut hasher);
             format!("local:{}", hasher.finish())
         };
-        
+
         item.id = key.clone();
-        
-        items.entry(key.clone()).or_insert_with(Vec::new).push(item.clone());
-        
+
+        items
+            .entry(key.clone())
+            .or_insert_with(Vec::new)
+            .push(item.clone());
+
         let mut paths = self.path_map.write().unwrap();
         paths.insert(item.path.clone(), key);
     }
-    
-
 }
 
 use std::hash::Hasher;

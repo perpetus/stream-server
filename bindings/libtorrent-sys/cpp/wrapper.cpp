@@ -422,6 +422,7 @@ session_add_torrent(Session &session, AddTorrentParams const &params) {
   lt::torrent_handle h = session.session.add_torrent(p);
   if (!h.is_valid())
     throw std::runtime_error("Failed to add torrent");
+  memory_label_last_unlabeled_storage(sha1_to_hex(h.info_hashes().get_best()));
 
   return std::make_unique<TorrentHandle>(std::move(h));
 }
@@ -440,15 +441,18 @@ std::unique_ptr<TorrentHandle> session_add_magnet(Session &session,
   lt::torrent_handle h = session.session.add_torrent(p);
   if (!h.is_valid())
     throw std::runtime_error("Failed to add torrent");
+  memory_label_last_unlabeled_storage(sha1_to_hex(h.info_hashes().get_best()));
 
   return std::make_unique<TorrentHandle>(std::move(h));
 }
 
 void session_remove_torrent(Session &session, TorrentHandle const &handle,
                             bool delete_files) {
+  auto info_hash = sha1_to_hex(handle.handle.info_hashes().get_best());
   lt::remove_flags_t flags =
       delete_files ? lt::session::delete_files : lt::remove_flags_t{};
   session.session.remove_torrent(handle.handle, flags);
+  memory_clear_torrent(info_hash);
 }
 
 // ============================================================================

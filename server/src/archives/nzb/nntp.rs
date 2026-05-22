@@ -1,13 +1,12 @@
+use anyhow::{Result, anyhow};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
-use tokio::io::{AsyncWriteExt, BufReader, AsyncBufReadExt};
 use tokio_native_tls::{TlsConnector, TlsStream};
-use anyhow::{anyhow, Result};
-
 
 #[allow(dead_code)]
 pub struct NntpClient {
     stream: BufReader<Box<dyn Connection + Send + Unpin>>, // Dynamic dispatch to handle Plain vs TLS or Enum
-    // OR use an enum to avoid dyn overhead, but dyn is easier to write initially
+                                                           // OR use an enum to avoid dyn overhead, but dyn is easier to write initially
 }
 
 // Helper trait to unify TcpStream and TlsStream
@@ -78,18 +77,22 @@ impl Client {
     pub async fn connect(host: &str, port: u16, ssl: bool) -> Result<Self> {
         let addr = format!("{}:{}", host, port);
         tracing::debug!("Connecting to NNTP server at {}", addr);
-        
+
         let tcp = TcpStream::connect(&addr).await?;
-        
+
         let stream = if ssl {
             let connector = native_tls::TlsConnector::builder().build()?;
             let connector = TlsConnector::from(connector);
             // Verify domain? usually yes, but legacy app might not strict check.
             // Using host as domain.
             let tls_stream = connector.connect(host, tcp).await?;
-            NntpStream { inner: StreamType::Tls(tls_stream) }
+            NntpStream {
+                inner: StreamType::Tls(tls_stream),
+            }
         } else {
-            NntpStream { inner: StreamType::Plain(tcp) }
+            NntpStream {
+                inner: StreamType::Plain(tcp),
+            }
         };
 
         let mut client = Client {
@@ -108,42 +111,47 @@ impl Client {
     }
 
     pub async fn authenticate(&mut self, user: &str, pass: &str) -> Result<()> {
-        self.send_command(&format!("AUTHINFO USER {}", user)).await?;
+        self.send_command(&format!("AUTHINFO USER {}", user))
+            .await?;
         let response = self.read_response().await?;
-        
+
         if response.starts_with("381") {
             // Password required
-            self.send_command(&format!("AUTHINFO PASS {}", pass)).await?;
+            self.send_command(&format!("AUTHINFO PASS {}", pass))
+                .await?;
             let response = self.read_response().await?;
             if !response.starts_with("281") {
                 return Err(anyhow!("NNTP Authentication failed: {}", response));
             }
         } else if !response.starts_with("281") {
-             return Err(anyhow!("NNTP Authentication failed (User stage): {}", response));
+            return Err(anyhow!(
+                "NNTP Authentication failed (User stage): {}",
+                response
+            ));
         }
 
         Ok(())
     }
-    
+
     // Select group isn't strictly necessary if using message-id, but good practice?
     // "Most servers do not require the GROUP command to be used if the article is being retrieved by message-id"
     // We will implement body fetch by Message-ID.
-    
+
     pub async fn fetch_body(&mut self, message_id: &str) -> Result<Vec<u8>> {
         // Encapsulate ID in <> if not present
-        let msg_id = if message_id.starts_with('<') { 
-            message_id.to_string() 
-        } else { 
-            format!("<{}>", message_id) 
+        let msg_id = if message_id.starts_with('<') {
+            message_id.to_string()
+        } else {
+            format!("<{}>", message_id)
         };
-        
+
         self.send_command(&format!("BODY {}", msg_id)).await?;
         let response = self.read_response().await?;
-        
+
         if !response.starts_with("222") {
-             return Err(anyhow!("Failed to fetch body for {}: {}", msg_id, response));
+            return Err(anyhow!("Failed to fetch body for {}: {}", msg_id, response));
         }
-        
+
         // Read until .\r\n
         let mut body = Vec::new();
         loop {
@@ -152,11 +160,11 @@ impl Client {
             if bytes_read == 0 {
                 break; // EOF
             }
-            
+
             if line == ".\r\n" {
                 break;
             }
-            
+
             // Dot-unstuffing: If line starts with .., remove first dot
             if line.starts_with("..") {
                 body.extend_from_slice(line[1..].as_bytes());
@@ -164,7 +172,7 @@ impl Client {
                 body.extend_from_slice(line.as_bytes());
             }
         }
-        
+
         Ok(body)
     }
 

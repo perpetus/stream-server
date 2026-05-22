@@ -7,21 +7,77 @@ use axum::{
 };
 
 use axum::http::HeaderMap;
-use enginefs::backend::TorrentHandle;
+use enginefs::backend::{TorrentHandle, priorities::PlaybackIntent};
 use futures_util::Stream;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::io::AsyncSeekExt;
 
-/// Guard that calls on_stream_end when dropped
-struct StreamGuard<S> {
-    inner: S,
-    engine: Arc<crate::state::AppState>,
+static NEXT_STREAM_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Guard that calls on_stream_end when dropped.
+struct StreamLifecycleGuard {
+    engine: Arc<enginefs::EngineFS>,
     info_hash: String,
     file_idx: usize,
+    stream_id: u64,
     notified: bool,
+}
+
+impl StreamLifecycleGuard {
+    fn new(
+        engine: Arc<enginefs::EngineFS>,
+        info_hash: String,
+        file_idx: usize,
+        stream_id: u64,
+    ) -> Self {
+        crate::diagnostics::logging::direct_stream_started();
+        Self {
+            engine,
+            info_hash,
+            file_idx,
+            stream_id,
+            notified: false,
+        }
+    }
+
+    fn notify_end(&mut self) {
+        if self.notified {
+            return;
+        }
+        self.notified = true;
+        crate::diagnostics::logging::direct_stream_ended();
+
+        let engine = self.engine.clone();
+        let info_hash = self.info_hash.clone();
+        let file_idx = self.file_idx;
+        let stream_id = self.stream_id;
+
+        tokio::spawn(async move {
+            engine.on_stream_end(&info_hash, file_idx).await;
+            tracing::debug!(
+                stream_id,
+                info_hash = %info_hash,
+                file_idx,
+                "Stream lifecycle guard notified stream end"
+            );
+        });
+    }
+}
+
+impl Drop for StreamLifecycleGuard {
+    fn drop(&mut self) {
+        self.notify_end();
+    }
+}
+
+/// Guard that keeps the stream lifecycle alive for the response body.
+struct StreamGuard<S> {
+    inner: S,
+    _lifecycle: StreamLifecycleGuard,
 }
 
 impl<S: Stream + Unpin> Stream for StreamGuard<S> {
@@ -36,27 +92,6 @@ impl<S: Stream + Unpin> Stream for StreamGuard<S> {
     }
 }
 
-impl<S> Drop for StreamGuard<S> {
-    fn drop(&mut self) {
-        if !self.notified {
-            self.notified = true;
-            let engine = self.engine.clone();
-            let info_hash = self.info_hash.clone();
-            let file_idx = self.file_idx;
-
-            // Spawn a task to notify stream end since Drop is sync
-            tokio::spawn(async move {
-                engine.engine.on_stream_end(&info_hash, file_idx).await;
-                tracing::debug!(
-                    "StreamGuard: Notified stream end for {} file_idx={}",
-                    info_hash,
-                    file_idx
-                );
-            });
-        }
-    }
-}
-
 fn parse_trackers(query_str: Option<String>) -> Vec<String> {
     let mut trackers = Vec::new();
     if let Some(q) = query_str {
@@ -67,6 +102,42 @@ fn parse_trackers(query_str: Option<String>) -> Vec<String> {
         }
     }
     trackers
+}
+
+fn query_has_hls_intent(query_str: Option<&str>) -> bool {
+    query_str
+        .map(|q| {
+            url::form_urlencoded::parse(q.as_bytes()).any(|(key, value)| {
+                (key == "enginefs-intent" && value.eq_ignore_ascii_case("hls"))
+                    || (key == "hls" && (value == "1" || value.eq_ignore_ascii_case("true")))
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn playback_intent_for_request(
+    query_str: Option<&str>,
+    priority: u8,
+    start: u64,
+    file_size: u64,
+) -> PlaybackIntent {
+    if priority == 255 {
+        return PlaybackIntent::InternalProbe;
+    }
+    if priority == 0 {
+        return PlaybackIntent::Background;
+    }
+    if start > 0 && start >= enginefs::backend::priorities::container_metadata_start(file_size) {
+        return PlaybackIntent::ContainerMetadata;
+    }
+
+    let is_hls = query_has_hls_intent(query_str);
+    match (is_hls, start == 0) {
+        (true, true) => PlaybackIntent::HlsInitial,
+        (true, false) => PlaybackIntent::HlsSeek,
+        (false, true) => PlaybackIntent::DirectInitial,
+        (false, false) => PlaybackIntent::DirectSeek,
+    }
 }
 
 fn content_type_for_name(name: &str) -> &'static str {
@@ -115,7 +186,7 @@ pub async fn head_stream_video(
 ) -> Response {
     let request_start = Instant::now();
     let info_hash = info_hash.to_lowercase();
-    let trackers = parse_trackers(query_str);
+    let trackers = parse_trackers(query_str.clone());
 
     let engine = if let Some(e) = state.engine.get_engine(&info_hash).await {
         e
@@ -195,26 +266,33 @@ pub async fn stream_video(
 ) -> Response {
     let request_start = Instant::now();
     let info_hash = info_hash.to_lowercase();
+    let stream_id = NEXT_STREAM_ID.fetch_add(1, Ordering::Relaxed);
 
     tracing::debug!(
-        "stream_video: Request for info_hash={} idx={}",
-        info_hash,
-        idx
+        stream_id,
+        info_hash = %info_hash,
+        file_idx = idx,
+        "stream_video request"
     );
 
     // Parse trackers from query string 'tr=url&tr=url2'
-    let trackers = parse_trackers(query_str);
-    tracing::debug!("stream_video: Found {} trackers", trackers.len());
+    let trackers = parse_trackers(query_str.clone());
+    tracing::debug!(
+        stream_id,
+        tracker_count = trackers.len(),
+        "stream_video trackers parsed"
+    );
 
     // Try to get existing engine, or auto-create from info hash
     let engine = if let Some(e) = state.engine.get_engine(&info_hash).await {
-        tracing::debug!("stream_video: Engine found in cache");
+        tracing::debug!(stream_id, "stream_video engine found in cache");
         e
     } else {
         // Auto-create engine from magnet link
         tracing::debug!(
-            "stream_video: Auto-creating engine for info_hash: {}",
-            info_hash
+            stream_id,
+            info_hash = %info_hash,
+            "stream_video auto-creating engine"
         );
         let magnet = format!("magnet:?xt=urn:btih:{}", info_hash);
         // Note: usage of enginefs::backend::TorrentSource requires enginefs dependency or import
@@ -222,11 +300,11 @@ pub async fn stream_video(
 
         match state.engine.add_torrent(source, Some(trackers)).await {
             Ok(e) => {
-                tracing::debug!("stream_video: Engine created successfully");
+                tracing::debug!(stream_id, "stream_video engine created successfully");
                 e
             }
             Err(e) => {
-                tracing::error!("Failed to create engine: {}", e);
+                tracing::error!(stream_id, error = %e, "stream_video failed to create engine");
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("Failed to create engine: {}", e),
@@ -236,15 +314,18 @@ pub async fn stream_video(
         }
     };
 
-    // --- Stream Lifecycle: Notify start and focus bandwidth ---
-    state.engine.on_stream_start(&info_hash, idx).await;
-    state.engine.focus_torrent(&info_hash).await;
-
     let files = engine.handle.get_files().await;
     let Some(file_info) = files.get(idx) else {
+        tracing::warn!(
+            stream_id,
+            info_hash = %info_hash,
+            file_idx = idx,
+            "stream_video file index not found before stream start"
+        );
         return (StatusCode::NOT_FOUND, "File not found").into_response();
     };
     let size = file_info.length;
+    let name = file_info.name.clone();
 
     let range_header = headers
         .get(header::RANGE)
@@ -254,13 +335,21 @@ pub async fn stream_video(
         if let Some((start, end)) = parse_range(range, size) {
             (start, end, true)
         } else {
-            tracing::warn!("stream_video: Invalid range header '{}'", range);
+            tracing::warn!(
+                stream_id,
+                info_hash = %info_hash,
+                file_idx = idx,
+                range = %range,
+                "stream_video invalid range header"
+            );
             return (StatusCode::RANGE_NOT_SATISFIABLE, "Range Not Satisfiable").into_response();
         }
     } else {
         (0, size.saturating_sub(1), false)
     };
     let start_offset_hint = start;
+    let is_container_metadata_probe =
+        start > 0 && start >= enginefs::backend::priorities::container_metadata_start(size);
 
     // Parse priority from enginefs-prio header
     let priority: u8 = if let Some(prio_val) = headers.get("enginefs-prio") {
@@ -268,42 +357,195 @@ pub async fn stream_video(
     } else {
         1
     };
+    let playback_intent = playback_intent_for_request(query_str.as_deref(), priority, start, size);
+
+    // --- Stream Lifecycle: Notify start only after validation has succeeded. ---
+    state.engine.on_stream_start(&info_hash, idx).await;
+    let lifecycle =
+        StreamLifecycleGuard::new(state.engine.clone(), info_hash.clone(), idx, stream_id);
+    state.engine.focus_torrent(&info_hash).await;
 
     // Await the async get_file
     tracing::debug!(
-        "stream_video: Calling get_file({}) with offset {} and priority {}",
-        idx,
-        start_offset_hint,
-        priority
+        stream_id,
+        info_hash = %info_hash,
+        file_idx = idx,
+        start_offset = start_offset_hint,
+        priority,
+        intent = ?playback_intent,
+        "stream_video calling get_file"
     );
-    if let Some(mut file) = engine.get_file(idx, start_offset_hint, priority).await {
+    if let Some(mut file) = engine
+        .get_file_with_intent(idx, start_offset_hint, priority, playback_intent)
+        .await
+    {
         tracing::debug!(
-            "stream_video: get_file returned success. Size={}",
-            file.size
+            stream_id,
+            info_hash = %info_hash,
+            file_idx = idx,
+            size = file.size,
+            "stream_video get_file returned success"
         );
         let size = file.size;
-        let name = file.name.clone();
+        let name = if file.name.is_empty() {
+            name
+        } else {
+            file.name.clone()
+        };
 
         tracing::debug!(
-            "stream_video: Range request: {}-{} (total {})",
+            stream_id,
+            info_hash = %info_hash,
+            file_idx = idx,
+            "stream_video range request: {}-{} (total {})",
             start,
             end,
             size
         );
 
         if start >= size {
-            tracing::warn!("stream_video: Range not satisfiable");
+            tracing::warn!(
+                stream_id,
+                info_hash = %info_hash,
+                file_idx = idx,
+                start,
+                size,
+                "stream_video range not satisfiable"
+            );
             return (StatusCode::RANGE_NOT_SATISFIABLE, "Range Not Satisfiable").into_response();
+        }
+
+        let readiness_timeout = match playback_intent {
+            PlaybackIntent::DirectInitial => Some(Duration::from_secs(5)),
+            PlaybackIntent::DirectSeek => Some(Duration::from_secs(1)),
+            PlaybackIntent::HlsInitial => Some(Duration::from_secs(10)),
+            PlaybackIntent::HlsSeek => Some(Duration::from_secs(1)),
+            _ => None,
+        };
+        let enforce_readiness_before_headers = readiness_timeout.is_some();
+        if !enforce_readiness_before_headers {
+            tracing::info!(
+                stream_id,
+                info_hash = %info_hash,
+                file_idx = idx,
+                range_start = start,
+                range_end = end,
+                file_size = size,
+                intent = ?playback_intent,
+                container_metadata_probe = is_container_metadata_probe,
+                "direct stream readiness bypassed"
+            );
+        } else {
+            let readiness_timeout = readiness_timeout.expect("readiness timeout checked");
+            let readiness = match engine
+                .handle
+                .wait_for_piece_ready(idx, start_offset_hint, readiness_timeout, playback_intent)
+                .await
+            {
+                Ok(readiness) => readiness,
+                Err(e) => {
+                    tracing::warn!(
+                        stream_id,
+                        info_hash = %info_hash,
+                        file_idx = idx,
+                        intent = ?playback_intent,
+                        error = %e,
+                        "direct stream readiness failed"
+                    );
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!("Stream piece could not be prepared: {}", e),
+                    )
+                        .into_response();
+                }
+            };
+
+            if !readiness.ready {
+                let readiness_timeout_is_fatal = false;
+                if readiness_timeout_is_fatal {
+                    tracing::warn!(
+                        stream_id,
+                        info_hash = %info_hash,
+                        file_idx = idx,
+                        intent = ?playback_intent,
+                        piece = readiness.piece,
+                        ready_pieces = readiness.ready_pieces,
+                        target_pieces = readiness.target_pieces,
+                        peers = readiness.peers,
+                        download_rate = readiness.download_rate,
+                        elapsed_ms = readiness.elapsed_ms,
+                        timeout_ms = readiness_timeout.as_millis() as u64,
+                        reason = %readiness.reason,
+                        fatal = true,
+                        "direct stream readiness timed out"
+                    );
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!(
+                            "Stream piece was not ready after {}s (piece {}, peers {}, rate {} B/s)",
+                            readiness_timeout.as_secs(),
+                            readiness.piece,
+                            readiness.peers,
+                            readiness.download_rate
+                        ),
+                    )
+                        .into_response();
+                }
+
+                tracing::warn!(
+                    stream_id,
+                    info_hash = %info_hash,
+                    file_idx = idx,
+                    intent = ?playback_intent,
+                    piece = readiness.piece,
+                    ready_pieces = readiness.ready_pieces,
+                    target_pieces = readiness.target_pieces,
+                    peers = readiness.peers,
+                    download_rate = readiness.download_rate,
+                    elapsed_ms = readiness.elapsed_ms,
+                    timeout_ms = readiness_timeout.as_millis() as u64,
+                    reason = %readiness.reason,
+                    fatal = false,
+                    "direct stream readiness timed out; continuing with body wait"
+                );
+            } else {
+                tracing::info!(
+                    stream_id,
+                    info_hash = %info_hash,
+                    file_idx = idx,
+                    intent = ?playback_intent,
+                    piece = readiness.piece,
+                    ready_pieces = readiness.ready_pieces,
+                    target_pieces = readiness.target_pieces,
+                    peers = readiness.peers,
+                    download_rate = readiness.download_rate,
+                    elapsed_ms = readiness.elapsed_ms,
+                    reason = %readiness.reason,
+                    "direct stream readiness satisfied"
+                );
+            }
         }
 
         // Seek to the start position
         if start > 0 {
-            tracing::debug!("stream_video: Seeking to {}", start);
+            tracing::debug!(
+                stream_id,
+                info_hash = %info_hash,
+                file_idx = idx,
+                start,
+                "stream_video seeking"
+            );
             if let Err(e) = file.seek(std::io::SeekFrom::Start(start)).await {
-                tracing::warn!("Seek error: {}", e);
+                tracing::warn!(
+                    stream_id,
+                    info_hash = %info_hash,
+                    file_idx = idx,
+                    error = %e,
+                    "stream_video seek error"
+                );
                 return (StatusCode::INTERNAL_SERVER_ERROR, "Seek failed").into_response();
             }
-            tracing::debug!("stream_video: Seek complete");
+            tracing::debug!(stream_id, "stream_video seek complete");
         }
 
         let content_length = end - start + 1;
@@ -313,7 +555,14 @@ pub async fn stream_video(
         let mime = content_type_for_name(&name);
 
         // Log detected file type
-        tracing::info!("Media file detected: {} ({})", name, mime);
+        tracing::info!(
+            stream_id,
+            info_hash = %info_hash,
+            file_idx = idx,
+            content_type = mime,
+            file_name = %name,
+            "media file detected"
+        );
 
         res_headers.insert(header::CONTENT_TYPE, mime.parse().unwrap());
 
@@ -340,19 +589,19 @@ pub async fn stream_video(
         // Wrap with StreamGuard to notify when stream ends
         let guarded_stream = StreamGuard {
             inner: base_stream,
-            engine: Arc::new(state.clone()),
-            info_hash: info_hash.clone(),
-            file_idx: idx,
-            notified: false,
+            _lifecycle: lifecycle,
         };
         let body = Body::from_stream(guarded_stream);
 
         tracing::info!(
-            "startup: direct stream response ready in {:?} (range {}-{}, partial={})",
-            request_start.elapsed(),
-            start,
-            end,
-            is_partial
+            stream_id,
+            info_hash = %info_hash,
+            file_idx = idx,
+            elapsed_ms = request_start.elapsed().as_millis() as u64,
+            range_start = start,
+            range_end = end,
+            partial = is_partial,
+            "startup: direct stream response ready"
         );
 
         if is_partial {
@@ -361,6 +610,12 @@ pub async fn stream_video(
             (StatusCode::OK, res_headers, body).into_response()
         }
     } else {
+        tracing::warn!(
+            stream_id,
+            info_hash = %info_hash,
+            file_idx = idx,
+            "stream_video get_file returned none after stream start"
+        );
         (StatusCode::NOT_FOUND, "File not found").into_response()
     }
 }

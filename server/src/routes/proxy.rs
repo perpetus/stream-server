@@ -1,10 +1,10 @@
 use crate::state::AppState;
 use axum::{
+    Router,
     extract::{Path, Query},
-    http::{header, HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     routing::any,
-    Router,
 };
 use reqwest::{Client, Method};
 use std::collections::HashMap;

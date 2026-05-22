@@ -1,11 +1,11 @@
-use super::session::NzbSession;
 use super::parser::NzbFile;
-use std::sync::Arc;
+use super::session::NzbSession;
+use bytes::Bytes;
+use std::io::{Error, ErrorKind, Result};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, ReadBuf};
-use std::io::{Result, Error, ErrorKind};
-use bytes::Bytes;
 
 pub struct NzbFileStream {
     session: Arc<NzbSession>,
@@ -28,7 +28,7 @@ impl NzbFileStream {
         // Sort segments by number just in case
         let mut file = file;
         file.segments.segments.sort_by_key(|s| s.number);
-        
+
         Self {
             session,
             file,
@@ -56,7 +56,9 @@ impl AsyncRead for NzbFileStream {
             }
 
             // 2. If no buffer and no more segments, EOF
-            if self.current_segment_idx >= self.file.segments.segments.len() && self.fetch_future.is_none() {
+            if self.current_segment_idx >= self.file.segments.segments.len()
+                && self.fetch_future.is_none()
+            {
                 return Poll::Ready(Ok(()));
             }
 
@@ -66,7 +68,7 @@ impl AsyncRead for NzbFileStream {
                     Poll::Ready(result) => {
                         self.fetch_future = None;
                         self.fetching = false;
-                        
+
                         match result {
                             Ok(Ok(raw_body)) => {
                                 // Decode yEnc
@@ -77,18 +79,25 @@ impl AsyncRead for NzbFileStream {
                                 // If crate is not straightforward, we do simplistic decode for now.
                                 // Note: `yenc` crate on crates.io is minimal.
                                 // Let's try `yenc::decode`.
-                                
+
                                 // Parse raw_body for yEnc
                                 let decoded = match decode_yenc(&raw_body) {
                                     Ok(d) => d,
-                                    Err(e) => return Poll::Ready(Err(Error::new(ErrorKind::InvalidData, e.to_string()))),
+                                    Err(e) => {
+                                        return Poll::Ready(Err(Error::new(
+                                            ErrorKind::InvalidData,
+                                            e.to_string(),
+                                        )));
+                                    }
                                 };
-                                
+
                                 self.buffer = Bytes::from(decoded);
                                 self.current_segment_idx += 1;
                                 continue; // Loop back to write to buf
                             }
-                            Ok(Err(e)) => Poll::Ready(Err(Error::new(ErrorKind::Other, e.to_string()))),
+                            Ok(Err(e)) => {
+                                Poll::Ready(Err(Error::new(ErrorKind::Other, e.to_string())))
+                            }
                             Err(e) => Poll::Ready(Err(Error::new(ErrorKind::Other, e.to_string()))), // JoinError
                         }
                     }
@@ -101,7 +110,8 @@ impl AsyncRead for NzbFileStream {
                 let segment = self.file.segments.segments[self.current_segment_idx].clone();
                 let session = self.session.clone();
                 let fut = tokio::spawn(async move {
-                    session.fetch_segment(&segment.id)
+                    session
+                        .fetch_segment(&segment.id)
                         .await
                         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
                 });
@@ -120,55 +130,58 @@ fn decode_yenc(input: &[u8]) -> anyhow::Result<Vec<u8>> {
     // Find =ypart (optional)
     // Decode data
     // Find =yend
-    
+
     // Naive implementation for MVP
     let start_marker = b"=ybegin";
     let part_marker = b"=ypart";
-    
+
     // Find start
-    let start_idx = input.windows(start_marker.len())
+    let start_idx = input
+        .windows(start_marker.len())
         .position(|w| w == start_marker)
         .unwrap_or(0); // If no header, maybe raw? But NNTP usually has header.
-        
+
     // Find data start (newline after header(s))
     let mut data_start = start_idx;
     // Skip line
     if let Some(pos) = input[start_idx..].iter().position(|&b| b == b'\n') {
         data_start += pos + 1;
     }
-    
+
     // Check for =ypart
     if input[data_start..].starts_with(part_marker) {
         if let Some(pos) = input[data_start..].iter().position(|&b| b == b'\n') {
             data_start += pos + 1;
         }
     }
-    
+
     let mut output = Vec::with_capacity(input.len());
     let mut i = data_start;
-    
+
     while i < input.len() {
         let b = input[i];
-        
+
         // Check for end
         if b == b'=' && input[i..].starts_with(b"=yend") {
             break;
         }
-        
+
         if b == b'=' {
             // Escape next
             i += 1;
-            if i >= input.len() { break; }
+            if i >= input.len() {
+                break;
+            }
             let escaped = input[i];
             output.push((escaped.wrapping_sub(64)).wrapping_sub(42));
         } else if b == b'\r' || b == b'\n' {
             // Ignore newlines in body? yEnc usually ignores them, but they might mean end of line.
             // "The CR/LF pairs at the end of each line are not part of the data"
         } else {
-             output.push(b.wrapping_sub(42));
+            output.push(b.wrapping_sub(42));
         }
         i += 1;
     }
-    
+
     Ok(output)
 }

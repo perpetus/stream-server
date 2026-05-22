@@ -1,6 +1,6 @@
 use crossbeam_channel::Sender;
 use tracing::{Event, Subscriber};
-use tracing_subscriber::{layer::Context, Layer};
+use tracing_subscriber::{Layer, layer::Context};
 
 pub struct TuiLogLayer {
     sender: Sender<String>,

@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncSeek};
 
 #[cfg(feature = "librqbit")]
@@ -32,6 +33,7 @@ pub trait TorrentBackend: Send + Sync {
     async fn get_torrent(&self, info_hash: &str) -> Option<Self::Handle>;
     async fn remove_torrent(&self, info_hash: &str) -> Result<()>;
     async fn list_torrents(&self) -> Vec<String>;
+    async fn memory_diagnostics(&self) -> BackendMemoryDiagnostics;
 }
 
 #[async_trait::async_trait]
@@ -47,6 +49,7 @@ pub trait TorrentHandle: Send + Sync + Clone {
         start_offset: u64,
         priority: u8,
         bitrate: Option<u64>,
+        intent: priorities::PlaybackIntent,
     ) -> Result<Box<dyn FileStreamTrait>>;
     async fn get_files(&self) -> Vec<BackendFileInfo>;
     /// Get the local filesystem path for a file (for probing without HTTP loopback)
@@ -58,6 +61,46 @@ pub trait TorrentHandle: Send + Sync + Clone {
     /// Clear streaming state for a file (set priority to 0, clear piece deadlines).
     /// Called when switching to a different file to ensure exclusive downloading.
     async fn clear_file_streaming(&self, file_idx: usize) -> Result<()>;
+    /// Wait until the first piece needed for the requested offset is readable.
+    async fn wait_for_piece_ready(
+        &self,
+        file_idx: usize,
+        offset: u64,
+        timeout: Duration,
+        intent: priorities::PlaybackIntent,
+    ) -> Result<PieceReadiness>;
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PieceReadiness {
+    pub ready: bool,
+    pub piece: i32,
+    pub ready_pieces: u32,
+    pub target_pieces: u32,
+    pub elapsed_ms: u64,
+    pub peers: u64,
+    pub download_rate: u64,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct BackendMemoryDiagnostics {
+    pub native_storage_bytes: u64,
+    pub native_storage_pieces: u64,
+    pub native_total_read_bytes: u64,
+    pub native_total_write_bytes: u64,
+    pub rust_piece_cache_entries: u64,
+    pub rust_piece_cache_bytes: u64,
+    pub waiter_keys: u64,
+    pub waiter_wakers: u64,
+    pub torrents: Vec<TorrentMemoryDiagnostics>,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct TorrentMemoryDiagnostics {
+    pub info_hash: String,
+    pub native_storage_bytes: u64,
+    pub native_storage_pieces: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

@@ -194,7 +194,13 @@ async fn stream_file(
             if let Some(idx) = files.iter().position(|f| f.name == archive_internal_path) {
                 // get_file_reader(idx, offset, priority)
                 let reader = handle
-                    .get_file_reader(idx, 0, 7, None)
+                    .get_file_reader(
+                        idx,
+                        0,
+                        7,
+                        None,
+                        enginefs::backend::priorities::PlaybackIntent::DirectInitial,
+                    )
                     .await // 7 = high priority
                     .map_err(|e| {
                         tracing::error!("Failed to get file stream: {}", e);

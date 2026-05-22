@@ -1,7 +1,7 @@
 use crate::backend::{FileStreamTrait, TorrentHandle};
 use std::pin::Pin;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncSeek};
 

@@ -239,6 +239,8 @@ impl PieceCacheManager {
         // Clear from disk tracking
         let mut disk_written = self.disk_written.write().await;
         disk_written.retain(|(ih, _)| ih != &info_hash_lower);
+        let mut pending = self.pending_requests.write().await;
+        pending.retain(|(ih, _)| ih != &info_hash_lower);
 
         // Optionally clean disk files in background
         if self.config.disk_cache_enabled {

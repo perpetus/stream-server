@@ -1,11 +1,11 @@
 #![allow(dead_code)]
-use std::io::{Read, Seek, SeekFrom, Result as IoResult, Error, ErrorKind};
+use std::io::{Error, ErrorKind, Read, Result as IoResult, Seek, SeekFrom};
 use tokio::sync::oneshot;
 
 /// Commands sent from the Sync world to the Async world
 enum BridgeCommand {
-    Read(usize),      // Request N bytes
-    Seek(SeekFrom),   // Request Seek
+    Read(usize),    // Request N bytes
+    Seek(SeekFrom), // Request Seek
     Shutdown,
 }
 
@@ -30,19 +30,21 @@ impl Read for SyncReaderBridge {
     fn read(&mut self, buf: &mut [u8]) -> IoResult<usize> {
         let (resp_tx, resp_rx) = oneshot::channel();
         let buf_len = buf.len();
-        
-        self.tx.send((BridgeCommand::Read(buf_len), resp_tx))
-             .map_err(|_| Error::new(ErrorKind::BrokenPipe, "Async backend closed"))?;
-             
-        let response = resp_rx.blocking_recv()
+
+        self.tx
+            .send((BridgeCommand::Read(buf_len), resp_tx))
+            .map_err(|_| Error::new(ErrorKind::BrokenPipe, "Async backend closed"))?;
+
+        let response = resp_rx
+            .blocking_recv()
             .map_err(|_| Error::new(ErrorKind::BrokenPipe, "Response dropped"))?;
-            
+
         match response {
             BridgeResponse::Read(Ok(data)) => {
                 let len = std::cmp::min(buf.len(), data.len());
                 buf[0..len].copy_from_slice(&data[0..len]);
                 Ok(len)
-            },
+            }
             BridgeResponse::Read(Err(e)) => Err(e),
             _ => Err(Error::new(ErrorKind::InvalidData, "Invalid response type")),
         }
@@ -52,12 +54,14 @@ impl Read for SyncReaderBridge {
 impl Seek for SyncReaderBridge {
     fn seek(&mut self, pos: SeekFrom) -> IoResult<u64> {
         let (resp_tx, resp_rx) = oneshot::channel();
-        self.tx.send((BridgeCommand::Seek(pos), resp_tx))
-             .map_err(|_| Error::new(ErrorKind::BrokenPipe, "Async backend closed"))?;
-             
-        let response = resp_rx.blocking_recv()
+        self.tx
+            .send((BridgeCommand::Seek(pos), resp_tx))
+            .map_err(|_| Error::new(ErrorKind::BrokenPipe, "Async backend closed"))?;
+
+        let response = resp_rx
+            .blocking_recv()
             .map_err(|_| Error::new(ErrorKind::BrokenPipe, "Response dropped"))?;
-            
+
         match response {
             BridgeResponse::Seek(res) => res,
             _ => Err(Error::new(ErrorKind::InvalidData, "Invalid response type")),
@@ -66,11 +70,17 @@ impl Seek for SyncReaderBridge {
 }
 
 // Factory function
-pub fn create_bridge(mut reader: Box<dyn crate::archives::AsyncSeekableReader>) -> (SyncReaderBridge, impl std::future::Future<Output = ()> + Send) {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(BridgeCommand, oneshot::Sender<BridgeResponse>)>();
-    
+pub fn create_bridge(
+    mut reader: Box<dyn crate::archives::AsyncSeekableReader>,
+) -> (
+    SyncReaderBridge,
+    impl std::future::Future<Output = ()> + Send,
+) {
+    let (tx, mut rx) =
+        tokio::sync::mpsc::unbounded_channel::<(BridgeCommand, oneshot::Sender<BridgeResponse>)>();
+
     let bridge = SyncReaderBridge { tx };
-    
+
     let background_task = async move {
         while let Some((cmd, respond_to)) = rx.recv().await {
             match cmd {
@@ -80,20 +90,20 @@ pub fn create_bridge(mut reader: Box<dyn crate::archives::AsyncSeekableReader>) 
                         Ok(n) => {
                             buf.truncate(n);
                             let _ = respond_to.send(BridgeResponse::Read(Ok(buf)));
-                        },
+                        }
                         Err(e) => {
                             let _ = respond_to.send(BridgeResponse::Read(Err(e)));
                         }
                     }
-                },
+                }
                 BridgeCommand::Seek(pos) => {
                     let res = tokio::io::AsyncSeekExt::seek(&mut reader, pos).await;
                     let _ = respond_to.send(BridgeResponse::Seek(res));
-                },
+                }
                 BridgeCommand::Shutdown => break,
             }
         }
     };
-    
+
     (bridge, background_task)
 }

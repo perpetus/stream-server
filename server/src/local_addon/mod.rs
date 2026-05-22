@@ -1,22 +1,21 @@
 pub mod index;
+pub mod manifest;
 pub mod parser;
 pub mod resolver;
 pub mod scanner;
-pub mod manifest;
 pub mod torrent;
 
-use axum::{
-    routing::get,
-    Router,
-    extract::{Path, State},
-    Json,
-};
-use serde_json::{json, Value};
 use self::manifest::get_manifest;
 use crate::state::AppState;
+use axum::{
+    Json, Router,
+    extract::{Path, State},
+    routing::get,
+};
+use serde_json::{Value, json};
 
-pub use self::scanner::scan_background;
 pub use self::index::LocalIndex;
+pub use self::scanner::scan_background;
 
 pub fn get_router() -> Router<AppState> {
     Router::new()
@@ -31,10 +30,7 @@ async fn handle_manifest() -> Json<manifest::Manifest> {
     Json(get_manifest())
 }
 
-async fn handle_catalog(
-    state: State<AppState>,
-    path: Path<(String, String)>,
-) -> Json<Value> {
+async fn handle_catalog(state: State<AppState>, path: Path<(String, String)>) -> Json<Value> {
     let (type_, id_ext) = path.0;
     let id = id_ext.strip_suffix(".json").unwrap_or(&id_ext).to_string();
     _handle_catalog(state, type_, id, None)
@@ -44,7 +40,10 @@ async fn handle_catalog_extra(
     state: State<AppState>,
     Path((type_, id, extra_ext)): Path<(String, String, String)>,
 ) -> Json<Value> {
-    let extra = extra_ext.strip_suffix(".json").unwrap_or(&extra_ext).to_string();
+    let extra = extra_ext
+        .strip_suffix(".json")
+        .unwrap_or(&extra_ext)
+        .to_string();
     _handle_catalog(state, type_, id, Some(extra))
 }
 
@@ -56,14 +55,15 @@ fn _handle_catalog(
 ) -> Json<Value> {
     // Simple catalog: Return everything matching the type
     let items = state.local_index.items.read().unwrap();
-    let metas: Vec<Value> = items.values()
+    let metas: Vec<Value> = items
+        .values()
         .flatten()
         .filter(|item| item.metadata.type_ == type_)
         // De-duplicate by IMDB ID
         .fold(std::collections::HashMap::new(), |mut acc, item| {
             let key = item.imdb_id.clone().unwrap_or_else(|| item.path.clone());
-             acc.entry(key).or_insert(item);
-             acc
+            acc.entry(key).or_insert(item);
+            acc
         })
         .values()
         .map(|item| {
@@ -85,24 +85,29 @@ async fn handle_meta(
     Path((type_, id_ext)): Path<(String, String)>,
 ) -> Json<Value> {
     let id = id_ext.strip_suffix(".json").unwrap_or(&id_ext).to_string();
-    
+
     // Handle bt: prefix - query engine directly
     if id.starts_with("bt:") {
         let info_hash = id.strip_prefix("bt:").unwrap_or(&id).to_lowercase();
         if let Some(engine) = state.engine.get_engine(&info_hash).await {
             let stats = engine.get_statistics().await;
-            let videos: Vec<Value> = stats.files.iter().enumerate().map(|(idx, file)| {
-                json!({
-                    "id": format!("{}:{}", id, idx),
-                    "title": file.name.clone(),
-                    "released": "2020-01-01T00:00:00.000Z",
-                    "stream": {
-                        "infoHash": info_hash,
-                        "fileIdx": idx,
-                    }
+            let videos: Vec<Value> = stats
+                .files
+                .iter()
+                .enumerate()
+                .map(|(idx, file)| {
+                    json!({
+                        "id": format!("{}:{}", id, idx),
+                        "title": file.name.clone(),
+                        "released": "2020-01-01T00:00:00.000Z",
+                        "stream": {
+                            "infoHash": info_hash,
+                            "fileIdx": idx,
+                        }
+                    })
                 })
-            }).collect();
-            
+                .collect();
+
             let meta = json!({
                 "id": id,
                 "type": type_,
@@ -116,13 +121,13 @@ async fn handle_meta(
         }
         return Json(json!({ "meta": null }));
     }
-    
+
     // Handle local: prefix - use local index
     let items_map = state.local_index.items.read().unwrap();
     if let Some(items) = items_map.get(&id) {
         if let Some(first) = items.first() {
-             // For series, we might want to list videos
-             let videos: Vec<Value> = items.iter().map(|it| {
+            // For series, we might want to list videos
+            let videos: Vec<Value> = items.iter().map(|it| {
                  json!({
                      "id": format!("{}:{}:{}", id, it.metadata.season.unwrap_or(1), it.metadata.episode.as_ref().map(|v| v[0]).unwrap_or(1)),
                      "title": it.metadata.name.clone(),
@@ -132,13 +137,13 @@ async fn handle_meta(
                  })
              }).collect();
 
-             let meta = json!({
-                 "id": id,
-                 "type": type_,
-                 "name": first.metadata.name,
-                 "videos": videos,
-             });
-             return Json(json!({ "meta": meta }));
+            let meta = json!({
+                "id": id,
+                "type": type_,
+                "name": first.metadata.name,
+                "videos": videos,
+            });
+            return Json(json!({ "meta": meta }));
         }
     }
     Json(json!({ "meta": null }))
@@ -149,20 +154,24 @@ async fn handle_stream(
     Path((_type, id_ext)): Path<(String, String)>,
 ) -> Json<Value> {
     let id = id_ext.strip_suffix(".json").unwrap_or(&id_ext);
-    
+
     let parts: Vec<&str> = id.split(':').collect();
     if parts.len() < 2 {
         return Json(json!({ "streams": [] }));
     }
-    
+
     // Handle bt: prefix - query engine directly
     if parts[0] == "bt" {
         let info_hash = parts[1].to_lowercase();
         let file_idx: usize = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
-        
+
         if let Some(engine) = state.engine.get_engine(&info_hash).await {
             let stats = engine.get_statistics().await;
-            let file_name = stats.files.get(file_idx).map(|f| f.name.clone()).unwrap_or_else(|| "Unknown".to_string());
+            let file_name = stats
+                .files
+                .get(file_idx)
+                .map(|f| f.name.clone())
+                .unwrap_or_else(|| "Unknown".to_string());
             return Json(json!({
                 "streams": [{
                     "title": file_name,
@@ -176,10 +185,10 @@ async fn handle_stream(
         }
         return Json(json!({ "streams": [] }));
     }
-    
+
     // Handle local: prefix - use local index
     let base_id = format!("{}:{}", parts[0], parts[1]); // local:ttXXXX
-    
+
     let items_map = state.local_index.items.read().unwrap();
     if let Some(items) = items_map.get(&base_id) {
         // Filter by S:E if present
@@ -188,8 +197,13 @@ async fn handle_stream(
 
         let matched_item = items.iter().find(|it| {
             if target_season.is_some() {
-                 it.metadata.season == target_season && 
-                 it.metadata.episode.as_ref().map(|e| e.contains(&target_episode.unwrap_or(1))).unwrap_or(false)
+                it.metadata.season == target_season
+                    && it
+                        .metadata
+                        .episode
+                        .as_ref()
+                        .map(|e| e.contains(&target_episode.unwrap_or(1)))
+                        .unwrap_or(false)
             } else {
                 true // Movie match
             }
@@ -198,17 +212,17 @@ async fn handle_stream(
         if let Some(item) = matched_item {
             if let (Some(info_hash), Some(file_idx)) = (&item.info_hash, item.file_idx) {
                 // Torrent Stream
-                 return Json(json!({
-                     "streams": [{
-                         "title": item.metadata.name.clone().unwrap_or("Torrent File".to_string()),
-                         "infoHash": info_hash,
-                         "fileIdx": file_idx,
-                         "behaviorHints": {
-                             "notWebReady": false // Can stream via enginefs
-                         }
-                     }]
-                 }));
-             } else {
+                return Json(json!({
+                    "streams": [{
+                        "title": item.metadata.name.clone().unwrap_or("Torrent File".to_string()),
+                        "infoHash": info_hash,
+                        "fileIdx": file_idx,
+                        "behaviorHints": {
+                            "notWebReady": false // Can stream via enginefs
+                        }
+                    }]
+                }));
+            } else {
                 // Check for archive path
                 if item.path.starts_with("archive:") {
                     // path format: archive:{abs_path}|{internal_path}
@@ -220,7 +234,7 @@ async fn handle_stream(
                             urlencoding::encode(archive_path),
                             urlencoding::encode(internal_path)
                         );
-                        
+
                         return Json(json!({
                             "streams": [{
                                 "title": item.metadata.name.clone().unwrap_or("Archive File".to_string()),
@@ -235,19 +249,18 @@ async fn handle_stream(
                 }
 
                 // Local File Stream
-                 return Json(json!({
-                     "streams": [{
-                         "title": "Local File",
-                         "url": format!("file://{}", item.path),
-                         "behaviorHints": {
-                             "notWebReady": true
-                         }
-                     }]
-                 }));
-             }
+                return Json(json!({
+                    "streams": [{
+                        "title": "Local File",
+                        "url": format!("file://{}", item.path),
+                        "behaviorHints": {
+                            "notWebReady": true
+                        }
+                    }]
+                }));
+            }
         }
     }
-    
+
     Json(json!({ "streams": [] }))
 }
-

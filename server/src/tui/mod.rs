@@ -6,16 +6,16 @@ use crossterm::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseEventKind,
     },
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use enginefs::backend::EngineStats;
 use ratatui::{
+    Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tabs},
-    Terminal,
 };
 
 pub mod log_layer;
@@ -402,7 +402,7 @@ fn run_tui(
     // Signal shutdown immediately using blocking_send (not async spawn)
     // This ensures the shutdown signal is delivered before we return
     let _ = shutdown_tx.blocking_send(());
-    
+
     // Force exit after a short grace period to handle any stuck connections
     std::thread::spawn(|| {
         std::thread::sleep(Duration::from_secs(2));

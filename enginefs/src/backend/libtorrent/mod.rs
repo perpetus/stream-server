@@ -7,7 +7,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use crate::backend::{TorrentBackend, TorrentSource};
+use crate::backend::{
+    BackendMemoryDiagnostics, TorrentBackend, TorrentMemoryDiagnostics, TorrentSource,
+};
 use crate::tracker_prober::TrackerProber;
 
 use libtorrent_sys::{LibtorrentSession, SessionSettings};
@@ -35,6 +37,8 @@ pub struct LibtorrentBackend {
     piece_cache: Arc<crate::piece_cache::PieceCacheManager>,
     /// Registry of wakers waiting for pieces to finish downloading
     piece_waiter: Arc<crate::piece_waiter::PieceWaiterRegistry>,
+    /// Torrent/file metadata inspections already scheduled for this backend lifetime
+    metadata_inspections: Arc<tokio::sync::Mutex<std::collections::HashSet<(String, usize)>>>,
 }
 
 impl LibtorrentBackend {
@@ -93,6 +97,8 @@ impl LibtorrentBackend {
         ));
 
         let piece_waiter = Arc::new(crate::piece_waiter::PieceWaiterRegistry::new());
+        let metadata_inspections =
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
 
         let backend = Self {
             session: Arc::new(RwLock::new(session)),
@@ -102,6 +108,7 @@ impl LibtorrentBackend {
             stream_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             piece_cache,
             piece_waiter,
+            metadata_inspections,
         };
         backend.start_monitor_task();
         Ok(backend)
@@ -133,6 +140,8 @@ impl LibtorrentBackend {
         ));
 
         let piece_waiter = Arc::new(crate::piece_waiter::PieceWaiterRegistry::new());
+        let metadata_inspections =
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
 
         let backend = Self {
             session: Arc::new(RwLock::new(session)),
@@ -142,6 +151,7 @@ impl LibtorrentBackend {
             stream_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             piece_cache,
             piece_waiter,
+            metadata_inspections,
         };
         backend.start_monitor_task();
         Ok(backend)
@@ -224,9 +234,7 @@ impl LibtorrentBackend {
                         );
                     }
 
-                    // Handle piece_finished_alert: read piece data directly from memory storage
-                    // We bypass libtorrent's read_piece() which fails with custom disk interfaces
-                    // due to "invalid piece index in slot list" errors.
+                    // Handle piece_finished_alert: read piece data directly from memory storage.
                     if alert.alert_type == piece_finished_alert_type && alert.piece_index >= 0 {
                         tracing::info!(
                             "piece_finished_alert piece={} info_hash={}",
@@ -234,7 +242,13 @@ impl LibtorrentBackend {
                             alert.info_hash,
                         );
 
-                        let piece_data = libtorrent_sys::memory_read_piece_direct(alert.piece_index);
+                        if !alert.info_hash.is_empty() {
+                            libtorrent_sys::memory_label_last_unlabeled_storage(&alert.info_hash);
+                        }
+                        let piece_data = libtorrent_sys::memory_read_piece_direct(
+                            &alert.info_hash,
+                            alert.piece_index,
+                        );
                         if !piece_data.is_empty() {
                             let info_hash = alert.info_hash.clone();
                             let piece_idx = alert.piece_index;
@@ -256,12 +270,14 @@ impl LibtorrentBackend {
                                 alert.piece_index,
                                 alert.info_hash,
                             );
-                        }    // Still notify waiters so they can retry
-                            alert_piece_waiter
-                                .notify_piece_finished(&alert.info_hash, alert.piece_index);
                         }
+
+                        // Still notify waiters so they can retry if the storage read raced.
+                        alert_piece_waiter
+                            .notify_piece_finished(&alert.info_hash, alert.piece_index);
                     }
                 }
+            }
         });
 
         // === SLOW MONITOR ===
@@ -569,6 +585,7 @@ impl TorrentBackend for LibtorrentBackend {
             stream_counter: self.stream_counter.clone(),
             piece_cache: self.piece_cache.clone(),
             piece_waiter: self.piece_waiter.clone(),
+            metadata_inspections: self.metadata_inspections.clone(),
         })
     }
 
@@ -583,22 +600,32 @@ impl TorrentBackend for LibtorrentBackend {
                 stream_counter: self.stream_counter.clone(),
                 piece_cache: self.piece_cache.clone(),
                 piece_waiter: self.piece_waiter.clone(),
+                metadata_inspections: self.metadata_inspections.clone(),
             }),
             Err(_) => None,
         }
     }
 
     async fn remove_torrent(&self, info_hash: &str) -> Result<()> {
-        let mut session = self.session.write().await;
-        let handle = session
-            .find_torrent(info_hash)
-            .map_err(|e| anyhow!("Torrent not found: {}", e))?;
-        session
-            .remove_torrent(&handle, false)
-            .map_err(|e| anyhow!("Failed to remove torrent: {}", e))?;
+        {
+            let mut session = self.session.write().await;
+            let handle = session
+                .find_torrent(info_hash)
+                .map_err(|e| anyhow!("Torrent not found: {}", e))?;
+            session
+                .remove_torrent(&handle, false)
+                .map_err(|e| anyhow!("Failed to remove torrent: {}", e))?;
+        }
+
+        self.piece_cache.clear_torrent(info_hash).await;
+        self.piece_waiter.clear_torrent(info_hash);
+        {
+            let mut inspections = self.metadata_inspections.lock().await;
+            inspections.retain(|(hash, _)| hash != info_hash);
+        }
+        libtorrent_sys::memory_clear_torrent(info_hash);
         Ok(())
     }
-
     async fn list_torrents(&self) -> Vec<String> {
         let session = self.session.read().await;
         session
@@ -606,5 +633,31 @@ impl TorrentBackend for LibtorrentBackend {
             .iter()
             .map(|t| t.info_hash.to_string())
             .collect()
+    }
+
+    async fn memory_diagnostics(&self) -> BackendMemoryDiagnostics {
+        let native = libtorrent_sys::memory_storage_stats();
+        let (rust_piece_cache_entries, rust_piece_cache_bytes) = self.piece_cache.stats();
+        let waiters = self.piece_waiter.stats();
+
+        BackendMemoryDiagnostics {
+            native_storage_bytes: native.total_bytes,
+            native_storage_pieces: native.total_pieces,
+            native_total_read_bytes: native.total_read_bytes,
+            native_total_write_bytes: native.total_write_bytes,
+            rust_piece_cache_entries,
+            rust_piece_cache_bytes,
+            waiter_keys: waiters.keys,
+            waiter_wakers: waiters.wakers,
+            torrents: native
+                .torrents
+                .into_iter()
+                .map(|torrent| TorrentMemoryDiagnostics {
+                    info_hash: torrent.info_hash,
+                    native_storage_bytes: torrent.bytes,
+                    native_storage_pieces: torrent.pieces,
+                })
+                .collect(),
+        }
     }
 }

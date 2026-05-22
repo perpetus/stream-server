@@ -1,4 +1,5 @@
 /target
+/target-patched
 /libtorrent-downloads
 /rqbit-downloads
 /vcpkg

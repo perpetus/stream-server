@@ -1,6 +1,7 @@
 use crate::backend::{
-    BackendFileInfo, EngineStats, FileStreamTrait, Growler, PeerSearch, StatsFile, StatsOptions,
-    SwarmCap, TorrentBackend, TorrentHandle, TorrentSource,
+    BackendFileInfo, BackendMemoryDiagnostics, EngineStats, FileStreamTrait, Growler, PeerSearch,
+    PieceReadiness, StatsFile, StatsOptions, SwarmCap, TorrentBackend, TorrentHandle,
+    TorrentSource,
 };
 use anyhow::{Context, Result};
 use librqbit::{ManagedTorrent, Session};
@@ -145,6 +146,10 @@ impl TorrentBackend for LibrqbitBackend {
     async fn list_torrents(&self) -> Vec<String> {
         Vec::new()
     }
+
+    async fn memory_diagnostics(&self) -> BackendMemoryDiagnostics {
+        BackendMemoryDiagnostics::default()
+    }
 }
 
 #[async_trait::async_trait]
@@ -196,6 +201,7 @@ impl TorrentHandle for LibrqbitHandle {
                         length: f.len,
                         offset,
                         downloaded: 0, // TODO: Implement per-file progress for librqbit if needed
+                        progress: 0.0,
                     });
                     total_size += f.len;
                     offset += f.len;
@@ -263,6 +269,7 @@ impl TorrentHandle for LibrqbitHandle {
         _start_offset: u64,
         _priority: u8,
         _bitrate: Option<u64>,
+        _intent: crate::backend::priorities::PlaybackIntent,
     ) -> Result<Box<dyn FileStreamTrait>> {
         let stream = self
             .handle
@@ -291,6 +298,33 @@ impl TorrentHandle for LibrqbitHandle {
         // librqbit doesn't expose local file paths easily
         // Return None to fall back to HTTP URL probing
         None
+    }
+
+    async fn prepare_file_for_streaming(&self, _file_idx: usize) -> Result<()> {
+        Ok(())
+    }
+
+    async fn clear_file_streaming(&self, _file_idx: usize) -> Result<()> {
+        Ok(())
+    }
+
+    async fn wait_for_piece_ready(
+        &self,
+        _file_idx: usize,
+        _offset: u64,
+        _timeout: Duration,
+        _intent: crate::backend::priorities::PlaybackIntent,
+    ) -> Result<PieceReadiness> {
+        Ok(PieceReadiness {
+            ready: true,
+            piece: -1,
+            ready_pieces: 1,
+            target_pieces: 1,
+            elapsed_ms: 0,
+            peers: 0,
+            download_rate: 0,
+            reason: "librqbit-reader".to_string(),
+        })
     }
 }
 

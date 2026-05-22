@@ -1,5 +1,5 @@
 use super::{ArchiveEntry, ArchiveReader, AsyncSeekableReader, cache::ProgressiveCache};
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use std::path::PathBuf;
 
 use flate2::read::GzDecoder;
@@ -23,7 +23,7 @@ impl ArchiveReader for TgzHandler {
             let tar = GzDecoder::new(file);
             let mut archive = tar::Archive::new(tar);
             let mut entries = Vec::new();
-            
+
             for file in archive.entries()? {
                 let file = file?;
                 entries.push(ArchiveEntry {
@@ -33,45 +33,48 @@ impl ArchiveReader for TgzHandler {
                 });
             }
             Ok(entries)
-        }).await?
+        })
+        .await?
     }
 
     async fn open_file(&self, path: &str) -> Result<Box<dyn AsyncSeekableReader>> {
         // TGZ requires decompression. Random access is impossible without decompressing up to that point.
         // We use ProgressiveCache + spawn_blocking to decompress directly to cache.
         // This supports seeking on result.
-        
+
         let path_clone = self.path.clone();
         let target_path = path.to_string();
-        
+
         // We don't know the file size unless we scanned it in list_files OR we scan now.
         // For efficiency, we scan and extract in one go.
-        // But we need to know size for Cache if possible? 
+        // But we need to know size for Cache if possible?
         // Cache works without total_size (Video player might dislike unknown duration, but it works).
-        
+
         // If we want size, we rely on list_files info?
         // Let's assume size unknown for now or implement "scan header first".
         // `tar` entries have size in header!
         // So we will find the header, get size, create cache, then extract.
-        
+
         // Optimization: Create cache immediately with None, start thread.
-        // When thread finds header, it can update total_size? 
+        // When thread finds header, it can update total_size?
         // ProgressiveCache `new` takes explicit size.
         // We can just use `None` size.
-        
+
         let (cache, writer) = ProgressiveCache::new(None).await?;
-        
+
         std::thread::spawn(move || {
             let res = (|| -> Result<()> {
                 let file = std::fs::File::open(&path_clone)?;
                 let tar = GzDecoder::new(file);
                 let mut archive = tar::Archive::new(tar);
-                
+
                 let mut found = false;
-                
+
                 // Clone sync writer
-                let mut sync_writer = writer.try_clone_sync().map_err(|e| anyhow!("Failed to clone writer: {}", e))?;
-                
+                let mut sync_writer = writer
+                    .try_clone_sync()
+                    .map_err(|e| anyhow!("Failed to clone writer: {}", e))?;
+
                 // We iterate. This is slow for large TGZ but it's the only way.
                 for entry in archive.entries()? {
                     let mut entry = entry?;
@@ -82,13 +85,13 @@ impl ArchiveReader for TgzHandler {
                         break;
                     }
                 }
-                
+
                 if !found {
                     return Err(anyhow!("File not found in TGZ"));
                 }
                 Ok(())
             })();
-            
+
             if let Err(e) = res {
                 writer.set_error(e.to_string());
             } else {

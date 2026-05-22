@@ -21,7 +21,12 @@ fn get_extensions() -> &'static Regex {
 
 fn get_movie_keywords() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?i)(1080p|720p|480p|blurayrip|brrip|divx|dvdrip|hdrip|hdtv|tvrip|xvid|camrip)").unwrap())
+    RE.get_or_init(|| {
+        Regex::new(
+            r"(?i)(1080p|720p|480p|blurayrip|brrip|divx|dvdrip|hdrip|hdtv|tvrip|xvid|camrip)",
+        )
+        .unwrap()
+    })
 }
 
 fn get_season_regex() -> &'static Regex {
@@ -53,8 +58,11 @@ pub fn parse_filename(path: &Path) -> Option<VideoMetadata> {
     let mut meta = VideoMetadata::default();
     meta.type_ = "other".to_string();
 
-    let clean_name = filename.replace('.', " ").replace('_', " ").replace('-', " ");
-    
+    let clean_name = filename
+        .replace('.', " ")
+        .replace('_', " ")
+        .replace('-', " ");
+
     if let Some(caps) = get_year_regex().find(&clean_name) {
         if let Ok(year) = caps.as_str().parse::<i32>() {
             meta.year = Some(year);
@@ -66,7 +74,7 @@ pub fn parse_filename(path: &Path) -> Option<VideoMetadata> {
             meta.season = s.as_str().parse::<i32>().ok();
         }
     }
-    
+
     let mut episodes = Vec::new();
     for caps in get_episode_regex().captures_iter(&clean_name) {
         if let Some(e) = caps.get(1) {
@@ -78,7 +86,7 @@ pub fn parse_filename(path: &Path) -> Option<VideoMetadata> {
     if !episodes.is_empty() {
         meta.episode = Some(episodes);
     }
-    
+
     // Determine Type
     if meta.season.is_some() && meta.episode.is_some() {
         meta.type_ = "series".to_string();
@@ -89,22 +97,41 @@ pub fn parse_filename(path: &Path) -> Option<VideoMetadata> {
     let parts: Vec<&str> = clean_name.split_whitespace().collect();
     let mut name_parts = Vec::new();
     for part in parts {
-        if get_year_regex().is_match(part) || get_season_regex().is_match(part) || get_episode_regex().is_match(part) || get_movie_keywords().is_match(part) {
+        if get_year_regex().is_match(part)
+            || get_season_regex().is_match(part)
+            || get_episode_regex().is_match(part)
+            || get_movie_keywords().is_match(part)
+        {
             break;
         }
         name_parts.push(part);
     }
-    
+
     if !name_parts.is_empty() {
         meta.name = Some(name_parts.join(" "));
     } else {
-        meta.name = Some(path.file_stem()?.to_str()?.to_string().replace('.', " ").replace('_', " "));
+        meta.name = Some(
+            path.file_stem()?
+                .to_str()?
+                .to_string()
+                .replace('.', " ")
+                .replace('_', " "),
+        );
     }
 
-    if clean_name.contains("1080p") { meta.tags.push("1080p".to_string()); meta.tags.push("hd".to_string()); }
-    if clean_name.contains("720p") { meta.tags.push("720p".to_string()); }
-    if clean_name.contains("480p") { meta.tags.push("480p".to_string()); }
-    if get_sample_regex().is_match(&clean_name) { meta.tags.push("sample".to_string()); }
+    if clean_name.contains("1080p") {
+        meta.tags.push("1080p".to_string());
+        meta.tags.push("hd".to_string());
+    }
+    if clean_name.contains("720p") {
+        meta.tags.push("720p".to_string());
+    }
+    if clean_name.contains("480p") {
+        meta.tags.push("480p".to_string());
+    }
+    if get_sample_regex().is_match(&clean_name) {
+        meta.tags.push("sample".to_string());
+    }
 
     Some(meta)
 }

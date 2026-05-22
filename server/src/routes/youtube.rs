@@ -1,10 +1,10 @@
 use crate::state::AppState;
 use axum::{
+    Json, Router,
     extract::Path,
     http::StatusCode,
     response::{IntoResponse, Redirect},
     routing::get,
-    Json, Router,
 };
 
 pub fn router() -> Router<AppState> {
@@ -34,7 +34,7 @@ pub async fn redirect_youtube(Path(id): Path<String>) -> impl IntoResponse {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to get video info: {}", e),
             )
-                .into_response()
+                .into_response();
         }
     };
 
@@ -70,7 +70,7 @@ pub async fn get_youtube_json(Path(id): Path<String>) -> impl IntoResponse {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to get video info: {}", e),
             )
-                .into_response()
+                .into_response();
         }
     };
 

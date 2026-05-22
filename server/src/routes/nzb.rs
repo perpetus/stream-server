@@ -1,13 +1,12 @@
-use axum::{
-    extract::{Path, State},
-    response::{Response, IntoResponse},
-    routing::{get, post},
-    Router,
-    http::StatusCode,
-    Json,
-};
+use crate::archives::nzb::session::{NzbConfig, NzbServerConfig, NzbSession};
 use crate::state::AppState;
-use crate::archives::nzb::session::{NzbSession, NzbConfig, NzbServerConfig};
+use axum::{
+    Json, Router,
+    extract::{Path, State},
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    routing::{get, post},
+};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 // use std::path::PathBuf;
@@ -65,31 +64,50 @@ async fn create_session_internal(
     // 1. Fetch NZB content
     let nzb_content = reqwest::get(&payload.nzb_url)
         .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Failed to fetch NZB URL: {}", e)))?
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Failed to fetch NZB URL: {}", e),
+            )
+        })?
         .text()
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to read NZB content: {}", e)))?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to read NZB content: {}", e),
+            )
+        })?;
 
     // 2. Map config
     let config = NzbConfig {
         nzb_url: payload.nzb_url.clone(),
-        servers: payload.servers.into_iter().map(|s| NzbServerConfig {
-            host: s.host,
-            port: s.port,
-            user: s.user,
-            pass: s.pass,
-            ssl: s.ssl,
-            connections: s.connections,
-        }).collect(),
+        servers: payload
+            .servers
+            .into_iter()
+            .map(|s| NzbServerConfig {
+                host: s.host,
+                port: s.port,
+                user: s.user,
+                pass: s.pass,
+                ssl: s.ssl,
+                connections: s.connections,
+            })
+            .collect(),
     };
 
     // 3. Create Session
     let session = NzbSession::new(key.clone(), config, nzb_content)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to parse NZB: {}", e)))?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to parse NZB: {}", e),
+            )
+        })?;
 
     state.nzb_sessions.insert(key.clone(), session);
-    
+
     tracing::info!("Created NZB session {}", key);
 
     Ok(Json(CreateResponse { key }))
@@ -106,11 +124,16 @@ async fn stream_nzb_file(
                 return Ok(axum::body::Body::from_stream(reader_stream).into_response());
             }
             Err(e) => {
-                tracing::error!("Failed to find/open file {} in session {}: {}", file, key, e);
+                tracing::error!(
+                    "Failed to find/open file {} in session {}: {}",
+                    file,
+                    key,
+                    e
+                );
                 return Err(StatusCode::NOT_FOUND);
             }
         }
     }
-    
+
     Err(StatusCode::NOT_FOUND)
 }
