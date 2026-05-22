@@ -69,12 +69,13 @@ jobs:
           PKG_CONFIG_PATH: ${{ github.workspace }}\vcpkg_installed\x64-windows-static-release\lib\pkgconfig
 
       - name: Restore Source Code
-        run: git restore server enginefs bindings
+        run: git restore server enginefs bindings stremio-runtime-stub
 
       - name: Build Release
         run: |
           cargo clean -p server --release
           cargo build --release --target x86_64-pc-windows-msvc --features libtorrent --no-default-features
+          cargo build --release --target x86_64-pc-windows-msvc -p stremio-runtime-stub
         env:
           VCPKG_ROOT: ${{ github.workspace }}\vcpkg
           VCPKG_INSTALLED_DIR: ${{ github.workspace }}\vcpkg_installed
@@ -85,15 +86,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: server-windows-amd64
-          path: target/x86_64-pc-windows-msvc/release/server.exe
-
-      - name: Initialize WiX
-        run: cargo wix init --package server --force
-        env:
-          VCPKG_ROOT: ${{ github.workspace }}\vcpkg
-          VCPKG_INSTALLED_DIR: ${{ github.workspace }}\vcpkg_installed
-          VCPKGRS_TRIPLET: x64-windows-static-release
-          PKG_CONFIG_PATH: ${{ github.workspace }}\vcpkg_installed\x64-windows-static-release\lib\pkgconfig
+          path: |
+            target/x86_64-pc-windows-msvc/release/server.exe
+            target/x86_64-pc-windows-msvc/release/stremio-runtime.exe
 
       - name: Build MSI Installer
         run: cargo wix --package server --no-build --nocapture --target x86_64-pc-windows-msvc
@@ -286,6 +281,7 @@ jobs:
           mkdir -p release
           # Windows
           cp artifacts/server-windows-amd64/server.exe release/stream-server-windows-amd64.exe || true
+          cp artifacts/server-windows-amd64/stremio-runtime.exe release/stremio-runtime-windows-amd64.exe || true
           cp artifacts/server-windows-msi/*.msi release/ || true
           # Linux
           cp artifacts/server-linux-amd64/server release/stream-server-linux-amd64 || true

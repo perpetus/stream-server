@@ -86,29 +86,11 @@
         <Property Id='DiskPrompt' Value='server Installation'/>
 
         <Directory Id='TARGETDIR' Name='SourceDir'>
+            <!-- ============================================================
+                 Main server install - Program Files\server\bin
+                 ============================================================ -->
             <Directory Id='$(var.PlatformProgramFilesFolder)' Name='PFiles'>
                 <Directory Id='APPLICATIONFOLDER' Name='server'>
-                    
-                    <!--
-                      Enabling the license sidecar file in the installer is a four step process:
-
-                      1. Uncomment the `Component` tag and its contents.
-                      2. Change the value for the `Source` attribute in the `File` tag to a path
-                         to the file that should be included as the license sidecar file. The path
-                         can, and probably should be, relative to this file.
-                      3. Change the value for the `Name` attribute in the `File` tag to the
-                         desired name for the file when it is installed alongside the `bin` folder
-                         in the installation directory. This can be omitted if the desired name is
-                         the same as the file name.
-                      4. Uncomment the `ComponentRef` tag with the Id attribute value of "License"
-                         further down in this file.
-                    -->
-                    <!--
-                    <Component Id='License' Guid='*'>
-                        <File Id='LicenseFile' Name='ChangeMe' DiskId='1' Source='C:\Path\To\File' KeyPath='yes'/>
-                    </Component>
-                    -->
-
                     <Directory Id='Bin' Name='bin'>
                         <Component Id='Path' Guid='B2C3D4E5-F678-90AB-CDEF-123456789012' KeyPath='yes'>
                             <Environment
@@ -123,7 +105,7 @@
                         <Component Id='binary0' Guid='*'>
                             <File
                                 Id='exe0'
-                                Name='server.exe'
+                                Name='stream-server.exe'
                                 DiskId='1'
                                 Source='$(var.CargoTargetBinDir)\server.exe'
                                 KeyPath='yes'/>
@@ -131,23 +113,88 @@
                     </Directory>
                 </Directory>
             </Directory>
+
+            <!-- ============================================================
+                 Stremio integration (optional)
+                 Installs to %LOCALAPPDATA%\Programs\Stremio
+                 ============================================================ -->
+            <Directory Id='LocalAppDataFolder'>
+                <Directory Id='LocalPrograms' Name='Programs'>
+                    <Directory Id='STREMIOFOLDER' Name='Stremio'>
+                        <!--
+                          Back up the original Node.js stremio-runtime.exe
+                          before our stub overwrites it.
+                          MoveFile table (seq 3800) runs before InstallFiles (seq 4000).
+                        -->
+                        <Component Id='StremioBackup' Guid='C3D4E5F6-7890-ABCD-EF12-345678901234'>
+                            <RegistryValue
+                                Root='HKCU'
+                                Key='Software\Perpetus\StreamServer'
+                                Name='StremioBackupDone'
+                                Type='integer'
+                                Value='1'
+                                KeyPath='yes'/>
+                            <CopyFile
+                                Id='BackupStremioRuntime'
+                                SourceProperty='STREMIOFOLDER'
+                                SourceName='stremio-runtime.exe'
+                                DestinationProperty='STREMIOFOLDER'
+                                DestinationName='stremio-runtime.node.exe'
+                                Delete='yes'/>
+                        </Component>
+
+                        <!-- ICE38: components in user profile must use HKCU registry KeyPath -->
+                        <Component Id='StremioRuntimeStub' Guid='D4E5F678-90AB-CDEF-1234-567890ABCDEF'>
+                            <RegistryValue
+                                Root='HKCU'
+                                Key='Software\Perpetus\StreamServer'
+                                Name='StremioRuntimeInstalled'
+                                Type='integer'
+                                Value='1'
+                                KeyPath='yes'/>
+                            <File
+                                Id='StremioRuntimeExe'
+                                Name='stremio-runtime.exe'
+                                DiskId='1'
+                                Source='$(var.CargoTargetBinDir)\stremio-runtime.exe'/>
+                        </Component>
+
+                        <Component Id='StremioStreamServer' Guid='E5F67890-ABCD-EF12-3456-7890ABCDEF12'>
+                            <RegistryValue
+                                Root='HKCU'
+                                Key='Software\Perpetus\StreamServer'
+                                Name='StremioStreamServerInstalled'
+                                Type='integer'
+                                Value='1'
+                                KeyPath='yes'/>
+                            <File
+                                Id='StremioStreamServerExe'
+                                Name='stream-server.exe'
+                                DiskId='1'
+                                Source='$(var.CargoTargetBinDir)\server.exe'/>
+                            <!-- ICE64: register user-profile directories for cleanup on uninstall.
+                                 MSI only removes directories if empty, so Stremio's
+                                 own files keep the folder intact. -->
+                            <RemoveFolder Id='CleanupStremioFolder' Directory='STREMIOFOLDER' On='uninstall'/>
+                            <RemoveFolder Id='CleanupLocalPrograms' Directory='LocalPrograms' On='uninstall'/>
+                        </Component>
+                    </Directory>
+                </Directory>
+            </Directory>
         </Directory>
 
+        <!-- ================================================================
+             Features
+             ================================================================ -->
         <Feature
             Id='Binaries'
             Title='Application'
-            Description='Installs all binaries and the license.'
+            Description='Installs the stream-server binary and adds it to PATH.'
             Level='1'
             ConfigurableDirectory='APPLICATIONFOLDER'
             AllowAdvertise='no'
             Display='expand'
             Absent='disallow'>
-            
-            <!--
-              Uncomment the following `ComponentRef` tag to add the license
-              sidecar file to the installer.
-            -->
-            <!--<ComponentRef Id='License'/>-->
 
             <ComponentRef Id='binary0'/>
 
@@ -159,6 +206,18 @@
                 Absent='allow'>
                 <ComponentRef Id='Path'/>
             </Feature>
+        </Feature>
+
+        <Feature
+            Id='StremioIntegration'
+            Title='Stremio Integration'
+            Description='Replaces Stremio runtime with the Rust stream-server. Original backed up as stremio-runtime.node.exe. Requires Stremio installed.'
+            Level='2'
+            AllowAdvertise='no'
+            Absent='allow'>
+            <ComponentRef Id='StremioBackup'/>
+            <ComponentRef Id='StremioRuntimeStub'/>
+            <ComponentRef Id='StremioStreamServer'/>
         </Feature>
 
         <SetProperty Id='ARPINSTALLLOCATION' Value='[APPLICATIONFOLDER]' After='CostFinalize'/>
