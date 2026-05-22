@@ -25,6 +25,7 @@ pub struct ArchiveEntry {
 #[allow(dead_code)]
 pub struct ArchiveSession {
     pub path: std::path::PathBuf,
+    pub selected_file: Option<String>,
     pub created: std::time::Instant,
 }
 

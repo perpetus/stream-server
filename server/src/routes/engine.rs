@@ -1,11 +1,14 @@
+use crate::routes::compat;
 use crate::state::AppState;
 use axum::{
     extract::{Json, State},
     response::IntoResponse,
 };
+use enginefs::backend::TorrentHandle;
 use hex;
 use serde::Deserialize;
 use serde_json::json;
+use std::sync::Arc;
 
 #[derive(Deserialize)]
 pub struct CreateEngineRequest {
@@ -13,6 +16,18 @@ pub struct CreateEngineRequest {
     #[serde(alias = "blob")]
     pub torrent: Option<String>, // Torrent blob (hex encoded) - alias "blob" for stremio-core compat
     pub announce: Option<Vec<String>>,
+    #[serde(rename = "peerSearch")]
+    pub peer_search: Option<PeerSearchBody>,
+    #[serde(rename = "fileMustInclude", default)]
+    pub file_must_include: Vec<String>,
+    #[serde(rename = "guessFileIdx")]
+    pub guess_file_idx: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+pub struct PeerSearchBody {
+    #[serde(default)]
+    pub sources: Vec<String>,
 }
 
 pub async fn create_engine(
@@ -30,12 +45,14 @@ pub async fn create_engine(
         return Json(json!({ "error": "Missing 'from' or 'torrent' field" }));
     };
 
-    match state.engine.add_torrent(source, payload.announce).await {
+    let trackers = merged_trackers(payload.announce, payload.peer_search);
+    let file_must_include = payload.file_must_include;
+    let should_guess = guess_file_idx_requested(payload.guess_file_idx.as_ref());
+
+    match state.engine.add_torrent(source, Some(trackers)).await {
         Ok(engine) => {
-            let stats = engine.get_statistics().await;
-            // Note: guessed_file_idx and file_must_include heuristics are now
-            // applied internally by get_statistics() for stream_name/stream_len
-            Json(json!(stats))
+            let stats = stats_with_guess(&engine, &file_must_include, should_guess).await;
+            Json(stats)
         }
         Err(e) => Json(json!({ "error": e.to_string() })),
     }
@@ -65,6 +82,12 @@ pub async fn remove_all_engines(State(state): State<AppState>) -> impl IntoRespo
 #[derive(Deserialize)]
 pub struct CreateMagnetRequest {
     pub stream: Option<CreateMagnetStream>,
+    #[serde(rename = "peerSearch")]
+    pub peer_search: Option<PeerSearchBody>,
+    #[serde(rename = "fileMustInclude", default)]
+    pub file_must_include: Vec<String>,
+    #[serde(rename = "guessFileIdx")]
+    pub guess_file_idx: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -90,11 +113,85 @@ pub async fn create_magnet(
     let magnet = format!("magnet:?xt=urn:btih:{}", ih);
     let source = enginefs::backend::TorrentSource::Url(magnet);
 
-    match state.engine.add_torrent(source, None).await {
+    let trackers = merged_trackers(None, payload.peer_search);
+    let file_must_include = payload.file_must_include;
+    let should_guess = guess_file_idx_requested(payload.guess_file_idx.as_ref());
+
+    match state.engine.add_torrent(source, Some(trackers)).await {
         Ok(engine) => {
-            let stats = engine.get_statistics().await;
-            Json(json!(stats))
+            let stats = stats_with_guess(&engine, &file_must_include, should_guess).await;
+            Json(stats)
         }
         Err(e) => Json(json!({ "error": e.to_string() })),
     }
+}
+
+pub async fn create_magnet_get(
+    State(state): State<AppState>,
+    axum::extract::Path(info_hash): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let magnet = format!("magnet:?xt=urn:btih:{}", info_hash);
+    let source = enginefs::backend::TorrentSource::Url(magnet);
+
+    match state.engine.add_torrent(source, None).await {
+        Ok(engine) => {
+            let stats = stats_with_guess(&engine, &[], false).await;
+            Json(stats)
+        }
+        Err(e) => Json(json!({ "error": e.to_string() })),
+    }
+}
+
+fn merged_trackers(
+    announce: Option<Vec<String>>,
+    peer_search: Option<PeerSearchBody>,
+) -> Vec<String> {
+    let mut sources = announce.unwrap_or_default();
+    if let Some(peer_search) = peer_search {
+        sources.extend(peer_search.sources);
+    }
+    compat::normalize_tracker_sources(sources)
+}
+
+fn guess_file_idx_requested(value: Option<&serde_json::Value>) -> bool {
+    match value {
+        Some(serde_json::Value::Bool(false)) | None => false,
+        Some(serde_json::Value::Null) => false,
+        Some(_) => true,
+    }
+}
+
+async fn stats_with_guess<H>(
+    engine: &Arc<enginefs::engine::Engine<H>>,
+    filters: &[String],
+    should_guess: bool,
+) -> serde_json::Value
+where
+    H: TorrentHandle,
+{
+    let stats = engine.get_statistics().await;
+    let mut value = serde_json::to_value(stats).unwrap_or_else(|_| json!({}));
+
+    if filters.is_empty() && !should_guess {
+        return value;
+    }
+
+    let files = engine.handle.get_files().await;
+    let candidates = files
+        .iter()
+        .enumerate()
+        .map(|(index, file)| compat::FileCandidate {
+            index,
+            name: file.name.clone(),
+            length: file.length,
+        })
+        .collect::<Vec<_>>();
+
+    if let Ok(idx) = compat::resolve_file_idx("-1", &candidates, filters) {
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert("guessedFileIdx".to_string(), json!(idx));
+        }
+    }
+
+    value
 }

@@ -1,12 +1,13 @@
 use crate::archives::ArchiveSession;
+use crate::routes::compat;
 use crate::state::AppState;
 use axum::{
     Json, Router,
     body::Body,
     extract::{Path, Query, State},
-    http::{StatusCode, header},
-    response::Response,
-    routing::{get, post},
+    http::{Method, StatusCode, header},
+    response::{IntoResponse, Redirect, Response},
+    routing::get,
 };
 use enginefs::backend::TorrentHandle;
 use serde::{Deserialize, Serialize};
@@ -14,13 +15,6 @@ use std::path::PathBuf;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
-
-#[derive(Deserialize)]
-struct CreateBody {
-    url: String,
-}
-
-type CreatePayload = Vec<CreateBody>;
 
 #[derive(Serialize)]
 struct CreateResponse {
@@ -33,13 +27,31 @@ struct StreamParams {
     file: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct CreateQuery {
+    lz: Option<String>,
+}
+
+#[derive(Debug)]
+struct ArchiveCreateRequest {
+    urls: Vec<String>,
+    file_idx: Option<usize>,
+    file_must_include: Vec<String>,
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/create", post(create_session_auto))
-        .route("/create/{key}", post(create_session_with_key))
+        .route(
+            "/create",
+            get(create_session_auto).post(create_session_auto),
+        )
+        .route(
+            "/create/{key}",
+            get(create_session_with_key).post(create_session_with_key),
+        )
         .route("/stream", get(stream_content_query))
         .route("/stream/{key}", get(stream_redirection))
-        .route("/stream/{key}/{file}", get(stream_content_path))
+        .route("/stream/{key}/{*file}", get(stream_content_path))
 }
 
 async fn resolve_path(url: &str) -> Result<PathBuf, StatusCode> {
@@ -94,44 +106,228 @@ async fn resolve_path(url: &str) -> Result<PathBuf, StatusCode> {
     }
 }
 
+fn parse_create_request(
+    lz: Option<String>,
+    body: &axum::body::Bytes,
+) -> Result<ArchiveCreateRequest, String> {
+    let value = if let Some(lz) = lz {
+        let utf16 = lz_str::decompress_from_encoded_uri_component(&lz)
+            .ok_or_else(|| "Failed to decompress lz payload".to_string())?;
+        let json =
+            String::from_utf16(&utf16).map_err(|_| "Invalid UTF-16 in lz payload".to_string())?;
+        serde_json::from_str::<serde_json::Value>(&json)
+            .map_err(|err| format!("Invalid lz JSON payload: {err}"))?
+    } else if body.is_empty() {
+        return Err("Missing archive create payload".to_string());
+    } else {
+        serde_json::from_slice::<serde_json::Value>(body)
+            .map_err(|err| format!("Invalid JSON payload: {err}"))?
+    };
+
+    archive_request_from_value(&value)
+}
+
+fn archive_request_from_value(value: &serde_json::Value) -> Result<ArchiveCreateRequest, String> {
+    if let Some(items) = value.as_array() {
+        let urls = items
+            .iter()
+            .filter_map(|item| {
+                item.get("url")
+                    .and_then(|url| url.as_str())
+                    .or_else(|| item.as_str())
+                    .map(str::to_string)
+            })
+            .collect::<Vec<_>>();
+        return Ok(ArchiveCreateRequest {
+            urls,
+            file_idx: None,
+            file_must_include: Vec::new(),
+        });
+    }
+
+    let Some(obj) = value.as_object() else {
+        return Err("Archive create payload must be an object or array".to_string());
+    };
+
+    let urls = obj
+        .get("urls")
+        .and_then(|urls| urls.as_array())
+        .map(|urls| {
+            urls.iter()
+                .filter_map(archive_url_from_value)
+                .collect::<Vec<_>>()
+        })
+        .or_else(|| {
+            obj.get("url")
+                .and_then(|url| url.as_str())
+                .map(|url| vec![url.to_string()])
+        })
+        .unwrap_or_default();
+
+    let file_idx = obj
+        .get("fileIdx")
+        .and_then(|idx| idx.as_u64())
+        .map(|idx| idx as usize);
+    let file_must_include = obj
+        .get("fileMustInclude")
+        .and_then(|filters| filters.as_array())
+        .map(|filters| {
+            filters
+                .iter()
+                .filter_map(|filter| filter.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Ok(ArchiveCreateRequest {
+        urls,
+        file_idx,
+        file_must_include,
+    })
+}
+
+fn archive_url_from_value(value: &serde_json::Value) -> Option<String> {
+    value.as_str().map(str::to_string).or_else(|| {
+        value
+            .as_array()
+            .and_then(|parts| parts.first())
+            .and_then(|url| url.as_str())
+            .map(str::to_string)
+    })
+}
+
+async fn select_archive_file(
+    state: &AppState,
+    path: &std::path::Path,
+    request: &ArchiveCreateRequest,
+) -> Result<Option<String>, StatusCode> {
+    let settings = state.settings.read().await;
+    let cache_config = crate::archives::CacheConfig {
+        cache_dir: Some(std::path::PathBuf::from(&settings.cache_root)),
+        _cache_size: settings.cache_size as u64,
+    };
+    drop(settings);
+
+    let reader = crate::archives::get_archive_reader_with_config(path, cache_config)
+        .await
+        .map_err(|err| {
+            tracing::error!(path = %path.display(), error = %err, "failed to create archive reader");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    let entries = reader.list_files().await.map_err(|err| {
+        tracing::error!(path = %path.display(), error = %err, "failed to list archive files");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let files = entries
+        .iter()
+        .filter(|entry| !entry.is_dir)
+        .enumerate()
+        .map(|(index, entry)| compat::FileCandidate {
+            index,
+            name: entry.path.clone(),
+            length: entry.size,
+        })
+        .collect::<Vec<_>>();
+
+    if files.is_empty() {
+        return Ok(None);
+    }
+
+    let requested_idx = request
+        .file_idx
+        .map(|idx| idx.to_string())
+        .unwrap_or_else(|| "-1".to_string());
+    let selected_idx = compat::resolve_file_idx(&requested_idx, &files, &request.file_must_include)
+        .map_err(|err| {
+            tracing::warn!(error = %err, "failed to resolve archive file");
+            StatusCode::NOT_FOUND
+        })?;
+    Ok(files
+        .into_iter()
+        .find(|file| file.index == selected_idx)
+        .map(|file| file.name))
+}
+
 async fn create_session_auto(
     State(state): State<AppState>,
-    Json(payload): Json<CreatePayload>,
-) -> Result<Json<CreateResponse>, StatusCode> {
-    let item = payload.first().ok_or(StatusCode::BAD_REQUEST)?;
+    method: Method,
+    Query(query): Query<CreateQuery>,
+    body: axum::body::Bytes,
+) -> Response {
     let key = Uuid::new_v4().to_string();
-
-    let path = resolve_path(&item.url).await?;
-
-    state.archive_cache.insert(
-        key.clone(),
-        ArchiveSession {
-            path,
-            created: std::time::Instant::now(),
-        },
-    );
-
-    Ok(Json(CreateResponse { key }))
+    create_session_internal(state, key, method, query, body).await
 }
 
 async fn create_session_with_key(
     State(state): State<AppState>,
     Path(key): Path<String>,
-    Json(payload): Json<CreatePayload>,
-) -> Result<Json<CreateResponse>, StatusCode> {
-    let item = payload.first().ok_or(StatusCode::BAD_REQUEST)?;
+    method: Method,
+    Query(query): Query<CreateQuery>,
+    body: axum::body::Bytes,
+) -> Response {
+    create_session_internal(state, key, method, query, body).await
+}
 
-    let path = resolve_path(&item.url).await?;
+async fn create_session_internal(
+    state: AppState,
+    key: String,
+    method: Method,
+    query: CreateQuery,
+    body: axum::body::Bytes,
+) -> Response {
+    let payload = match parse_create_request(query.lz, &body) {
+        Ok(payload) => payload,
+        Err(err) => return (StatusCode::BAD_REQUEST, err).into_response(),
+    };
+
+    if payload.urls.len() > 1 {
+        tracing::warn!(
+            key = %key,
+            url_count = payload.urls.len(),
+            "multi-volume archive compatibility requested but not implemented"
+        );
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            "Multi-volume archive streaming is not implemented",
+        )
+            .into_response();
+    }
+
+    let Some(url) = payload.urls.first() else {
+        return (StatusCode::BAD_REQUEST, "No archive URL provided").into_response();
+    };
+
+    let path = match resolve_path(url).await {
+        Ok(path) => path,
+        Err(status) => return (status, "Failed to resolve archive URL").into_response(),
+    };
+
+    let selected_file = match select_archive_file(&state, &path, &payload).await {
+        Ok(file) => file,
+        Err(status) => return (status, "Failed to select archive file").into_response(),
+    };
 
     state.archive_cache.insert(
         key.clone(),
         ArchiveSession {
             path,
+            selected_file: selected_file.clone(),
             created: std::time::Instant::now(),
         },
     );
 
-    Ok(Json(CreateResponse { key }))
+    if method == Method::GET {
+        if let Some(file) = selected_file {
+            return Redirect::temporary(&format!(
+                "./stream/{}/{}",
+                urlencoding::encode(&key),
+                encode_path_segments(&file)
+            ))
+            .into_response();
+        }
+    }
+
+    Json(CreateResponse { key }).into_response()
 }
 
 async fn stream_content_query(
@@ -139,7 +335,15 @@ async fn stream_content_query(
     headers: header::HeaderMap,
     Query(params): Query<StreamParams>,
 ) -> Result<Response, StatusCode> {
-    let file = params.file.ok_or(StatusCode::BAD_REQUEST)?;
+    let file = if let Some(file) = params.file {
+        file
+    } else {
+        let session = state
+            .archive_cache
+            .get(&params.key)
+            .ok_or(StatusCode::NOT_FOUND)?;
+        session.selected_file.clone().ok_or(StatusCode::NOT_FOUND)?
+    };
     stream_file(&state, &params.key, &file, &headers).await
 }
 
@@ -152,10 +356,27 @@ async fn stream_content_path(
 }
 
 async fn stream_redirection(
-    State(_state): State<AppState>,
-    Path(_key): Path<String>,
+    State(state): State<AppState>,
+    Path(key): Path<String>,
 ) -> Result<Response, StatusCode> {
-    Err(StatusCode::NOT_IMPLEMENTED)
+    let session = state.archive_cache.get(&key).ok_or(StatusCode::NOT_FOUND)?;
+    if let Some(file) = &session.selected_file {
+        Ok(Redirect::temporary(&format!(
+            "./{}/{}",
+            urlencoding::encode(&key),
+            encode_path_segments(file)
+        ))
+        .into_response())
+    } else {
+        Err(StatusCode::NOT_FOUND)
+    }
+}
+
+fn encode_path_segments(path: &str) -> String {
+    path.split('/')
+        .map(|segment| urlencoding::encode(segment).into_owned())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 // New implementation of stream_file
@@ -358,6 +579,8 @@ async fn stream_file(
     let mut builder = Response::builder()
         .header(header::CONTENT_TYPE, mime.as_ref())
         .header(header::ACCEPT_RANGES, "bytes")
+        .header("transferMode.dlna.org", compat::DLNA_TRANSFER_MODE)
+        .header("contentFeatures.dlna.org", compat::DLNA_CONTENT_FEATURES)
         .header(header::CONTENT_LENGTH, len);
 
     if is_partial {

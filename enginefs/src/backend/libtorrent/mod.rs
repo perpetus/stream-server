@@ -224,13 +224,13 @@ impl LibtorrentBackend {
                 let alerts = s.pop_alerts();
 
                 for alert in alerts {
-                    // Log hash failures to detect starvation and bad piece validations
+                    // Hash failures are expected on unhealthy peers; libtorrent re-downloads the piece.
                     if alert.alert_type == hash_failed_alert_type {
-                        tracing::error!(
-                            "hash_failed_alert piece={} info_hash={} message={}",
-                            alert.piece_index,
-                            alert.info_hash,
-                            alert.message
+                        tracing::warn!(
+                            piece = alert.piece_index,
+                            info_hash = %alert.info_hash,
+                            alert_message = %alert.message,
+                            "piece hash validation failed; libtorrent will retry"
                         );
                     }
 

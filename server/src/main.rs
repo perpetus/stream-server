@@ -1,11 +1,6 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
-use axum::{
-    Router,
-    http::StatusCode,
-    response::Redirect,
-    routing::{get, post},
-};
+use axum::{Router, http::StatusCode, response::Redirect, routing::get};
 use enginefs::EngineFS; // This is a type alias in enginefs::lib.rs based on features
 use fslock::LockFile;
 use state::AppState;
@@ -260,7 +255,10 @@ async fn run_server(
             "/create",
             get(routes::engine::create_engine).post(routes::engine::create_engine),
         )
-        .route("/{infoHash}/create", post(routes::engine::create_magnet))
+        .route(
+            "/{infoHash}/create",
+            get(routes::engine::create_magnet_get).post(routes::engine::create_magnet),
+        )
         .route("/{infoHash}/remove", get(routes::engine::remove_engine))
         .route(
             "/{infoHash}/stats.json",
@@ -283,6 +281,10 @@ async fn run_server(
         .route(
             "/subtitles.vtt",
             get(routes::subtitles::proxy_subtitles_vtt),
+        )
+        .route(
+            "/subtitles.{ext}",
+            get(routes::subtitles::proxy_subtitles_ext),
         )
         .route(
             "/{infoHash}/{fileIdx}/subtitles.vtt",
@@ -309,10 +311,14 @@ async fn run_server(
         .nest("/ftp", routes::ftp::router())
         .route("/samples/{filename}", get(routes::system::get_samples))
         // HLS routes with query params for Stremio compatibility
+        .route("/hlsv2/status", get(routes::hls::hls_status))
+        .route("/hlsv2/{id}/destroy", get(routes::hls::hls_destroy))
+        .route("/hlsv2/{id}/burn", get(routes::hls::hls_burn))
         .route(
             "/hlsv2/{hash}/master.m3u8",
             get(routes::hls::master_playlist_by_url),
         )
+        .route("/hlsv2/{id}/{resource}", get(routes::hls::hls_v2_resource))
         // HLS routes with path params (original)
         .route(
             "/hlsv2/{infoHash}/{fileIdx}/master.m3u8",
@@ -334,7 +340,16 @@ async fn run_server(
         // Legacy generic probe
         .route("/probe", get(routes::hls::probe_by_url))
         .route("/probe/{infoHash}/{fileIdx}", get(routes::hls::get_probe))
-        .route("/tracks/{infoHash}/{fileIdx}", get(routes::hls::get_tracks))
+        .route("/tracks/{*url}", get(routes::hls::get_tracks_by_url))
+        .route(
+            "/{first}/{second}/{resource}",
+            get(routes::hls::legacy_hls_resource),
+        )
+        .route(
+            "/{first}/{second}/{variant}/{seg}",
+            get(routes::hls::legacy_hls_segment),
+        )
+        .route("/thumb.jpg", get(|| async { StatusCode::NOT_FOUND }))
         .nest("/casting", routes::casting::router())
         .route("/favicon.ico", get(|| async { StatusCode::NOT_FOUND }))
         .layer(TraceLayer::new_for_http())
@@ -342,11 +357,12 @@ async fn run_server(
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 11470));
+    let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("listening on {}", addr);
     // Print to stdout explicitly so stremio-shell-ng can detect startup
     // (tracing may go to file when no terminal is attached)
     println!("listening on {}", addr);
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    println!("EngineFS server started at http://127.0.0.1:11470");
 
     // Shutdown signal
     let shutdown = async move {

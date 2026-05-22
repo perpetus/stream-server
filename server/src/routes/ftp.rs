@@ -1,3 +1,4 @@
+use crate::routes::compat;
 use crate::state::AppState;
 use axum::{
     Router,
@@ -22,7 +23,16 @@ pub struct FtpStreamBody {
 }
 
 pub fn router() -> Router<AppState> {
-    Router::new().route("/{filename}", get(stream_ftp))
+    Router::new()
+        .route("/create", get(ftp_unsupported).post(ftp_unsupported))
+        .route("/create/{key}", get(ftp_unsupported).post(ftp_unsupported))
+        .route("/stream", get(ftp_unsupported))
+        .route("/stream/{key}/{*file}", get(ftp_unsupported))
+        .route("/{filename}", get(stream_ftp))
+}
+
+async fn ftp_unsupported() -> Response {
+    compat::unsupported("FTP create/session compatibility routes")
 }
 
 async fn stream_ftp(Path(filename): Path<String>, Query(params): Query<FtpQuery>) -> Response {
@@ -104,8 +114,10 @@ async fn stream_http(url: &str, filename: &str) -> Response {
         .header(axum::http::header::CONTENT_TYPE, content_type)
         .header(
             axum::http::header::CONTENT_DISPOSITION,
-            format!("inline; filename=\"{}\"", filename),
+            compat::content_disposition_inline(filename),
         )
+        .header("transferMode.dlna.org", compat::DLNA_TRANSFER_MODE)
+        .header("contentFeatures.dlna.org", compat::DLNA_CONTENT_FEATURES)
         .body(Body::from_stream(stream))
         .unwrap()
 }
@@ -147,8 +159,10 @@ async fn stream_via_curl(url: &str, filename: &str) -> Response {
         .header(axum::http::header::CONTENT_TYPE, content_type)
         .header(
             axum::http::header::CONTENT_DISPOSITION,
-            format!("inline; filename=\"{}\"", filename),
+            compat::content_disposition_inline(filename),
         )
+        .header("transferMode.dlna.org", compat::DLNA_TRANSFER_MODE)
+        .header("contentFeatures.dlna.org", compat::DLNA_CONTENT_FEATURES)
         .body(Body::from_stream(stream))
         .unwrap()
 }

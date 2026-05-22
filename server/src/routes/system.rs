@@ -1,10 +1,12 @@
+use crate::routes::compat;
 use crate::state::AppState;
 use axum::{
     Json,
-    extract::{Query, State},
+    extract::{Query, RawQuery, State},
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use enginefs::backend::TorrentHandle;
 use serde_json::{Value, json};
 
 #[derive(serde::Deserialize)]
@@ -26,13 +28,19 @@ pub async fn get_stats(
     }
 
     if params.sys.as_deref() == Some("1") {
-        // Basic system info mock (to avoid new crate dep for now, or use std if easy)
-        // server.js uses os.loadavg(), os.cpus()
+        let mut system = sysinfo::System::new_all();
+        system.refresh_all();
+        let loadavg = sysinfo::System::load_average();
         root.insert(
             "sys".to_string(),
             json!({
-                "loadavg": [0.0, 0.0, 0.0], // Placeholder
-                "cpus": [] // Placeholder
+                "loadavg": [loadavg.one, loadavg.five, loadavg.fifteen],
+                "cpus": system.cpus().iter().map(|cpu| {
+                    json!({
+                        "model": cpu.brand(),
+                        "speed": cpu.frequency(),
+                    })
+                }).collect::<Vec<_>>()
             }),
         );
     }
@@ -144,6 +152,7 @@ pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
     let settings = state.settings.read().await;
     Json(json!({
         "baseUrl": "http://127.0.0.1:11470",
+        "options": [],
         "values": settings.clone()
     }))
 }
@@ -436,7 +445,8 @@ pub async fn get_engine_stats(
 
 pub async fn get_file_stats(
     State(state): State<AppState>,
-    axum::extract::Path((info_hash, idx)): axum::extract::Path<(String, usize)>,
+    axum::extract::Path((info_hash, requested_idx)): axum::extract::Path<(String, String)>,
+    RawQuery(query_str): RawQuery,
 ) -> Response {
     let info_hash = info_hash.to_lowercase();
 
@@ -457,6 +467,24 @@ pub async fn get_file_stats(
                 )
                     .into_response();
             }
+        }
+    };
+
+    let files = engine.handle.get_files().await;
+    let candidates = files
+        .iter()
+        .enumerate()
+        .map(|(index, file)| compat::FileCandidate {
+            index,
+            name: file.name.clone(),
+            length: file.length,
+        })
+        .collect::<Vec<_>>();
+    let filters = compat::query_values(query_str.as_deref(), "f");
+    let idx = match compat::resolve_file_idx(&requested_idx, &candidates, &filters) {
+        Ok(idx) => idx,
+        Err(err) => {
+            return (axum::http::StatusCode::NOT_FOUND, err).into_response();
         }
     };
 

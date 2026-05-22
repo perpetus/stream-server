@@ -2,6 +2,7 @@ use crate::state::AppState;
 use axum::{
     Json,
     extract::{Path, Query, State},
+    http::StatusCode,
     response::{IntoResponse, Response},
 };
 use enginefs::backend::{SubtitleTrack, TorrentHandle};
@@ -42,13 +43,24 @@ pub async fn opensub_hash(
     if let (Some(info_hash), Some(file_idx)) = (info_hash, file_idx) {
         if let Some(engine) = state.engine.get_engine(&info_hash).await {
             match engine.get_opensub_hash(file_idx).await {
-                Ok(hash) => return Json(json!({ "result": { "hash": hash } })),
-                Err(e) => return Json(json!({ "error": e.to_string() })),
+                Ok(hash) => {
+                    let size = engine
+                        .handle
+                        .get_files()
+                        .await
+                        .get(file_idx)
+                        .map(|file| file.length)
+                        .unwrap_or(0);
+                    return Json(
+                        json!({ "error": null, "result": { "hash": hash, "size": size } }),
+                    );
+                }
+                Err(e) => return Json(json!({ "error": e.to_string(), "result": null })),
             }
         }
     }
 
-    Json(json!({ "error": "Could not identify file from URL" }))
+    Json(json!({ "error": "Could not identify file from URL", "result": null }))
 }
 
 pub async fn opensub_hash_path(
@@ -58,11 +70,20 @@ pub async fn opensub_hash_path(
     let info_hash = info_hash.to_lowercase();
     if let Some(engine) = state.engine.get_engine(&info_hash).await {
         match engine.get_opensub_hash(file_idx).await {
-            Ok(hash) => return Json(json!({ "result": { "hash": hash } })),
-            Err(e) => return Json(json!({ "error": e.to_string() })),
+            Ok(hash) => {
+                let size = engine
+                    .handle
+                    .get_files()
+                    .await
+                    .get(file_idx)
+                    .map(|file| file.length)
+                    .unwrap_or(0);
+                return Json(json!({ "error": null, "result": { "hash": hash, "size": size } }));
+            }
+            Err(e) => return Json(json!({ "error": e.to_string(), "result": null })),
         }
     }
-    Json(json!({ "error": "Engine not found" }))
+    Json(json!({ "error": "Engine not found", "result": null }))
 }
 
 #[derive(serde::Deserialize)]
@@ -101,11 +122,11 @@ pub async fn subtitles_tracks(
                 })
                 .collect();
 
-            return Json(json!({ "result": result }));
+            return Json(json!({ "error": null, "result": result }));
         }
     }
 
-    Json(json!({ "result": [] }))
+    Json(json!({ "error": null, "result": [] }))
 }
 
 pub async fn get_subtitles_vtt(
@@ -173,9 +194,21 @@ pub async fn get_subtitles_vtt(
 #[derive(serde::Deserialize)]
 pub struct ProxySubtitlesQuery {
     pub from: Option<String>,
+    pub offset: Option<i64>,
 }
 
 pub async fn proxy_subtitles_vtt(Query(query): Query<ProxySubtitlesQuery>) -> Response {
+    proxy_subtitles_response("vtt", query).await
+}
+
+pub async fn proxy_subtitles_ext(
+    Path(ext): Path<String>,
+    Query(query): Query<ProxySubtitlesQuery>,
+) -> Response {
+    proxy_subtitles_response(&ext, query).await
+}
+
+async fn proxy_subtitles_response(ext: &str, query: ProxySubtitlesQuery) -> Response {
     let from_url = match query.from {
         Some(url) => url,
         None => {
@@ -214,13 +247,58 @@ pub async fn proxy_subtitles_vtt(Query(query): Query<ProxySubtitlesQuery>) -> Re
         }
     };
 
-    // Use the new subtitle parser which handles SRT, ASS, and VTT
-    // with proper styling preservation
-    let vtt_content = enginefs::subtitles::convert_to_vtt(&content);
+    let offset = query.offset.unwrap_or(0);
+    let ext = ext.trim_start_matches('.').to_ascii_lowercase();
+    match ext.as_str() {
+        "vtt" => {
+            let vtt_content = enginefs::subtitles::convert_to_vtt(&content);
+            let shifted = apply_subtitle_offset(&vtt_content, offset);
+            Response::builder()
+                .header("content-type", "text/vtt")
+                .header("access-control-allow-origin", "*")
+                .body(axum::body::Body::from(shifted))
+                .unwrap()
+        }
+        "srt" => {
+            let shifted = apply_subtitle_offset(&content, offset);
+            Response::builder()
+                .header("content-type", "application/x-subrip")
+                .header("access-control-allow-origin", "*")
+                .body(axum::body::Body::from(shifted))
+                .unwrap()
+        }
+        _ => (
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            format!("Unsupported subtitle extension: {ext}"),
+        )
+            .into_response(),
+    }
+}
 
-    Response::builder()
-        .header("content-type", "text/vtt")
-        .header("access-control-allow-origin", "*")
-        .body(axum::body::Body::from(vtt_content))
-        .unwrap()
+fn apply_subtitle_offset(content: &str, offset_ms: i64) -> String {
+    if offset_ms == 0 {
+        return content.to_string();
+    }
+
+    let regex = match regex::Regex::new(r"(\d{2}):(\d{2}):(\d{2})([,.])(\d{3})") {
+        Ok(regex) => regex,
+        Err(_) => return content.to_string(),
+    };
+
+    regex
+        .replace_all(content, |caps: &regex::Captures| {
+            let hours = caps[1].parse::<i64>().unwrap_or(0);
+            let minutes = caps[2].parse::<i64>().unwrap_or(0);
+            let seconds = caps[3].parse::<i64>().unwrap_or(0);
+            let millis = caps[5].parse::<i64>().unwrap_or(0);
+            let total =
+                (hours * 3_600_000 + minutes * 60_000 + seconds * 1_000 + millis + offset_ms)
+                    .max(0);
+            let h = total / 3_600_000;
+            let m = (total % 3_600_000) / 60_000;
+            let s = (total % 60_000) / 1_000;
+            let ms = total % 1_000;
+            format!("{h:02}:{m:02}:{s:02}{}{ms:03}", &caps[4])
+        })
+        .to_string()
 }

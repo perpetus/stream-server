@@ -1,3 +1,4 @@
+use crate::routes::compat;
 use crate::state::AppState;
 use axum::{
     body::Body,
@@ -93,15 +94,7 @@ impl<S: Stream + Unpin> Stream for StreamGuard<S> {
 }
 
 fn parse_trackers(query_str: Option<String>) -> Vec<String> {
-    let mut trackers = Vec::new();
-    if let Some(q) = query_str {
-        for (key, val) in url::form_urlencoded::parse(q.as_bytes()) {
-            if key == "tr" {
-                trackers.push(val.into_owned());
-            }
-        }
-    }
-    trackers
+    compat::normalize_tracker_sources(compat::query_values(query_str.as_deref(), "tr"))
 }
 
 fn query_has_hls_intent(query_str: Option<&str>) -> bool {
@@ -181,7 +174,7 @@ fn content_type_for_name(name: &str) -> &'static str {
 pub async fn head_stream_video(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path((info_hash, idx)): Path<(String, usize)>,
+    Path((info_hash, requested_idx)): Path<(String, String)>,
     RawQuery(query_str): RawQuery,
 ) -> Response {
     let request_start = Instant::now();
@@ -207,6 +200,28 @@ pub async fn head_stream_video(
     };
 
     let files = engine.handle.get_files().await;
+    let candidates = files
+        .iter()
+        .enumerate()
+        .map(|(index, file)| compat::FileCandidate {
+            index,
+            name: file.name.clone(),
+            length: file.length,
+        })
+        .collect::<Vec<_>>();
+    let filters = compat::query_values(query_str.as_deref(), "f");
+    let idx = match compat::resolve_file_idx(&requested_idx, &candidates, &filters) {
+        Ok(idx) => idx,
+        Err(err) => {
+            tracing::warn!(
+                info_hash = %info_hash,
+                requested_idx = %requested_idx,
+                error = %err,
+                "head_stream_video could not resolve file index"
+            );
+            return (StatusCode::NOT_FOUND, err).into_response();
+        }
+    };
     let Some(file_info) = files.get(idx) else {
         return (StatusCode::NOT_FOUND, "File not found").into_response();
     };
@@ -241,6 +256,13 @@ pub async fn head_stream_video(
             format!("bytes {}-{}/{}", start, end, size).parse().unwrap(),
         );
     }
+    if compat::query_flag(query_str.as_deref(), "download") {
+        res_headers.insert(
+            header::CONTENT_DISPOSITION,
+            compat::content_disposition_attachment(name),
+        );
+    }
+    compat::add_dlna_headers(&mut res_headers);
 
     tracing::debug!(
         "head_stream_video: Responded in {:?} for {} idx={} range {}-{}",
@@ -261,7 +283,7 @@ pub async fn head_stream_video(
 pub async fn stream_video(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path((info_hash, idx)): Path<(String, usize)>,
+    Path((info_hash, requested_idx)): Path<(String, String)>,
     RawQuery(query_str): RawQuery,
 ) -> Response {
     let request_start = Instant::now();
@@ -271,7 +293,7 @@ pub async fn stream_video(
     tracing::debug!(
         stream_id,
         info_hash = %info_hash,
-        file_idx = idx,
+        file_idx = %requested_idx,
         "stream_video request"
     );
 
@@ -315,6 +337,29 @@ pub async fn stream_video(
     };
 
     let files = engine.handle.get_files().await;
+    let candidates = files
+        .iter()
+        .enumerate()
+        .map(|(index, file)| compat::FileCandidate {
+            index,
+            name: file.name.clone(),
+            length: file.length,
+        })
+        .collect::<Vec<_>>();
+    let filters = compat::query_values(query_str.as_deref(), "f");
+    let idx = match compat::resolve_file_idx(&requested_idx, &candidates, &filters) {
+        Ok(idx) => idx,
+        Err(err) => {
+            tracing::warn!(
+                stream_id,
+                info_hash = %info_hash,
+                requested_idx = %requested_idx,
+                error = %err,
+                "stream_video could not resolve file index"
+            );
+            return (StatusCode::NOT_FOUND, err).into_response();
+        }
+    };
     let Some(file_info) = files.get(idx) else {
         tracing::warn!(
             stream_id,
@@ -492,7 +537,7 @@ pub async fn stream_video(
                         .into_response();
                 }
 
-                tracing::warn!(
+                tracing::info!(
                     stream_id,
                     info_hash = %info_hash,
                     file_idx = idx,
@@ -574,6 +619,13 @@ pub async fn stream_video(
                 format!("bytes {}-{}/{}", start, end, size).parse().unwrap(),
             );
         }
+        if compat::query_flag(query_str.as_deref(), "download") {
+            res_headers.insert(
+                header::CONTENT_DISPOSITION,
+                compat::content_disposition_attachment(&name),
+            );
+        }
+        compat::add_dlna_headers(&mut res_headers);
 
         // Limit the stream to the requested range if necessary
         // For now, tokio_util::io::ReaderStream reads until EOF.

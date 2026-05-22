@@ -1,3 +1,4 @@
+use crate::routes::compat;
 use crate::state::AppState;
 use axum::{
     Json,
@@ -13,7 +14,8 @@ use tokio_util::io::ReaderStream;
 #[derive(Deserialize)]
 pub struct ProbeQuery {
     #[serde(rename = "mediaURL")]
-    pub media_url: String,
+    pub media_url: Option<String>,
+    pub url: Option<String>,
 }
 
 fn stremio_format_name(container: &str) -> String {
@@ -67,24 +69,16 @@ pub async fn probe_by_url(
     Query(params): Query<ProbeQuery>,
 ) -> Response {
     let start = std::time::Instant::now();
-    // Extract infoHash and fileIdx from the mediaURL
-    // Format: http://127.0.0.1:11470/{infoHash}/{fileIdx}?
-    let media_url = params.media_url.trim_end_matches('?');
-    let parts: Vec<&str> = media_url.split('/').collect();
-
-    if parts.len() < 2 {
-        return (StatusCode::BAD_REQUEST, "Invalid mediaURL format").into_response();
-    }
-
-    let file_idx_str = parts[parts.len() - 1].split('?').next().unwrap_or("0");
-    let info_hash = parts[parts.len() - 2];
-
-    let file_idx: usize = match file_idx_str.parse() {
-        Ok(i) => i,
-        Err(_) => return (StatusCode::BAD_REQUEST, "Invalid file index").into_response(),
+    let Some(media_url) = params.media_url.or(params.url) else {
+        return (StatusCode::BAD_REQUEST, "Missing mediaURL").into_response();
+    };
+    let media_url = normalize_media_url(&media_url);
+    let (info_hash, requested_idx) = match compat::parse_media_url(&media_url) {
+        Ok(parts) => parts,
+        Err(err) => return (StatusCode::BAD_REQUEST, err).into_response(),
     };
 
-    let engine = match state.engine.get_or_add_engine(info_hash).await {
+    let engine = match state.engine.get_or_add_engine(&info_hash).await {
         Ok(e) => e,
         Err(e) => {
             return (
@@ -94,8 +88,12 @@ pub async fn probe_by_url(
                 .into_response();
         }
     };
+    let file_idx = match resolve_hls_file_idx(&engine, &requested_idx, &media_url).await {
+        Ok(idx) => idx,
+        Err(err) => return (StatusCode::NOT_FOUND, err).into_response(),
+    };
 
-    let probe = match engine.get_probe_result(file_idx, media_url).await {
+    let probe = match engine.get_probe_result(file_idx, &media_url).await {
         Ok(p) => p,
         Err(e) => {
             return (
@@ -109,14 +107,14 @@ pub async fn probe_by_url(
     let elapsed = start.elapsed();
     tracing::info!("Probe request for {} took {:?}", media_url, elapsed);
 
-    Json(stremio_probe_json(info_hash, file_idx, &probe)).into_response()
+    Json(stremio_probe_json(&info_hash, file_idx, &probe)).into_response()
 }
 
 /// Query params for HLS endpoints
 #[derive(Deserialize)]
 pub struct HlsQuery {
     #[serde(rename = "mediaURL")]
-    pub media_url: String,
+    pub media_url: Option<String>,
 }
 
 /// Master playlist endpoint using mediaURL query parameter (for Stremio compatibility)
@@ -128,31 +126,16 @@ pub async fn master_playlist_by_url(
     axum::extract::Query(params): axum::extract::Query<HlsQuery>,
     axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
 ) -> Response {
-    // Strip query string from mediaURL and clean up the path
-    let media_url = params.media_url.trim_end_matches('?');
-    let parts: Vec<&str> = media_url.split('/').collect();
-
-    if parts.len() < 2 {
-        return (StatusCode::BAD_REQUEST, "Invalid mediaURL format").into_response();
-    }
-
-    // file_idx might have query params appended (e.g., "0?" or "0?foo=bar")
-    let file_idx_str = parts[parts.len() - 1].split('?').next().unwrap_or("0");
-    // Extract the REAL info_hash from the mediaURL - this is the actual torrent hash
-    let info_hash = parts[parts.len() - 2];
-
-    let file_idx: usize = match file_idx_str.parse() {
-        Ok(i) => i,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                format!("Invalid file index: {}", file_idx_str),
-            )
-                .into_response();
-        }
+    let Some(media_url) = params.media_url else {
+        return (StatusCode::BAD_REQUEST, "Missing mediaURL").into_response();
+    };
+    let media_url = normalize_media_url(&media_url);
+    let (info_hash, requested_idx) = match compat::parse_media_url(&media_url) {
+        Ok(parts) => parts,
+        Err(err) => return (StatusCode::BAD_REQUEST, err).into_response(),
     };
 
-    let engine = match state.engine.get_or_add_engine(info_hash).await {
+    let engine = match state.engine.get_or_add_engine(&info_hash).await {
         Ok(e) => e,
         Err(e) => {
             return (
@@ -162,8 +145,12 @@ pub async fn master_playlist_by_url(
                 .into_response();
         }
     };
+    let file_idx = match resolve_hls_file_idx(&engine, &requested_idx, &media_url).await {
+        Ok(idx) => idx,
+        Err(err) => return (StatusCode::NOT_FOUND, err).into_response(),
+    };
 
-    let probe = match engine.get_probe_result(file_idx, media_url).await {
+    let probe = match engine.get_probe_result(file_idx, &media_url).await {
         Ok(p) => p,
         Err(e) => {
             return (
@@ -278,6 +265,41 @@ pub async fn handle_hls_resource(
     Path((info_hash, file_idx_str, resource)): Path<(String, String, String)>,
     axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
 ) -> Response {
+    if let Some((real_info_hash, real_file_idx)) = compat::parse_hls_id(&info_hash) {
+        if resource == "init.mp4" {
+            return compat::unsupported("hlsv2 fMP4 init segments");
+        }
+
+        if let Some(segment) = hls_v2_segment_alias(&resource) {
+            return get_segment(
+                State(state),
+                _headers,
+                real_info_hash,
+                real_file_idx,
+                segment,
+                raw_query,
+            )
+            .await;
+        }
+
+        if resource.starts_with("segment") {
+            return compat::unsupported("hlsv2 fMP4 media segments");
+        }
+
+        if resource.ends_with(".m3u8") {
+            return get_stream_playlist(
+                State(state),
+                real_info_hash,
+                real_file_idx,
+                resource,
+                raw_query,
+            )
+            .await;
+        }
+
+        return compat::unsupported("hlsv2 track resource");
+    }
+
     // Parse file_idx - default to 0 if non-numeric (e.g., "subtitle4", "audio-1")
     let file_idx: usize = file_idx_str.parse().unwrap_or(0);
 
@@ -545,20 +567,268 @@ pub async fn get_probe(
     Json(probe).into_response()
 }
 
-pub async fn get_tracks(
-    State(state): State<AppState>,
-    Path((info_hash, file_idx)): Path<(String, usize)>,
-) -> Response {
-    let engine = match state.engine.get_engine(&info_hash).await {
-        Some(e) => e,
-        None => return (StatusCode::NOT_FOUND, "Engine not found").into_response(),
+fn normalize_media_url(media_url: &str) -> String {
+    if media_url.starts_with('/') {
+        format!("{}{}", compat::LOCAL_BASE_URL, media_url)
+    } else {
+        media_url.trim_end_matches('?').to_string()
+    }
+}
+
+async fn resolve_hls_file_idx<H: TorrentHandle>(
+    engine: &std::sync::Arc<enginefs::engine::Engine<H>>,
+    requested_idx: &str,
+    media_url: &str,
+) -> Result<usize, String> {
+    let filters = url::Url::parse(media_url)
+        .ok()
+        .map(|url| compat::query_values(url.query(), "f"))
+        .unwrap_or_default();
+    let files = engine.handle.get_files().await;
+    let candidates = files
+        .iter()
+        .enumerate()
+        .map(|(index, file)| compat::FileCandidate {
+            index,
+            name: file.name.clone(),
+            length: file.length,
+        })
+        .collect::<Vec<_>>();
+    compat::resolve_file_idx(requested_idx, &candidates, &filters)
+}
+
+pub async fn get_tracks_by_url(State(state): State<AppState>, Path(url): Path<String>) -> Response {
+    let decoded = urlencoding::decode(&url)
+        .map(|value| value.into_owned())
+        .unwrap_or(url);
+
+    if let Some((info_hash, file_idx)) = parse_tracks_path(&decoded) {
+        let engine = match state.engine.get_engine(&info_hash).await {
+            Some(engine) => engine,
+            None => return (StatusCode::NOT_FOUND, "Engine not found").into_response(),
+        };
+
+        let stream_url = hls_stream_url(11470, &info_hash, file_idx);
+        let probe = match engine.get_probe_result(file_idx, &stream_url).await {
+            Ok(probe) => probe,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        };
+        return Json(probe.streams).into_response();
+    }
+
+    let media_url = normalize_media_url(&decoded);
+    let (info_hash, requested_idx) = match compat::parse_media_url(&media_url) {
+        Ok(parts) => parts,
+        Err(err) => {
+            tracing::warn!(error = %err, media_url = %media_url, "tracks URL parse failed");
+            return Json(Vec::<serde_json::Value>::new()).into_response();
+        }
     };
 
-    let port = 11470;
-    let stream_url = hls_stream_url(port, &info_hash, file_idx);
-    let probe = match engine.get_probe_result(file_idx, &stream_url).await {
-        Ok(p) => p,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    let engine = match state.engine.get_engine(&info_hash).await {
+        Some(engine) => engine,
+        None => return Json(Vec::<serde_json::Value>::new()).into_response(),
+    };
+    let file_idx = match resolve_hls_file_idx(&engine, &requested_idx, &media_url).await {
+        Ok(idx) => idx,
+        Err(err) => {
+            tracing::warn!(error = %err, media_url = %media_url, "tracks file index resolve failed");
+            return Json(Vec::<serde_json::Value>::new()).into_response();
+        }
+    };
+    let probe = match engine.get_probe_result(file_idx, &media_url).await {
+        Ok(probe) => probe,
+        Err(err) => {
+            tracing::warn!(error = %err, media_url = %media_url, "tracks probe failed");
+            return Json(Vec::<serde_json::Value>::new()).into_response();
+        }
     };
     Json(probe.streams).into_response()
+}
+
+fn parse_tracks_path(path: &str) -> Option<(String, usize)> {
+    let path = path.trim_start_matches('/');
+    let mut parts = path.split('/');
+    let info_hash = parts.next()?;
+    let file_idx = parts.next()?;
+    if parts.next().is_some() || !compat::is_info_hash(info_hash) {
+        return None;
+    }
+    file_idx
+        .parse::<usize>()
+        .ok()
+        .map(|idx| (info_hash.to_ascii_lowercase(), idx))
+}
+
+pub async fn hls_status() -> Response {
+    Json(serde_json::json!({})).into_response()
+}
+
+pub async fn hls_destroy(Path(id): Path<String>) -> Response {
+    tracing::info!(id = %id, "hls converter destroy requested; no persistent converter is used");
+    compat::empty_ok()
+}
+
+pub async fn hls_burn(Path(id): Path<String>) -> Response {
+    tracing::warn!(id = %id, "hls subtitle burn-in is not implemented");
+    Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .body(Body::empty())
+        .unwrap()
+}
+
+pub async fn hls_v2_resource(
+    State(state): State<AppState>,
+    Path((id, resource)): Path<(String, String)>,
+    headers: axum::http::HeaderMap,
+    raw_query: axum::extract::RawQuery,
+) -> Response {
+    let Some((info_hash, file_idx)) = compat::parse_hls_id(&id) else {
+        return compat::unsupported("hlsv2 arbitrary converter playlist");
+    };
+
+    if resource == "init.mp4" || resource.starts_with("segment") {
+        if let Some(segment) = hls_v2_segment_alias(&resource) {
+            return get_segment(
+                State(state),
+                headers,
+                info_hash,
+                file_idx,
+                segment,
+                raw_query.0,
+            )
+            .await;
+        }
+        return compat::unsupported("hlsv2 fMP4 media segments");
+    }
+
+    if !resource.ends_with(".m3u8") {
+        return (StatusCode::NOT_FOUND, "HLS resource not found").into_response();
+    }
+
+    let track = resource.trim_end_matches(".m3u8");
+    if track == "master" || track == "hls" {
+        get_master_playlist(
+            State(state),
+            Path((info_hash, file_idx)),
+            headers,
+            raw_query,
+        )
+        .await
+    } else {
+        get_stream_playlist(
+            State(state),
+            info_hash,
+            file_idx,
+            resource,
+            raw_query.0,
+        )
+        .await
+    }
+}
+
+pub async fn legacy_hls_resource(
+    State(state): State<AppState>,
+    Path((first, second, resource)): Path<(String, String, String)>,
+    headers: axum::http::HeaderMap,
+    raw_query: axum::extract::RawQuery,
+) -> Response {
+    let Some((info_hash, file_idx)) = legacy_pair(&first, &second) else {
+        return compat::unsupported("legacy file/url HLS resource");
+    };
+
+    match resource.as_str() {
+        "hls.m3u8" | "master.m3u8" => {
+            get_master_playlist(
+                State(state),
+                Path((info_hash, file_idx)),
+                headers,
+                raw_query,
+            )
+            .await
+        }
+        "stream.m3u8" => {
+            get_stream_playlist(
+                State(state),
+                info_hash,
+                file_idx,
+                "stream-0.m3u8".to_string(),
+                raw_query.0,
+            )
+            .await
+        }
+        "thumb.jpg" => (StatusCode::NOT_FOUND, "thumbnail not available").into_response(),
+        "dlna" => compat::unsupported("legacy HLS DLNA discovery"),
+        resource if legacy_stream_playlist(resource) => {
+            get_stream_playlist(State(state), info_hash, file_idx, resource.to_string(), raw_query.0)
+                .await
+        }
+        resource if resource.starts_with("subs-") => {
+            compat::unsupported("legacy HLS subtitle playlist")
+        }
+        resource if resource.starts_with("mp4stream") => {
+            compat::unsupported("legacy HLS MP4 segments")
+        }
+        resource if resource.ends_with(".ts") => {
+            get_segment(
+                State(state),
+                headers,
+                info_hash,
+                file_idx,
+                resource.to_string(),
+                raw_query.0,
+            )
+            .await
+        }
+        _ => (StatusCode::NOT_FOUND, "legacy HLS resource not found").into_response(),
+    }
+}
+
+pub async fn legacy_hls_segment(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path((first, second, variant, seg)): Path<(String, String, String, String)>,
+    raw_query: axum::extract::RawQuery,
+) -> Response {
+    let Some((info_hash, file_idx)) = legacy_pair(&first, &second) else {
+        return compat::unsupported("legacy file/url HLS segment");
+    };
+
+    if variant.starts_with("mp4stream") {
+        return compat::unsupported("legacy HLS MP4 segments");
+    }
+
+    if variant == "stream" || variant.starts_with("stream-") || variant.starts_with("stream-q-") {
+        return get_segment(State(state), headers, info_hash, file_idx, seg, raw_query.0).await;
+    }
+
+    compat::unsupported("legacy HLS segment variant")
+}
+
+fn legacy_pair(first: &str, second: &str) -> Option<(String, usize)> {
+    if compat::is_info_hash(first) {
+        second
+            .parse::<usize>()
+            .ok()
+            .map(|file_idx| (first.to_ascii_lowercase(), file_idx))
+    } else {
+        None
+    }
+}
+
+fn legacy_stream_playlist(resource: &str) -> bool {
+    resource.ends_with(".m3u8")
+        && (resource.starts_with("stream-") || resource.starts_with("stream-q-"))
+}
+
+fn hls_v2_segment_alias(resource: &str) -> Option<String> {
+    if !resource.ends_with(".ts") {
+        return None;
+    }
+    let segment = resource.strip_prefix("segment").unwrap_or(resource);
+    if segment.trim_end_matches(".ts").parse::<usize>().is_ok() {
+        Some(segment.to_string())
+    } else {
+        None
+    }
 }

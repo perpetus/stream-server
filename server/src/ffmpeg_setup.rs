@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 const FFMPEG_URL: &str = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip";
 const SHA256_URL: &str = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip.sha256";
@@ -15,31 +15,30 @@ pub async fn setup_ffmpeg() -> Result<()> {
         return Ok(());
     }
 
-    if check_ffmpeg_availability() {
-        info!("FFmpeg is already available in PATH.");
+    if check_ffmpeg_tools_available() {
+        info!("FFmpeg and FFprobe are already available in PATH.");
         return Ok(());
     }
 
     info!("FFmpeg not found. Attempting auto-download...");
 
-    // Determine install location: ./tools/ffmpeg
-    let install_dir = std::env::current_exe()?
-        .parent()
-        .context("Failed to get exe parent dir")?
-        .join("tools")
-        .join("ffmpeg");
-
-    let bin_dir = install_dir.join("bin");
+    let install_dirs = install_dir_candidates();
 
     // Check if we already installed it but it's just not in PATH
-    if bin_dir.join("ffmpeg.exe").exists() {
-        info!(
-            "FFmpeg binaries found in {:?}, valid but not in PATH. Adding to PATH.",
-            bin_dir
-        );
-        add_to_path(&bin_dir);
-        return Ok(());
+    for install_dir in &install_dirs {
+        let bin_dir = install_dir.join("bin");
+        if ffmpeg_tools_exist(&bin_dir) {
+            info!(
+                "FFmpeg binaries found in {:?}, valid but not in PATH. Adding to PATH.",
+                bin_dir
+            );
+            add_to_path(&bin_dir);
+            return Ok(());
+        }
     }
+
+    let install_dir = select_writable_install_dir(&install_dirs)?;
+    let bin_dir = install_dir.join("bin");
 
     match download_and_install(&install_dir).await {
         Ok(_) => {
@@ -57,12 +56,109 @@ pub async fn setup_ffmpeg() -> Result<()> {
     }
 }
 
-fn check_ffmpeg_availability() -> bool {
-    Command::new("ffmpeg")
+fn install_dir_candidates() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(parent) = exe_path.parent() {
+            dirs.push(parent.join("tools").join("ffmpeg"));
+        } else {
+            warn!("Could not determine executable parent directory for FFmpeg install");
+        }
+    } else {
+        warn!("Could not determine executable path for FFmpeg install");
+    }
+
+    if let Some(data_dir) = dirs::data_local_dir() {
+        dirs.push(data_dir.join("stremio-server").join("tools").join("ffmpeg"));
+    }
+
+    if let Some(cache_dir) = dirs::cache_dir() {
+        dirs.push(
+            cache_dir
+                .join("stremio-server")
+                .join("tools")
+                .join("ffmpeg"),
+        );
+    }
+
+    dirs.push(
+        std::env::temp_dir()
+            .join("stremio-server")
+            .join("tools")
+            .join("ffmpeg"),
+    );
+
+    dedupe_paths(dirs)
+}
+
+fn dedupe_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut deduped = Vec::new();
+    for path in paths {
+        if !deduped.iter().any(|existing| existing == &path) {
+            deduped.push(path);
+        }
+    }
+    deduped
+}
+
+fn select_writable_install_dir(candidates: &[PathBuf]) -> Result<PathBuf> {
+    let mut failures = Vec::new();
+
+    for candidate in candidates {
+        match ensure_writable_dir(candidate) {
+            Ok(()) => return Ok(candidate.clone()),
+            Err(err) => {
+                warn!(
+                    install_dir = %candidate.display(),
+                    error = %err,
+                    "FFmpeg install directory is not writable; trying next candidate"
+                );
+                failures.push(format!("{} ({})", candidate.display(), err));
+            }
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "No writable FFmpeg install directory found. Tried: {}",
+        failures.join(", ")
+    ))
+}
+
+fn ensure_writable_dir(dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(dir).with_context(|| {
+        format!(
+            "Failed to create FFmpeg install directory {}",
+            dir.display()
+        )
+    })?;
+
+    let probe_path = dir.join(format!(".write-test-{}.tmp", std::process::id()));
+    std::fs::write(&probe_path, b"write test").with_context(|| {
+        format!(
+            "Failed to write to FFmpeg install directory {}",
+            dir.display()
+        )
+    })?;
+    let _ = std::fs::remove_file(probe_path);
+
+    Ok(())
+}
+
+fn check_ffmpeg_tools_available() -> bool {
+    command_available("ffmpeg") && command_available("ffprobe")
+}
+
+fn command_available(command: &str) -> bool {
+    Command::new(command)
         .arg("-version")
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+fn ffmpeg_tools_exist(bin_dir: &Path) -> bool {
+    bin_dir.join("ffmpeg.exe").exists() && bin_dir.join("ffprobe.exe").exists()
 }
 
 async fn download_and_install(install_dir: &Path) -> Result<()> {
@@ -137,6 +233,9 @@ fn extract_ffmpeg(zip_path: &Path, target_dir: &Path) -> Result<()> {
 
     std::fs::create_dir_all(target_dir)?;
 
+    let mut extracted_ffmpeg = false;
+    let mut extracted_ffprobe = false;
+
     for i in 0..archive.len() {
         let mut file = archive.by_index(i)?;
         let name = file.name().to_owned();
@@ -149,9 +248,24 @@ fn extract_ffmpeg(zip_path: &Path, target_dir: &Path) -> Result<()> {
             std::fs::create_dir_all(dest_path.parent().unwrap())?;
             let mut outfile = std::fs::File::create(&dest_path)?;
             std::io::copy(&mut file, &mut outfile)?;
+
+            if name.ends_with("bin/ffmpeg.exe") {
+                extracted_ffmpeg = true;
+            } else if name.ends_with("bin/ffprobe.exe") {
+                extracted_ffprobe = true;
+            }
         }
     }
-    Ok(())
+
+    if extracted_ffmpeg && extracted_ffprobe {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "FFmpeg archive did not contain required binaries: ffmpeg={}, ffprobe={}",
+            extracted_ffmpeg,
+            extracted_ffprobe
+        ))
+    }
 }
 
 fn add_to_path(path: &Path) {
