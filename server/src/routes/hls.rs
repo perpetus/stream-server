@@ -716,14 +716,7 @@ pub async fn hls_v2_resource(
         )
         .await
     } else {
-        get_stream_playlist(
-            State(state),
-            info_hash,
-            file_idx,
-            resource,
-            raw_query.0,
-        )
-        .await
+        get_stream_playlist(State(state), info_hash, file_idx, resource, raw_query.0).await
     }
 }
 
@@ -760,8 +753,14 @@ pub async fn legacy_hls_resource(
         "thumb.jpg" => (StatusCode::NOT_FOUND, "thumbnail not available").into_response(),
         "dlna" => compat::unsupported("legacy HLS DLNA discovery"),
         resource if legacy_stream_playlist(resource) => {
-            get_stream_playlist(State(state), info_hash, file_idx, resource.to_string(), raw_query.0)
-                .await
+            get_stream_playlist(
+                State(state),
+                info_hash,
+                file_idx,
+                resource.to_string(),
+                raw_query.0,
+            )
+            .await
         }
         resource if resource.starts_with("subs-") => {
             compat::unsupported("legacy HLS subtitle playlist")

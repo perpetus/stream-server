@@ -45,10 +45,17 @@ pub fn start(state: Arc<AppState>) {
 
         // Initial watch
         // We might need to retry if directory doesn't exist yet
-        let download_dir = state.engine.download_dir.clone();
-        if let Err(e) = watcher.watch(&download_dir, RecursiveMode::Recursive) {
-            warn!("Failed to watch download dir: {}", e);
-            // We will try to re-watch inside the loop if needed (omitted for brevity, relying on fallback poll)
+        let mut download_dirs = vec![
+            state.engine.download_dir.clone(),
+            state.download_engine.download_dir.clone(),
+        ];
+        download_dirs.sort();
+        download_dirs.dedup();
+        for download_dir in &download_dirs {
+            if let Err(e) = watcher.watch(download_dir, RecursiveMode::Recursive) {
+                warn!("Failed to watch download dir {:?}: {}", download_dir, e);
+                // We will try to re-watch inside the loop if needed (omitted for brevity, relying on fallback poll)
+            }
         }
 
         // Timer for fallback polling (1 hour)
@@ -67,8 +74,10 @@ pub fn start(state: Arc<AppState>) {
                         error!("Cache cleaner error: {}", e);
                     }
                     // Re-ensure watch if needed
-                    if let Err(e) = watcher.watch(&state.engine.download_dir, RecursiveMode::Recursive) {
-                        debug!("Retry watch: {}", e);
+                    for download_dir in [&state.engine.download_dir, &state.download_engine.download_dir] {
+                        if let Err(e) = watcher.watch(download_dir, RecursiveMode::Recursive) {
+                            debug!("Retry watch {:?}: {}", download_dir, e);
+                        }
                     }
                 }
 
@@ -97,24 +106,42 @@ async fn clean_cache(state: &Arc<AppState>) -> anyhow::Result<()> {
     let limit = settings.cache_size as u64;
     drop(settings); // Release lock
 
-    let download_dir = &state.engine.download_dir;
-    if !download_dir.exists() {
+    let mut download_dirs = vec![
+        state.engine.download_dir.clone(),
+        state.download_engine.download_dir.clone(),
+    ];
+    download_dirs.sort();
+    download_dirs.dedup();
+    if download_dirs
+        .iter()
+        .all(|download_dir| !download_dir.exists())
+    {
         return Ok(());
     }
 
     // 1. Identify protected files matching current active engines
-    let engines = state.engine.get_all_statistics().await;
     let mut protected_paths = HashSet::new();
 
-    for (_, stats) in engines {
-        if !stats.files.is_empty() {
-            for file in stats.files {
-                let path = download_dir.join(&file.path);
+    for (root, engines) in [
+        (
+            state.engine.download_dir.clone(),
+            state.engine.get_all_statistics().await,
+        ),
+        (
+            state.download_engine.download_dir.clone(),
+            state.download_engine.get_all_statistics().await,
+        ),
+    ] {
+        for (_, stats) in engines {
+            if !stats.files.is_empty() {
+                for file in stats.files {
+                    let path = root.join(&file.path);
+                    protected_paths.insert(path);
+                }
+            } else {
+                let path = root.join(&stats.name);
                 protected_paths.insert(path);
             }
-        } else {
-            let path = download_dir.join(&stats.name);
-            protected_paths.insert(path);
         }
     }
 
@@ -125,63 +152,73 @@ async fn clean_cache(state: &Arc<AppState>) -> anyhow::Result<()> {
     let mut files = Vec::new();
     let mut total_size = 0u64;
 
-    let mut entries = walkdir::WalkDir::new(download_dir).into_iter();
+    for download_dir in &download_dirs {
+        if !download_dir.exists() {
+            continue;
+        }
 
-    loop {
-        match entries.next() {
-            Some(Ok(entry)) => {
-                if entry.file_type().is_file() {
-                    let path = entry.path().to_path_buf();
-                    // Is protected?
-                    let is_protected = protected_paths.contains(&path)
-                        || protected_paths.iter().any(|p| path.starts_with(p));
+        let mut entries = walkdir::WalkDir::new(download_dir).into_iter();
 
-                    if let Ok(metadata) = entry.metadata() {
-                        let size = metadata.len();
-
-                        if is_protected {
-                            total_size += size;
+        loop {
+            match entries.next() {
+                Some(Ok(entry)) => {
+                    if entry.file_type().is_file() {
+                        let path = entry.path().to_path_buf();
+                        if path
+                            .components()
+                            .any(|component| component.as_os_str() == ".metadata")
+                        {
                             continue;
                         }
+                        // Is protected?
+                        let is_protected = protected_paths.contains(&path)
+                            || protected_paths.iter().any(|p| path.starts_with(p));
 
-                        if let Ok(modified) = metadata.modified() {
-                            // Check AGE
-                            let age = now
-                                .duration_since(modified)
-                                .unwrap_or(Duration::from_secs(0));
-                            if age > thirty_days {
-                                info!("File older than 30 days, deleting: {:?}", path);
-                                if let Err(e) = tokio::fs::remove_file(&path).await {
-                                    error!("Failed to delete file {:?}: {}", path, e);
-                                    // Count it in total size since we failed to delete?
-                                    // Or ignore? Let's count it to be safe for cache limit.
-                                    total_size += size;
-                                } else {
-                                    // Successfully deleted, do not add to total_size
-                                    // Try to clean empty parent dir
-                                    if let Some(parent) = path.parent() {
-                                        if parent != download_dir {
-                                            let _ = tokio::fs::remove_dir(parent).await;
+                        if let Ok(metadata) = entry.metadata() {
+                            let size = metadata.len();
+
+                            if is_protected {
+                                total_size += size;
+                                continue;
+                            }
+
+                            if let Ok(modified) = metadata.modified() {
+                                // Check AGE
+                                let age = now
+                                    .duration_since(modified)
+                                    .unwrap_or(Duration::from_secs(0));
+                                if age > thirty_days {
+                                    info!("File older than 30 days, deleting: {:?}", path);
+                                    if let Err(e) = tokio::fs::remove_file(&path).await {
+                                        error!("Failed to delete file {:?}: {}", path, e);
+                                        // Count it in total size since we failed to delete?
+                                        // Or ignore? Let's count it to be safe for cache limit.
+                                        total_size += size;
+                                    } else {
+                                        // Successfully deleted, do not add to total_size
+                                        // Try to clean empty parent dir
+                                        if let Some(parent) = path.parent() {
+                                            remove_empty_parents(parent, download_dir).await;
                                         }
                                     }
+                                } else {
+                                    // Keep for potentially size-based eviction
+                                    total_size += size;
+                                    files.push((path, size, modified));
                                 }
                             } else {
-                                // Keep for potentially size-based eviction
+                                // Could not read time, keep it but count size
                                 total_size += size;
-                                files.push((path, size, modified));
+                                files.push((path, size, std::time::SystemTime::UNIX_EPOCH));
                             }
-                        } else {
-                            // Could not read time, keep it but count size
-                            total_size += size;
-                            files.push((path, size, std::time::SystemTime::UNIX_EPOCH));
                         }
                     }
                 }
+                Some(Err(e)) => {
+                    debug!("Error walking directory: {}", e);
+                }
+                None => break,
             }
-            Some(Err(e)) => {
-                debug!("Error walking directory: {}", e);
-            }
-            None => break,
         }
     }
 
@@ -203,6 +240,14 @@ async fn clean_cache(state: &Arc<AppState>) -> anyhow::Result<()> {
                 break;
             }
 
+            if size > limit {
+                info!(
+                    "cache soft limit exceeded by single retained file: {:?} size={} limit={}",
+                    path, size, limit
+                );
+                continue;
+            }
+
             debug!("Deleting old file (size limit): {:?}", path);
             if let Err(e) = tokio::fs::remove_file(&path).await {
                 error!("Failed to delete file {:?}: {}", path, e);
@@ -212,8 +257,8 @@ async fn clean_cache(state: &Arc<AppState>) -> anyhow::Result<()> {
                 deleted_count += 1;
 
                 if let Some(parent) = path.parent() {
-                    if parent != download_dir {
-                        let _ = tokio::fs::remove_dir(parent).await;
+                    if let Some(root) = download_dirs.iter().find(|root| path.starts_with(root)) {
+                        remove_empty_parents(parent, root).await;
                     }
                 }
             }
@@ -226,4 +271,16 @@ async fn clean_cache(state: &Arc<AppState>) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+async fn remove_empty_parents(mut dir: &std::path::Path, root: &std::path::Path) {
+    while dir != root {
+        if tokio::fs::remove_dir(dir).await.is_err() {
+            break;
+        }
+        let Some(parent) = dir.parent() else {
+            break;
+        };
+        dir = parent;
+    }
 }

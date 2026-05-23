@@ -25,6 +25,13 @@ pub struct ProcessMemorySnapshot {
 pub struct MemorySnapshot {
     pub process: ProcessMemorySnapshot,
     pub engine: enginefs::EngineDiagnosticsSnapshot,
+    pub download_engine: enginefs::EngineDiagnosticsSnapshot,
+    pub download_disk_cache_bytes: u64,
+    pub download_disk_cache_files: u64,
+    pub active_disk_downloads: u64,
+    pub disk_download_root: String,
+    pub download_storage_mode: &'static str,
+    pub download_disk_backed_available: bool,
     pub archive_session_count: usize,
     pub nzb_session_count: usize,
     pub active_direct_streams: u64,
@@ -99,13 +106,56 @@ fn current_thread_count_impl() -> u64 {
 }
 
 async fn memory_snapshot_for_state(state: &AppState) -> MemorySnapshot {
+    let download_engine = state.download_engine.diagnostics_snapshot().await;
+    let (download_disk_cache_bytes, download_disk_cache_files) =
+        disk_tree_stats(&state.download_engine.download_dir);
+    let active_disk_downloads = download_engine
+        .streams
+        .active_file_streams
+        .iter()
+        .map(|stream| stream.count as u64)
+        .sum();
+
     MemorySnapshot {
         process: process_memory_snapshot(),
         engine: state.engine.diagnostics_snapshot().await,
+        download_engine,
+        download_disk_cache_bytes,
+        download_disk_cache_files,
+        active_disk_downloads,
+        disk_download_root: state.download_engine.download_dir.display().to_string(),
+        download_storage_mode: "dynamic",
+        download_disk_backed_available: state.download_engine_disk_backed,
         archive_session_count: state.archive_cache.len(),
         nzb_session_count: state.nzb_sessions.len(),
         active_direct_streams: logging::active_direct_streams(),
     }
+}
+
+fn disk_tree_stats(root: &std::path::Path) -> (u64, u64) {
+    if !root.exists() {
+        return (0, 0);
+    }
+
+    let mut bytes = 0u64;
+    let mut files = 0u64;
+    for entry in walkdir::WalkDir::new(root).into_iter().flatten() {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        if entry
+            .path()
+            .components()
+            .any(|component| component.as_os_str() == ".metadata")
+        {
+            continue;
+        }
+        if let Ok(metadata) = entry.metadata() {
+            bytes = bytes.saturating_add(metadata.len());
+            files = files.saturating_add(1);
+        }
+    }
+    (bytes, files)
 }
 
 pub fn start_memory_sampler(state: AppState) {
@@ -138,6 +188,12 @@ pub fn start_memory_sampler(state: AppState) {
                     rust_piece_cache_bytes = snapshot.engine.memory.rust_piece_cache_bytes,
                     native_storage_bytes = snapshot.engine.memory.native_storage_bytes,
                     native_storage_pieces = snapshot.engine.memory.native_storage_pieces,
+                    download_disk_cache_bytes = snapshot.download_disk_cache_bytes,
+                    download_disk_cache_files = snapshot.download_disk_cache_files,
+                    active_disk_downloads = snapshot.active_disk_downloads,
+                    disk_download_root = %snapshot.disk_download_root,
+                    download_storage_mode = snapshot.download_storage_mode,
+                    download_disk_backed_available = snapshot.download_disk_backed_available,
                     waiter_keys = snapshot.engine.memory.waiter_keys,
                     waiter_wakers = snapshot.engine.memory.waiter_wakers,
                     archive_session_count = snapshot.archive_session_count,

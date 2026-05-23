@@ -259,3 +259,63 @@ pub fn empty_ok() -> Response {
         .body(Body::empty())
         .unwrap()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn attachment_header_uses_safe_basename_and_utf8_name() {
+        let header = content_disposition_attachment(r#"C:\tmp\..\Movie "Final".mkv"#);
+        let value = header.to_str().expect("valid header");
+
+        assert!(value.starts_with("attachment;"));
+        assert!(value.contains(r#"filename="Movie Final.mkv""#));
+        assert!(value.contains("filename*=UTF-8''Movie%20Final.mkv"));
+        assert!(!value.contains(".."));
+    }
+
+    #[test]
+    fn resolves_minus_one_to_largest_video() {
+        let files = vec![
+            FileCandidate {
+                index: 0,
+                name: "sample.txt".to_string(),
+                length: 10_000,
+            },
+            FileCandidate {
+                index: 1,
+                name: "movie.mkv".to_string(),
+                length: 1_000,
+            },
+            FileCandidate {
+                index: 2,
+                name: "feature.mp4".to_string(),
+                length: 2_000,
+            },
+        ];
+
+        assert_eq!(resolve_file_idx("-1", &files, &[]).unwrap(), 2);
+    }
+
+    #[test]
+    fn resolves_minus_one_with_filter() {
+        let files = vec![
+            FileCandidate {
+                index: 0,
+                name: "episode.one.mkv".to_string(),
+                length: 1,
+            },
+            FileCandidate {
+                index: 1,
+                name: "episode.two.mkv".to_string(),
+                length: 1,
+            },
+        ];
+
+        assert_eq!(
+            resolve_file_idx("-1", &files, &["/two/i".to_string()]).unwrap(),
+            1
+        );
+    }
+}

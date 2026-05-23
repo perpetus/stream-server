@@ -8,6 +8,23 @@ use axum::{
 };
 use enginefs::backend::TorrentHandle;
 use serde_json::{Value, json};
+use std::collections::HashMap;
+
+async fn combined_engine_stats(
+    state: &AppState,
+) -> HashMap<String, enginefs::backend::EngineStats> {
+    let mut engines = state.engine.get_all_statistics().await;
+    let download_engines = state.download_engine.get_all_statistics().await;
+
+    // Direct playback/download requests use download_engine when disk-backed
+    // mode is available. Prefer those stats for duplicate info hashes so UI
+    // speed/peer counters reflect the active transfer.
+    for (hash, stats) in download_engines {
+        engines.insert(hash, stats);
+    }
+
+    engines
+}
 
 #[derive(serde::Deserialize)]
 pub struct StatsParams {
@@ -18,7 +35,7 @@ pub async fn get_stats(
     State(state): State<AppState>,
     Query(params): Query<StatsParams>,
 ) -> impl IntoResponse {
-    let engines = state.engine.get_all_statistics().await;
+    let engines = combined_engine_stats(&state).await;
 
     // Convert engines HashMap to Value
     let mut root: serde_json::Map<String, Value> = serde_json::Map::new();
@@ -131,7 +148,7 @@ impl Default for ServerSettings {
             cache_root,
             cache_size: 10.0 * 1024.0 * 1024.0 * 1024.0, // 10GB
             proxy_streams_enabled: false,
-            bt_max_connections: 65535,
+            bt_max_connections: enginefs::backend::DEFAULT_BT_MAX_CONNECTIONS,
             bt_handshake_timeout: 20000,
             bt_request_timeout: 10000,
             bt_download_speed_soft_limit: 0.0,
@@ -187,7 +204,12 @@ pub async fn set_settings(
         }
         if let Some(v) = obj.get("btMaxConnections") {
             if let Some(n) = v.as_u64() {
-                settings.bt_max_connections = n;
+                settings.bt_max_connections =
+                    if n == 0 || n >= enginefs::backend::LEGACY_UNLIMITED_BT_MAX_CONNECTIONS {
+                        enginefs::backend::DEFAULT_BT_MAX_CONNECTIONS
+                    } else {
+                        n
+                    };
             }
         }
         if let Some(v) = obj.get("btHandshakeTimeout") {
@@ -239,6 +261,10 @@ pub async fn set_settings(
 
     // Apply new speed profile to libtorrent session dynamically
     state.engine.update_speed_profile(&new_profile).await;
+    state
+        .download_engine
+        .update_speed_profile(&new_profile)
+        .await;
 
     // Save to disk
     if let Err(e) = state.save_settings().await {
@@ -420,13 +446,15 @@ pub async fn get_engine_stats(
     let info_hash = info_hash.to_lowercase();
 
     // Try to get existing engine, or auto-create from info hash
-    let engine = if let Some(e) = state.engine.get_engine(&info_hash).await {
+    let engine = if let Some(e) = state.download_engine.get_engine(&info_hash).await {
+        e
+    } else if let Some(e) = state.engine.get_engine(&info_hash).await {
         e
     } else {
         tracing::info!("Auto-creating engine for stats request: {}", info_hash);
         let magnet = format!("magnet:?xt=urn:btih:{}", info_hash);
         let source = enginefs::backend::TorrentSource::Url(magnet);
-        match state.engine.add_torrent(source, None).await {
+        match state.download_engine.add_torrent(source, None).await {
             Ok(e) => e,
             Err(e) => {
                 tracing::error!("Failed to create engine: {}", e);
@@ -451,13 +479,15 @@ pub async fn get_file_stats(
     let info_hash = info_hash.to_lowercase();
 
     // Try to get existing engine, or auto-create from info hash
-    let engine = if let Some(e) = state.engine.get_engine(&info_hash).await {
+    let engine = if let Some(e) = state.download_engine.get_engine(&info_hash).await {
+        e
+    } else if let Some(e) = state.engine.get_engine(&info_hash).await {
         e
     } else {
         tracing::info!("Auto-creating engine for file stats request: {}", info_hash);
         let magnet = format!("magnet:?xt=urn:btih:{}", info_hash);
         let source = enginefs::backend::TorrentSource::Url(magnet);
-        match state.engine.add_torrent(source, None).await {
+        match state.download_engine.add_torrent(source, None).await {
             Ok(e) => e,
             Err(e) => {
                 tracing::error!("Failed to create engine: {}", e);

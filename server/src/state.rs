@@ -9,6 +9,8 @@ use crate::local_addon::LocalIndex;
 #[derive(Clone)]
 pub struct AppState {
     pub engine: Arc<EngineFS>,
+    pub download_engine: Arc<EngineFS>,
+    pub download_engine_disk_backed: bool,
     pub settings: Arc<RwLock<ServerSettings>>,
     pub settings_path: PathBuf,
     pub config_dir: PathBuf,
@@ -47,10 +49,30 @@ impl AppState {
         config_dir: PathBuf,
         log_dir: PathBuf,
     ) -> Self {
+        Self::new_with_shared_settings_log_dir_and_download_engine(
+            engine.clone(),
+            engine,
+            false,
+            settings,
+            config_dir,
+            log_dir,
+        )
+    }
+
+    pub fn new_with_shared_settings_log_dir_and_download_engine(
+        engine: Arc<EngineFS>,
+        download_engine: Arc<EngineFS>,
+        download_engine_disk_backed: bool,
+        settings: Arc<RwLock<ServerSettings>>,
+        config_dir: PathBuf,
+        log_dir: PathBuf,
+    ) -> Self {
         let settings_path = config_dir.join("settings.json");
 
         Self {
             engine,
+            download_engine,
+            download_engine_disk_backed,
             settings,
             settings_path,
             config_dir,
@@ -93,6 +115,18 @@ impl AppState {
                     // For now, let's respect the file, but if missing/empty, use our runtime defaults.
                     if settings.cache_root.is_empty() {
                         settings.cache_root = defaults.cache_root.clone();
+                    }
+                    if settings.bt_max_connections == 0
+                        || settings.bt_max_connections
+                            >= enginefs::backend::LEGACY_UNLIMITED_BT_MAX_CONNECTIONS
+                    {
+                        tracing::info!(
+                            previous_bt_max_connections = settings.bt_max_connections,
+                            normalized_bt_max_connections =
+                                enginefs::backend::DEFAULT_BT_MAX_CONNECTIONS,
+                            "Normalizing legacy torrent connection setting for multi-client stability"
+                        );
+                        settings.bt_max_connections = enginefs::backend::DEFAULT_BT_MAX_CONNECTIONS;
                     }
                     return settings;
                 }

@@ -243,10 +243,12 @@ fn main() {
             }
 
             // Unix: exclude threading files (CRITSECT_HANDLE not defined without RAR_SMP)
-            if cfg!(not(windows)) && matches!(
-                name,
-                "threadmisc.cpp" | "threadpool.cpp" | "motw.cpp" | "isnt.cpp"
-            ) {
+            if cfg!(not(windows))
+                && matches!(
+                    name,
+                    "threadmisc.cpp" | "threadpool.cpp" | "motw.cpp" | "isnt.cpp"
+                )
+            {
                 return false;
             }
 
@@ -329,10 +331,13 @@ fn main() {
     let extra_includes_refs: Vec<&str> = extra_includes.iter().map(|s| s.as_str()).collect();
     clang_args.extend(extra_includes_refs);
 
-    let mut b = autocxx_build::Builder::new("src/ffi.rs", &[unrar_src.as_path(), PathBuf::from("src/cpp").as_path()])
-        .extra_clang_args(&clang_args)
-        .build()
-        .expect("Failed to generate autocxx bindings");
+    let mut b = autocxx_build::Builder::new(
+        "src/ffi.rs",
+        &[unrar_src.as_path(), PathBuf::from("src/cpp").as_path()],
+    )
+    .extra_clang_args(&clang_args)
+    .build()
+    .expect("Failed to generate autocxx bindings");
 
     #[cfg(target_os = "windows")]
     b.flag("/std:c++17");

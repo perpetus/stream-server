@@ -9,28 +9,28 @@ use autocxx::prelude::*;
 
 include_cpp! {
     #include "wrappers.hpp"
-    
+
     safety!(unsafe_ffi)
-    
+
     // Archive open/close
     generate!("RAROpenArchiveEx_Wrapper")
     generate!("RARCloseArchive")
-    
+
     // Header reading
     generate!("RARReadHeaderEx_Wrapper")
-    
-    // File processing  
+
+    // File processing
     generate!("RARProcessFile")
     generate!("RARProcessFileW_Wrapper")
-    
+
     // Password setting
     generate!("RARSetPassword")
-    
+
     // Callback setting
     // generate!("RARSetCallback") // Failed to generate directly
     generate!("RARSetCallback_Wrapper")
     generate!("UNRARCALLBACK")
-    
+
     // Data structures
     generate_pod!("RAROpenArchiveDataEx_Wrapper")
     generate_pod!("RARHeaderDataEx_Wrapper")

@@ -62,8 +62,8 @@ pub struct BackendEngineFS<B: TorrentBackend> {
     active_streams: Arc<RwLock<HashMap<String, usize>>>,
     /// Track active requests per specific streamed file so cleanup does not race probe retries.
     active_file_streams: Arc<RwLock<HashMap<(String, usize), usize>>>,
-    /// Tracks the currently active streamed file (info_hash, file_idx)
-    /// Only ONE file should be actively downloading at any time
+    /// Tracks the most recently active streamed file for legacy diagnostics.
+    /// Active scheduling is driven by active_file_streams so several torrents can stream at once.
     active_file: Arc<RwLock<Option<(String, usize)>>>,
     /// Optional disk cache for persisting completed files
     disk_cache: Option<Arc<disk_cache::DiskCacheManager>>,
@@ -392,29 +392,16 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         }
     }
 
-    /// Called when a stream starts for a torrent file
-    /// Implements exclusive single-file downloading - only ONE file downloads at a time
+    /// Called when a stream starts for a torrent file.
+    /// Several torrent files may be active at once; cleanup is per file stream.
     pub async fn on_stream_start(&self, info_hash: &str, file_idx: usize) {
         let info_hash = info_hash.to_lowercase();
         if let Some(engine) = self.get_engine(&info_hash).await {
             engine.touch();
         }
 
-        // Check if a different file was previously active and clear its priorities
         {
             let mut active = self.active_file.write().await;
-            if let Some((prev_hash, prev_idx)) = active.take() {
-                if prev_hash != info_hash || prev_idx != file_idx {
-                    tracing::info!(
-                        "Switching stream: clearing priorities for previous file {} idx={}",
-                        prev_hash,
-                        prev_idx
-                    );
-                    // Clear priorities for the previous file
-                    self.clear_file_priorities(&prev_hash, prev_idx).await;
-                }
-            }
-            // Set the new active file
             *active = Some((info_hash.clone(), file_idx));
         }
 
@@ -431,7 +418,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         }
 
         tracing::info!(
-            "Stream started for {} file_idx={} (exclusive mode)",
+            "Stream started for {} file_idx={} (shared mode)",
             info_hash,
             file_idx
         );
@@ -541,21 +528,6 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         });
     }
 
-    /// Clear piece priorities for a file that is no longer being streamed
-    async fn clear_file_priorities(&self, info_hash: &str, file_idx: usize) {
-        if let Some(engine) = self.get_engine(info_hash).await {
-            // Set file priority to 0 (skip) and clear piece deadlines
-            if let Err(e) = engine.handle.clear_file_streaming(file_idx).await {
-                tracing::warn!(
-                    "Failed to clear file priorities for {} idx={}: {}",
-                    info_hash,
-                    file_idx,
-                    e
-                );
-            }
-        }
-    }
-
     /// Get a reference to the backend for direct access
     pub fn get_backend(&self) -> &Arc<B> {
         &self.backend
@@ -615,15 +587,30 @@ impl BackendEngineFS<LibtorrentBackend> {
         Ok(efs)
     }
 
+    pub async fn new_disk_backed(
+        root_dir: std::path::PathBuf,
+        config: crate::backend::BackendConfig,
+        tracker_storage: Option<Arc<dyn crate::trackers::TrackerStorage>>,
+    ) -> Result<Self> {
+        let download_dir = root_dir.join("torrent-cache");
+        let backend = LibtorrentBackend::new_disk_backed(download_dir.clone(), config)?;
+
+        Ok(Self::new_with_backend_and_storage(
+            backend,
+            HashMap::new(),
+            download_dir.clone(),
+            download_dir,
+            tracker_storage,
+        ))
+    }
+
     /// Update session settings dynamically (called when user changes torrent profile)
     pub async fn update_speed_profile(&self, profile: &crate::backend::TorrentSpeedProfile) {
         self.backend.update_session_settings(profile).await;
     }
 
-    /// Pause all torrents except the specified one to focus bandwidth on streaming
-    /// Also enables streaming mode (limits upload to maximize download)
+    /// Mark the torrent as active without pausing other active torrents.
     pub async fn focus_torrent(&self, target_info_hash: &str) {
-        // Enable streaming mode (limit uploads)
         self.backend.set_streaming_mode(true).await;
         self.backend.focus_torrent(target_info_hash).await;
     }

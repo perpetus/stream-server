@@ -15,6 +15,7 @@ use crate::tracker_prober::TrackerProber;
 use libtorrent_sys::{LibtorrentSession, SessionSettings};
 
 mod constants;
+mod disk_stream;
 mod handle;
 mod helpers;
 mod stream;
@@ -26,12 +27,19 @@ pub use handle::LibtorrentTorrentHandle;
 
 use constants::DEFAULT_TRACKERS;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LibtorrentStorageMode {
+    MemoryOnly,
+    DiskBacked,
+}
+
 /// libtorrent backend implementation
 pub struct LibtorrentBackend {
     session: Arc<RwLock<LibtorrentSession>>,
     save_path: PathBuf,
     metadata_path: PathBuf,
     config: crate::backend::BackendConfig,
+    storage_mode: LibtorrentStorageMode,
     stream_counter: Arc<std::sync::atomic::AtomicUsize>,
     /// In-memory piece cache for fast streaming
     piece_cache: Arc<crate::piece_cache::PieceCacheManager>,
@@ -39,33 +47,77 @@ pub struct LibtorrentBackend {
     piece_waiter: Arc<crate::piece_waiter::PieceWaiterRegistry>,
     /// Torrent/file metadata inspections already scheduled for this backend lifetime
     metadata_inspections: Arc<tokio::sync::Mutex<std::collections::HashSet<(String, usize)>>>,
+    /// Torrents whose files have been initialized to priority 0 after metadata arrival.
+    file_priority_initializations: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 impl LibtorrentBackend {
     /// Create a new libtorrent backend
     pub fn new(save_path: PathBuf, config: crate::backend::BackendConfig) -> Result<Self> {
-        let settings = SessionSettings {
+        Self::new_memory_only(save_path, config)
+    }
+
+    pub fn new_memory_only(
+        save_path: PathBuf,
+        config: crate::backend::BackendConfig,
+    ) -> Result<Self> {
+        Self::new_with_storage_mode(save_path, config, LibtorrentStorageMode::MemoryOnly)
+    }
+
+    pub fn new_disk_backed(
+        save_path: PathBuf,
+        config: crate::backend::BackendConfig,
+    ) -> Result<Self> {
+        Self::new_with_storage_mode(save_path, config, LibtorrentStorageMode::DiskBacked)
+    }
+
+    fn default_session_settings(config: &crate::backend::BackendConfig) -> SessionSettings {
+        let download_rate_limit = if config.speed_profile.bt_download_speed_hard_limit > 0.0 {
+            config.speed_profile.bt_download_speed_hard_limit as i32
+        } else {
+            0
+        };
+        let (max_connections, max_connections_per_torrent, connections_normalized) =
+            config.speed_profile.effective_connection_limits();
+
+        if connections_normalized {
+            tracing::info!(
+                requested_max_connections = config.speed_profile.bt_max_connections,
+                effective_max_connections = max_connections,
+                effective_max_connections_per_torrent = max_connections_per_torrent,
+                "Normalized torrent connection limits for multi-client stability"
+            );
+        }
+
+        SessionSettings {
             listen_interfaces: "0.0.0.0:42000-42010,[::]:42000-42010".to_string(),
             user_agent: "stream-server/1.0".to_string(),
             enable_dht: true,
             enable_lsd: true,
             enable_upnp: true,
             enable_natpmp: true,
-            // Apply speed profile settings from config
-            max_connections: config.speed_profile.bt_max_connections as i32,
-            max_connections_per_torrent: (config.speed_profile.bt_max_connections / 2) as i32,
-            download_rate_limit: config.speed_profile.bt_download_speed_hard_limit as i32,
+            max_connections,
+            max_connections_per_torrent,
+            download_rate_limit,
             upload_rate_limit: 0,
-            active_downloads: 50, // Increased from 30
-            active_seeds: 50,     // Increased from 20
-            active_limit: 100,    // Increased from 50
+            active_downloads: 8,
+            active_seeds: 16,
+            active_limit: 24,
             anonymous_mode: false,
             proxy_host: String::new(),
             proxy_port: 0,
             proxy_type: 0,
             announce_to_all_trackers: true,
             announce_to_all_tiers: true,
-        };
+        }
+    }
+
+    fn new_with_storage_mode(
+        save_path: PathBuf,
+        config: crate::backend::BackendConfig,
+        storage_mode: LibtorrentStorageMode,
+    ) -> Result<Self> {
+        let settings = Self::default_session_settings(&config);
 
         tracing::info!(
             "LibtorrentBackend: max_connections={}, download_limit={} B/s",
@@ -73,14 +125,28 @@ impl LibtorrentBackend {
             settings.download_rate_limit
         );
 
-        // Always use memory-only storage - pieces stay in RAM during streaming
-        // Disk caching happens separately after stream completion (see Phase 3)
-        let session = LibtorrentSession::new_memory_only(settings)
-            .map_err(|e| anyhow!("Failed to create memory-only libtorrent session: {}", e))?;
-        tracing::info!(
-            "LibtorrentBackend: Memory-only mode (streaming-first, cache_size={})",
-            config.cache.size
-        );
+        let session = match storage_mode {
+            LibtorrentStorageMode::MemoryOnly => {
+                let session = LibtorrentSession::new_memory_only(settings).map_err(|e| {
+                    anyhow!("Failed to create memory-only libtorrent session: {}", e)
+                })?;
+                tracing::info!(
+                    "LibtorrentBackend: Memory-only mode (streaming-first, cache_size={})",
+                    config.cache.size
+                );
+                session
+            }
+            LibtorrentStorageMode::DiskBacked => {
+                let session = LibtorrentSession::new_disk_backed(settings).map_err(|e| {
+                    anyhow!("Failed to create disk-backed libtorrent session: {}", e)
+                })?;
+                tracing::info!(
+                    "LibtorrentBackend: Disk-backed mode (download-first, path={:?})",
+                    save_path
+                );
+                session
+            }
+        };
 
         std::fs::create_dir_all(&save_path)?;
 
@@ -99,16 +165,20 @@ impl LibtorrentBackend {
         let piece_waiter = Arc::new(crate::piece_waiter::PieceWaiterRegistry::new());
         let metadata_inspections =
             Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
+        let file_priority_initializations =
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
 
         let backend = Self {
             session: Arc::new(RwLock::new(session)),
             save_path,
             metadata_path,
             config,
+            storage_mode,
             stream_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             piece_cache,
             piece_waiter,
             metadata_inspections,
+            file_priority_initializations,
         };
         backend.start_monitor_task();
         Ok(backend)
@@ -120,10 +190,36 @@ impl LibtorrentBackend {
         settings: SessionSettings,
         config: crate::backend::BackendConfig,
     ) -> Result<Self> {
-        // Always use memory-only storage - pieces stay in RAM during streaming
-        let session = LibtorrentSession::new_memory_only(settings)
-            .map_err(|e| anyhow!("Failed to create memory-only libtorrent session: {}", e))?;
-        tracing::info!("LibtorrentBackend: Memory-only mode (streaming-first)");
+        Self::with_settings_and_storage_mode(
+            save_path,
+            settings,
+            config,
+            LibtorrentStorageMode::MemoryOnly,
+        )
+    }
+
+    fn with_settings_and_storage_mode(
+        save_path: PathBuf,
+        settings: SessionSettings,
+        config: crate::backend::BackendConfig,
+        storage_mode: LibtorrentStorageMode,
+    ) -> Result<Self> {
+        let session = match storage_mode {
+            LibtorrentStorageMode::MemoryOnly => {
+                let session = LibtorrentSession::new_memory_only(settings).map_err(|e| {
+                    anyhow!("Failed to create memory-only libtorrent session: {}", e)
+                })?;
+                tracing::info!("LibtorrentBackend: Memory-only mode (streaming-first)");
+                session
+            }
+            LibtorrentStorageMode::DiskBacked => {
+                let session = LibtorrentSession::new_disk_backed(settings).map_err(|e| {
+                    anyhow!("Failed to create disk-backed libtorrent session: {}", e)
+                })?;
+                tracing::info!("LibtorrentBackend: Disk-backed mode (download-first)");
+                session
+            }
+        };
 
         std::fs::create_dir_all(&save_path)?;
 
@@ -142,16 +238,20 @@ impl LibtorrentBackend {
         let piece_waiter = Arc::new(crate::piece_waiter::PieceWaiterRegistry::new());
         let metadata_inspections =
             Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
+        let file_priority_initializations =
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
 
         let backend = Self {
             session: Arc::new(RwLock::new(session)),
             save_path,
             metadata_path,
             config,
+            storage_mode,
             stream_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             piece_cache,
             piece_waiter,
             metadata_inspections,
+            file_priority_initializations,
         };
         backend.start_monitor_task();
         Ok(backend)
@@ -167,6 +267,16 @@ impl LibtorrentBackend {
         } else {
             0 // Unlimited
         };
+        let (max_connections, max_connections_per_torrent, connections_normalized) =
+            profile.effective_connection_limits();
+        if connections_normalized {
+            tracing::info!(
+                requested_max_connections = profile.bt_max_connections,
+                effective_max_connections = max_connections,
+                effective_max_connections_per_torrent = max_connections_per_torrent,
+                "Normalized updated torrent connection limits for multi-client stability"
+            );
+        }
 
         // Apply new settings via full settings pack
         let new_settings = libtorrent_sys::SessionSettings {
@@ -176,13 +286,13 @@ impl LibtorrentBackend {
             enable_lsd: true,
             enable_upnp: true,
             enable_natpmp: true,
-            max_connections: profile.bt_max_connections as i32,
-            max_connections_per_torrent: (profile.bt_max_connections / 2) as i32,
+            max_connections,
+            max_connections_per_torrent,
             download_rate_limit: download_limit,
             upload_rate_limit: 0,
-            active_downloads: 50,
-            active_seeds: 50,
-            active_limit: 100,
+            active_downloads: 8,
+            active_seeds: 16,
+            active_limit: 24,
             anonymous_mode: false,
             proxy_host: String::new(),
             proxy_port: 0,
@@ -195,9 +305,10 @@ impl LibtorrentBackend {
             tracing::error!("Failed to apply session settings: {}", e);
         } else {
             tracing::info!(
-                "Updated libtorrent settings: max_connections={}, download_limit={} B/s",
-                profile.bt_max_connections,
-                download_limit
+                "Updated libtorrent settings: max_connections={} per_torrent={} download_limit={} B/s",
+                max_connections,
+                max_connections_per_torrent,
+                download_limit,
             );
         }
     }
@@ -208,6 +319,7 @@ impl LibtorrentBackend {
         let alert_session = self.session.clone();
         let alert_piece_cache = self.piece_cache.clone();
         let alert_piece_waiter = self.piece_waiter.clone();
+        let alert_storage_mode = self.storage_mode;
 
         tokio::spawn(async move {
             // REDUCED to 5ms for instant piece notifications
@@ -234,7 +346,8 @@ impl LibtorrentBackend {
                         );
                     }
 
-                    // Handle piece_finished_alert: read piece data directly from memory storage.
+                    // Handle piece_finished_alert. Memory sessions copy verified pieces into
+                    // the Rust cache; disk sessions only need to wake file readers.
                     if alert.alert_type == piece_finished_alert_type && alert.piece_index >= 0 {
                         tracing::info!(
                             "piece_finished_alert piece={} info_hash={}",
@@ -242,34 +355,38 @@ impl LibtorrentBackend {
                             alert.info_hash,
                         );
 
-                        if !alert.info_hash.is_empty() {
-                            libtorrent_sys::memory_label_last_unlabeled_storage(&alert.info_hash);
-                        }
-                        let piece_data = libtorrent_sys::memory_read_piece_direct(
-                            &alert.info_hash,
-                            alert.piece_index,
-                        );
-                        if !piece_data.is_empty() {
-                            let info_hash = alert.info_hash.clone();
-                            let piece_idx = alert.piece_index;
-                            let cache = alert_piece_cache.clone();
-                            let waiter = alert_piece_waiter.clone();
-
-                            tokio::spawn(async move {
-                                cache.put_piece(&info_hash, piece_idx, piece_data).await;
-                                waiter.notify_piece_finished(&info_hash, piece_idx);
-                                tracing::info!(
-                                    "Direct-read: Cached piece {} for {}",
-                                    piece_idx,
-                                    info_hash
+                        if matches!(alert_storage_mode, LibtorrentStorageMode::MemoryOnly) {
+                            if !alert.info_hash.is_empty() {
+                                libtorrent_sys::memory_label_last_unlabeled_storage(
+                                    &alert.info_hash,
                                 );
-                            });
-                        } else {
-                            tracing::warn!(
-                                "piece_finished_alert: memory_read_piece_direct returned empty for piece={} info_hash={}",
+                            }
+                            let piece_data = libtorrent_sys::memory_read_piece_direct(
+                                &alert.info_hash,
                                 alert.piece_index,
-                                alert.info_hash,
                             );
+                            if !piece_data.is_empty() {
+                                let info_hash = alert.info_hash.clone();
+                                let piece_idx = alert.piece_index;
+                                let cache = alert_piece_cache.clone();
+                                let waiter = alert_piece_waiter.clone();
+
+                                tokio::spawn(async move {
+                                    cache.put_piece(&info_hash, piece_idx, piece_data).await;
+                                    waiter.notify_piece_finished(&info_hash, piece_idx);
+                                    tracing::info!(
+                                        "Direct-read: Cached piece {} for {}",
+                                        piece_idx,
+                                        info_hash
+                                    );
+                                });
+                            } else {
+                                tracing::warn!(
+                                    "piece_finished_alert: memory_read_piece_direct returned empty for piece={} info_hash={}",
+                                    alert.piece_index,
+                                    alert.info_hash,
+                                );
+                            }
                         }
 
                         // Still notify waiters so they can retry if the storage read raced.
@@ -285,6 +402,7 @@ impl LibtorrentBackend {
         let session = self.session.clone();
         let metadata_path = self.metadata_path.clone();
         let config = self.config.clone();
+        let file_priority_initializations = self.file_priority_initializations.clone();
         let _save_path = self.save_path.clone();
 
         tokio::spawn(async move {
@@ -316,6 +434,28 @@ impl LibtorrentBackend {
 
                         // Instant Loading Part 3: Save Metadata to Cache
                         let info_hash = handle.info_hash();
+                        let should_initialize_priorities = {
+                            let mut initialized = file_priority_initializations.lock().await;
+                            initialized.insert(info_hash.clone())
+                        };
+                        if should_initialize_priorities {
+                            let files = handle.files();
+                            for (idx, file) in files.iter().enumerate() {
+                                handle.set_file_priority(idx as i32, 0);
+                                tracing::debug!(
+                                    info_hash = %info_hash,
+                                    file_idx = idx,
+                                    file_path = %file.path,
+                                    "metadata-ready file priority initialized to skip"
+                                );
+                            }
+                            tracing::info!(
+                                info_hash = %info_hash,
+                                file_count = files.len(),
+                                "metadata-ready torrent initialized with all files skipped"
+                            );
+                        }
+
                         let cache_file =
                             metadata_path.join(format!("{}.torrent", info_hash.to_lowercase()));
                         if !cache_file.exists() {
@@ -331,14 +471,12 @@ impl LibtorrentBackend {
                         }
                     }
 
-                    // --- Auto-Pause Finished Torrents ---
-                    if status.is_finished && !status.is_paused {
-                        tracing::info!(
-                            "Monitor: Torrent '{}' finished. Pausing to save resources.",
-                            status.name
-                        );
-                        handle.pause();
-                    }
+                    // Do not auto-pause "finished" torrents here. With selective file
+                    // priorities, libtorrent can report finished when the current wanted
+                    // set is complete or temporarily empty, even while HTTP playback or
+                    // download readers are about to request more pieces. Cleanup clears
+                    // file priorities per stream; pausing here causes slow startup and
+                    // stalls when several torrents are active.
 
                     // --- PeerSearch Logic ---
                     {
@@ -398,18 +536,20 @@ impl LibtorrentBackend {
         });
     }
 
-    /// Pause all torrents except the specified one to focus bandwidth on streaming
+    /// Mark a torrent as latency-sensitive without pausing other active torrents.
     pub async fn focus_torrent(&self, target_info_hash: &str) {
         let session = self.session.read().await;
         let torrents = session.get_torrents();
 
         for status in torrents {
-            if status.info_hash.to_lowercase() != target_info_hash.to_lowercase() {
+            if status.info_hash.eq_ignore_ascii_case(target_info_hash) {
                 if let Ok(mut handle) = session.find_torrent(&status.info_hash) {
-                    if !status.is_paused {
-                        tracing::info!("Pausing torrent {} to focus on stream", status.info_hash);
-                        handle.pause();
+                    if status.is_paused {
+                        tracing::info!("Resuming torrent {} for active stream", status.info_hash);
+                        handle.resume();
                     }
+                    let _ = handle.force_reannounce();
+                    let _ = handle.force_dht_announce();
                 }
             }
         }
@@ -576,16 +716,22 @@ impl TorrentBackend for LibtorrentBackend {
         for (idx, _f) in files.iter().enumerate() {
             handle.set_file_priority(idx as i32, 0);
         }
+        if !files.is_empty() {
+            let mut initialized = self.file_priority_initializations.lock().await;
+            initialized.insert(handle.info_hash());
+        }
 
         Ok(LibtorrentTorrentHandle {
             session: self.session.clone(),
             info_hash: handle.info_hash(),
             save_path: self.save_path.clone(),
             config: self.config.clone(),
+            storage_mode: self.storage_mode,
             stream_counter: self.stream_counter.clone(),
             piece_cache: self.piece_cache.clone(),
             piece_waiter: self.piece_waiter.clone(),
             metadata_inspections: self.metadata_inspections.clone(),
+            file_priority_initializations: self.file_priority_initializations.clone(),
         })
     }
 
@@ -597,10 +743,12 @@ impl TorrentBackend for LibtorrentBackend {
                 info_hash: info_hash.to_string(),
                 save_path: self.save_path.clone(),
                 config: self.config.clone(),
+                storage_mode: self.storage_mode,
                 stream_counter: self.stream_counter.clone(),
                 piece_cache: self.piece_cache.clone(),
                 piece_waiter: self.piece_waiter.clone(),
                 metadata_inspections: self.metadata_inspections.clone(),
+                file_priority_initializations: self.file_priority_initializations.clone(),
             }),
             Err(_) => None,
         }
@@ -623,6 +771,10 @@ impl TorrentBackend for LibtorrentBackend {
             let mut inspections = self.metadata_inspections.lock().await;
             inspections.retain(|(hash, _)| hash != info_hash);
         }
+        {
+            let mut initialized = self.file_priority_initializations.lock().await;
+            initialized.remove(info_hash);
+        }
         libtorrent_sys::memory_clear_torrent(info_hash);
         Ok(())
     }
@@ -636,8 +788,23 @@ impl TorrentBackend for LibtorrentBackend {
     }
 
     async fn memory_diagnostics(&self) -> BackendMemoryDiagnostics {
-        let native = libtorrent_sys::memory_storage_stats();
-        let (rust_piece_cache_entries, rust_piece_cache_bytes) = self.piece_cache.stats();
+        let native = if matches!(self.storage_mode, LibtorrentStorageMode::MemoryOnly) {
+            libtorrent_sys::memory_storage_stats()
+        } else {
+            libtorrent_sys::MemoryStorageStats {
+                total_bytes: 0,
+                total_pieces: 0,
+                total_read_bytes: 0,
+                total_write_bytes: 0,
+                torrents: Vec::new(),
+            }
+        };
+        let (rust_piece_cache_entries, rust_piece_cache_bytes) =
+            if matches!(self.storage_mode, LibtorrentStorageMode::MemoryOnly) {
+                self.piece_cache.stats()
+            } else {
+                (0, 0)
+            };
         let waiters = self.piece_waiter.stats();
 
         BackendMemoryDiagnostics {

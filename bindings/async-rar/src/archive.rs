@@ -85,11 +85,11 @@ impl RarArchive {
 
         // Create open archive data structure
         let mut open_data = unsafe { std::mem::zeroed::<ffi::RAROpenArchiveDataEx_Wrapper>() };
-        
+
         // Set archive name
         open_data.ArcName = c_path.as_ptr() as *mut _;
         open_data.OpenMode = mode.to_raw();
-        
+
         // Allocate comment buffer
         let mut comment_buf = vec![0u8; 65536];
         open_data.CmtBuf = comment_buf.as_mut_ptr() as *mut _;
@@ -119,16 +119,17 @@ impl RarArchive {
     /// List all entries in the archive
     pub fn list_entries(&mut self) -> Result<Vec<RarEntry>> {
         let mut entries = Vec::new();
-        
+
         loop {
             let mut header = unsafe { std::mem::zeroed::<ffi::RARHeaderDataEx_Wrapper>() };
-            
-            let result = unsafe { ffi::RARReadHeaderEx_Wrapper(self.handle as *mut _, &mut header) };
-            
+
+            let result =
+                unsafe { ffi::RARReadHeaderEx_Wrapper(self.handle as *mut _, &mut header) };
+
             if result == autocxx::c_int(ffi::RAR_END_ARCHIVE) {
                 break;
             }
-            
+
             if result != autocxx::c_int(ffi::RAR_SUCCESS) {
                 return Err(RarError::from_code(result.into()));
             }
@@ -153,8 +154,17 @@ impl RarArchive {
             entries.push(entry);
 
             // Skip to next entry
-            let skip_result = unsafe { ffi::RARProcessFile(self.handle as *mut _, autocxx::c_int(ffi::RAR_SKIP), ptr::null_mut(), ptr::null_mut()) };
-            if skip_result != autocxx::c_int(ffi::RAR_SUCCESS) && skip_result != autocxx::c_int(ffi::RAR_END_ARCHIVE) {
+            let skip_result = unsafe {
+                ffi::RARProcessFile(
+                    self.handle as *mut _,
+                    autocxx::c_int(ffi::RAR_SKIP),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                )
+            };
+            if skip_result != autocxx::c_int(ffi::RAR_SUCCESS)
+                && skip_result != autocxx::c_int(ffi::RAR_END_ARCHIVE)
+            {
                 return Err(RarError::from_code(skip_result.into()));
             }
         }
@@ -169,13 +179,14 @@ impl RarArchive {
 
         loop {
             let mut header = unsafe { std::mem::zeroed::<ffi::RARHeaderDataEx_Wrapper>() };
-            
-            let result = unsafe { ffi::RARReadHeaderEx_Wrapper(self.handle as *mut _, &mut header) };
-            
+
+            let result =
+                unsafe { ffi::RARReadHeaderEx_Wrapper(self.handle as *mut _, &mut header) };
+
             if result == autocxx::c_int(ffi::RAR_END_ARCHIVE) {
                 break;
             }
-            
+
             if result != autocxx::c_int(ffi::RAR_SUCCESS) {
                 return Err(RarError::from_code(result.into()));
             }
@@ -203,8 +214,9 @@ impl RarArchive {
     }
 
     /// Stream an entry's data via callback
-    pub fn stream_entry<F>(&mut self, entry_name: &str, mut callback: F) -> Result<()> 
-    where F: FnMut(&[u8]) -> bool 
+    pub fn stream_entry<F>(&mut self, entry_name: &str, mut callback: F) -> Result<()>
+    where
+        F: FnMut(&[u8]) -> bool,
     {
         // Trait object to pass safe pointer
         let mut trait_obj: &mut dyn FnMut(&[u8]) -> bool = &mut callback;
@@ -213,19 +225,20 @@ impl RarArchive {
         unsafe {
             ffi::RARSetCallback_Wrapper(
                 self.handle as *mut _,
-                rar_callback as *const () as *mut autocxx::c_void, 
-                autocxx::c_longlong(user_data as i64)
+                rar_callback as *const () as *mut autocxx::c_void,
+                autocxx::c_longlong(user_data as i64),
             );
         }
 
         loop {
             let mut header = unsafe { std::mem::zeroed::<ffi::RARHeaderDataEx_Wrapper>() };
-            let result = unsafe { ffi::RARReadHeaderEx_Wrapper(self.handle as *mut _, &mut header) };
-            
+            let result =
+                unsafe { ffi::RARReadHeaderEx_Wrapper(self.handle as *mut _, &mut header) };
+
             if result == autocxx::c_int(ffi::RAR_END_ARCHIVE) {
                 break;
             }
-            
+
             if result != autocxx::c_int(ffi::RAR_SUCCESS) {
                 return Err(RarError::from_code(result.into()));
             }
@@ -243,32 +256,32 @@ impl RarArchive {
                         self.handle as *mut _,
                         autocxx::c_int(ffi::RAR_TEST),
                         ptr::null_mut(),
-                        ptr::null_mut()
+                        ptr::null_mut(),
                     )
                 };
 
                 if process_result != autocxx::c_int(ffi::RAR_SUCCESS) {
-                     return Err(RarError::from_code(process_result.into()));
+                    return Err(RarError::from_code(process_result.into()));
                 }
-                
+
                 // We are done with this specific entry
                 return Ok(());
             } else {
                 // Skip other entries
-                let skip_result = unsafe { 
+                let skip_result = unsafe {
                     ffi::RARProcessFile(
                         self.handle as *mut _,
                         autocxx::c_int(ffi::RAR_SKIP),
                         ptr::null_mut(),
-                        ptr::null_mut()
+                        ptr::null_mut(),
                     )
                 };
                 if skip_result != autocxx::c_int(ffi::RAR_SUCCESS) {
-                     return Err(RarError::from_code(skip_result.into()));
+                    return Err(RarError::from_code(skip_result.into()));
                 }
             }
         }
-        
+
         Err(RarError::Unknown(0)) // Entry not found
     }
 }

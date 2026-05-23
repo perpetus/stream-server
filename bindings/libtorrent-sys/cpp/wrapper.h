@@ -49,6 +49,9 @@ public:
 
 // Lifecycle
 std::unique_ptr<Session> create_session(SessionSettings const &settings);
+// Create session with normal filesystem-backed storage.
+std::unique_ptr<Session>
+create_session_disk_backed(SessionSettings const &settings);
 // Create session with memory-only storage (no disk writes)
 std::unique_ptr<Session>
 create_session_memory_only(SessionSettings const &settings);

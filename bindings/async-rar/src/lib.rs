@@ -33,17 +33,12 @@
 //! This crate supports Windows, Linux, and macOS. The UnRAR library is
 //! compiled from source as part of the build process.
 
-mod ffi;
-mod error;
 mod archive;
 mod async_archive;
+mod error;
+mod ffi;
 
 // Public API
+pub use archive::{OpenMode, RarArchive, RarEntry};
+pub use async_archive::{AsyncRarArchive, extract_all, extract_all_with_password, list_entries};
 pub use error::{RarError, Result};
-pub use archive::{RarArchive, RarEntry, OpenMode};
-pub use async_archive::{
-    AsyncRarArchive,
-    list_entries,
-    extract_all,
-    extract_all_with_password,
-};

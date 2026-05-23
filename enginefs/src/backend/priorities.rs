@@ -34,6 +34,8 @@ pub enum PlaybackIntent {
     HlsInitial,
     HlsSeek,
     HlsSequential,
+    DownloadFull,
+    DownloadRange,
     ContainerMetadata,
     InternalProbe,
     Background,
@@ -50,6 +52,7 @@ impl PlaybackIntent {
                 Self::DirectSequential
             }
             Self::HlsInitial | Self::HlsSeek | Self::HlsSequential => Self::HlsSequential,
+            Self::DownloadFull | Self::DownloadRange => self,
             other => other,
         }
     }
@@ -57,9 +60,28 @@ impl PlaybackIntent {
     pub fn seek_for_same_family(self) -> Self {
         if self.is_hls() {
             Self::HlsSeek
+        } else if matches!(self, Self::DownloadFull | Self::DownloadRange) {
+            Self::DownloadRange
         } else {
             Self::DirectSeek
         }
+    }
+}
+
+pub fn disk_backed_sequential_download(intent: PlaybackIntent) -> bool {
+    matches!(intent, PlaybackIntent::DownloadFull)
+}
+
+pub fn disk_backed_forward_window_pieces(intent: PlaybackIntent) -> i32 {
+    match intent {
+        PlaybackIntent::DownloadFull => 15,
+        PlaybackIntent::DownloadRange => 3,
+        PlaybackIntent::DirectInitial | PlaybackIntent::HlsInitial => MAX_STARTUP_PIECES - 1,
+        PlaybackIntent::DirectSeek | PlaybackIntent::HlsSeek => 7,
+        PlaybackIntent::DirectSequential | PlaybackIntent::HlsSequential => 7,
+        PlaybackIntent::ContainerMetadata => 1,
+        PlaybackIntent::InternalProbe => 1,
+        PlaybackIntent::Background => 0,
     }
 }
 
@@ -168,6 +190,8 @@ impl PlaybackPriorityPolicy {
             PlaybackIntent::DirectSequential | PlaybackIntent::HlsSequential => {
                 "sequential".to_string()
             }
+            PlaybackIntent::DownloadFull => "download-full".to_string(),
+            PlaybackIntent::DownloadRange => "download-range".to_string(),
             PlaybackIntent::ContainerMetadata => "container-metadata".to_string(),
             PlaybackIntent::InternalProbe => "internal-probe".to_string(),
             PlaybackIntent::Background => "background".to_string(),
@@ -197,6 +221,8 @@ impl PlaybackPriorityPolicy {
                 }
                 (2, hot, 32)
             }
+            PlaybackIntent::DownloadFull => (2, 16, 0),
+            PlaybackIntent::DownloadRange => (1, 4, 0),
             PlaybackIntent::DirectSeek | PlaybackIntent::HlsSeek => {
                 let mut hot = dynamic_hot_window(&ctx, bitrate_ratio).max(MIN_SEEK_HOT_PIECES);
                 let mut immediate = SEEK_IMMEDIATE_PIECES;
@@ -481,5 +507,43 @@ mod tests {
 
         assert!(!priorities.is_empty());
         assert_eq!(priorities[0].piece_idx, 0);
+    }
+
+    #[test]
+    fn disk_backed_sequential_is_only_for_full_downloads() {
+        assert!(disk_backed_sequential_download(
+            PlaybackIntent::DownloadFull
+        ));
+        assert!(!disk_backed_sequential_download(
+            PlaybackIntent::DownloadRange
+        ));
+        assert!(!disk_backed_sequential_download(
+            PlaybackIntent::DirectInitial
+        ));
+        assert!(!disk_backed_sequential_download(PlaybackIntent::DirectSeek));
+        assert!(!disk_backed_sequential_download(
+            PlaybackIntent::ContainerMetadata
+        ));
+    }
+
+    #[test]
+    fn disk_backed_container_metadata_uses_tiny_window() {
+        assert_eq!(
+            disk_backed_forward_window_pieces(PlaybackIntent::ContainerMetadata),
+            1
+        );
+        assert!(
+            disk_backed_forward_window_pieces(PlaybackIntent::DownloadFull)
+                > disk_backed_forward_window_pieces(PlaybackIntent::DownloadRange)
+        );
+    }
+
+    #[test]
+    fn download_range_priority_is_bounded() {
+        let decision = PlaybackPriorityPolicy::decide(base_context(PlaybackIntent::DownloadRange));
+
+        assert_eq!(decision.hot_window_pieces, 4);
+        assert_eq!(decision.warm_window_pieces, 0);
+        assert_eq!(decision.assignments[0].piece_priority, 7);
     }
 }

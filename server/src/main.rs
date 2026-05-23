@@ -167,14 +167,35 @@ async fn run_server(
 
     // EngineFS::new_with_storage() passes tracker storage for persistence.
     // We also pass the backend config for prioritization/monitoring logic
-    let engine_fs =
-        EngineFS::new_with_storage(cache_dir.clone(), backend_config, Some(tracker_storage))
-            .await?;
+    let engine_fs = EngineFS::new_with_storage(
+        cache_dir.clone(),
+        backend_config.clone(),
+        Some(tracker_storage.clone()),
+    )
+    .await?;
     let engine = Arc::new(engine_fs);
+    let (download_engine, download_engine_disk_backed) = match EngineFS::new_disk_backed(
+        cache_dir.clone(),
+        backend_config,
+        Some(tracker_storage),
+    )
+    .await
+    {
+        Ok(download_engine_fs) => (Arc::new(download_engine_fs), true),
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "Disk-backed download engine unavailable at startup; download=1 will use memory-only mode"
+            );
+            (engine.clone(), false)
+        }
+    };
 
     // Create state with the shared settings Arc
-    let state = AppState::new_with_shared_settings_and_log_dir(
+    let state = AppState::new_with_shared_settings_log_dir_and_download_engine(
         engine,
+        download_engine,
+        download_engine_disk_backed,
         settings_arc.clone(),
         config_dir.clone(),
         log_dir.clone(),
@@ -194,10 +215,15 @@ async fn run_server(
     // Start tray stats collection if tray is active
     if let Some(stats) = tray_stats {
         let engine_clone = state.engine.clone();
+        let download_engine_clone = state.download_engine.clone();
         diagnostics::logging::spawn_logged("tray-stats", async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                let all_stats = engine_clone.get_all_statistics().await;
+                let mut all_stats = engine_clone.get_all_statistics().await;
+                let download_stats = download_engine_clone.get_all_statistics().await;
+                for (hash, stats) in download_stats {
+                    all_stats.insert(hash, stats);
+                }
 
                 let mut total_down = 0.0;
                 let mut total_up = 0.0;

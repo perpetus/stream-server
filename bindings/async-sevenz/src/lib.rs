@@ -1,8 +1,6 @@
 mod ffi;
 
-use crate::ffi::{
-    ReaderRequest, ReaderResponse, RustReaderContext,
-};
+use crate::ffi::{ReaderRequest, ReaderResponse, RustReaderContext};
 use std::ffi::{c_void, CStr};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt};
 use tokio::sync::mpsc;
@@ -33,8 +31,9 @@ impl SevenZ {
     where
         R: AsyncRead + AsyncSeek + Unpin + Send + 'static,
     {
-        let (tx, mut rx) = mpsc::unbounded_channel::<(ReaderRequest, std::sync::mpsc::Sender<ReaderResponse>)>();
-        
+        let (tx, mut rx) =
+            mpsc::unbounded_channel::<(ReaderRequest, std::sync::mpsc::Sender<ReaderResponse>)>();
+
         // Spawn the driver task
         task::spawn(async move {
             while let Some((req, resp_tx)) = rx.recv().await {
@@ -57,7 +56,7 @@ impl SevenZ {
                             0 => std::io::SeekFrom::Start(offset as u64),
                             1 => std::io::SeekFrom::Current(offset),
                             2 => std::io::SeekFrom::End(offset),
-                            _ => { 
+                            _ => {
                                 let _ = resp_tx.send(ReaderResponse::Error);
                                 continue;
                             }
@@ -89,7 +88,8 @@ impl SevenZ {
         let archive_addr = task::spawn_blocking(move || unsafe {
             let ptr = ffi::OpenArchive(ffi_ctx_addr as *mut autocxx::c_void);
             ptr as usize
-        }).await?;
+        })
+        .await?;
 
         let archive = archive_addr as *mut ffi::SevenZArchive;
 
@@ -102,71 +102,82 @@ impl SevenZ {
             _context: context,
         })
     }
-    
-    pub async fn entries(&self) -> Result<Vec<ArchiveEntry>, Box<dyn std::error::Error + Send + Sync>> {
+
+    pub async fn entries(
+        &self,
+    ) -> Result<Vec<ArchiveEntry>, Box<dyn std::error::Error + Send + Sync>> {
         let archive = self.archive;
         let archive_addr = archive as usize;
-        
+
         task::spawn_blocking(move || unsafe {
-             let archive = archive_addr as *mut ffi::SevenZArchive;
-             let count = ffi::GetArchiveItemCount(archive).0;
-             let mut entries = Vec::with_capacity(count as usize);
-             
-             for i in 0..count {
-                 let name_ptr = ffi::GetArchiveItemName(archive, autocxx::c_uint(i));
-                 let name = if !name_ptr.is_null() {
-                     let c_str = CStr::from_ptr(name_ptr);
-                     let s = c_str.to_string_lossy().to_string();
-                     ffi::FreeString(name_ptr);
-                     s
-                 } else {
-                     format!("{}", i)
-                 };
-                 
-                 let is_dir = ffi::IsArchiveItemFolder(archive, autocxx::c_uint(i)) != autocxx::c_int(0);
-                 let size = ffi::GetArchiveItemSize(archive, autocxx::c_uint(i)).0;
-                 
-                 entries.push(ArchiveEntry {
-                     name,
-                     size,
-                     is_dir,
-                     index: i,
-                 });
-             }
-             Ok(entries)
-        }).await?
+            let archive = archive_addr as *mut ffi::SevenZArchive;
+            let count = ffi::GetArchiveItemCount(archive).0;
+            let mut entries = Vec::with_capacity(count as usize);
+
+            for i in 0..count {
+                let name_ptr = ffi::GetArchiveItemName(archive, autocxx::c_uint(i));
+                let name = if !name_ptr.is_null() {
+                    let c_str = CStr::from_ptr(name_ptr);
+                    let s = c_str.to_string_lossy().to_string();
+                    ffi::FreeString(name_ptr);
+                    s
+                } else {
+                    format!("{}", i)
+                };
+
+                let is_dir =
+                    ffi::IsArchiveItemFolder(archive, autocxx::c_uint(i)) != autocxx::c_int(0);
+                let size = ffi::GetArchiveItemSize(archive, autocxx::c_uint(i)).0;
+
+                entries.push(ArchiveEntry {
+                    name,
+                    size,
+                    is_dir,
+                    index: i,
+                });
+            }
+            Ok(entries)
+        })
+        .await?
     }
 
-    pub async fn get_entry_index(&self, name: &str) -> Result<Option<u32>, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn get_entry_index(
+        &self,
+        name: &str,
+    ) -> Result<Option<u32>, Box<dyn std::error::Error + Send + Sync>> {
         let archive = self.archive;
         let archive_addr = archive as usize;
         let name_c = std::ffi::CString::new(name)?;
 
         task::spawn_blocking(move || unsafe {
-             let archive = archive_addr as *mut ffi::SevenZArchive;
-             let idx = ffi::GetArchiveItemIndex(archive, name_c.as_ptr());
-             let idx_val = idx.0; 
-             if idx_val >= 0 {
-                 Ok(Some(idx_val as u32))
-             } else {
-                 Ok(None)
-             }
-        }).await?
+            let archive = archive_addr as *mut ffi::SevenZArchive;
+            let idx = ffi::GetArchiveItemIndex(archive, name_c.as_ptr());
+            let idx_val = idx.0;
+            if idx_val >= 0 {
+                Ok(Some(idx_val as u32))
+            } else {
+                Ok(None)
+            }
+        })
+        .await?
     }
 
     /// Get the uncompressed size of an entry by its index
-    pub async fn get_entry_size(&self, index: u32) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn get_entry_size(
+        &self,
+        index: u32,
+    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         let archive = self.archive;
         let archive_addr = archive as usize;
 
         task::spawn_blocking(move || unsafe {
-             let archive = archive_addr as *mut ffi::SevenZArchive;
-             let size = ffi::GetArchiveItemSize(archive, autocxx::c_uint(index));
-             Ok(size.0)
-        }).await?
+            let archive = archive_addr as *mut ffi::SevenZArchive;
+            let size = ffi::GetArchiveItemSize(archive, autocxx::c_uint(index));
+            Ok(size.0)
+        })
+        .await?
     }
 }
-
 
 // Structs must be outside impl blocks
 struct RustWriterContext {
@@ -196,13 +207,18 @@ pub unsafe extern "C" fn rust_write_cb(
 }
 
 impl SevenZ {
-    pub async fn extract<W>(&self, index: u32, writer: W) -> Result<(), Box<dyn std::error::Error + Send + Sync>> 
-    where W: std::io::Write + Send + 'static
+    pub async fn extract<W>(
+        &self,
+        index: u32,
+        writer: W,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    where
+        W: std::io::Write + Send + 'static,
     {
         let archive = self.archive;
         // Since archive is *mut, we cast to usize to pass to blocking task
         let archive_addr = archive as usize;
-        
+
         task::spawn_blocking(move || unsafe {
             let mut context = RustWriterContext {
                 writer: Box::new(writer),
@@ -210,17 +226,18 @@ impl SevenZ {
             let callback_ctx = &mut context as *mut RustWriterContext as *mut autocxx::c_void;
 
             let res = ffi::ExtractEntry(
-                archive_addr as *mut ffi::SevenZArchive, 
-                autocxx::c_uint(index), 
-                callback_ctx
+                archive_addr as *mut ffi::SevenZArchive,
+                autocxx::c_uint(index),
+                callback_ctx,
             );
-            
+
             if res != autocxx::c_int(0) {
-                 Err(format!("Extraction failed with code {:?}", res).into())
+                Err(format!("Extraction failed with code {:?}", res).into())
             } else {
-                 Ok(())
+                Ok(())
             }
-        }).await?
+        })
+        .await?
     }
 }
 

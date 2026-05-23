@@ -320,6 +320,8 @@ mod ffi {
         // Session lifecycle
         // ------------------------------------------------------------------------
         fn create_session(settings: &SessionSettings) -> Result<UniquePtr<Session>>;
+        /// Create session with normal filesystem-backed storage.
+        fn create_session_disk_backed(settings: &SessionSettings) -> Result<UniquePtr<Session>>;
         /// Create session with memory-only storage (no disk writes when cache_size=0)
         fn create_session_memory_only(settings: &SessionSettings) -> Result<UniquePtr<Session>>;
         fn session_abort(session: Pin<&mut Session>);
@@ -519,6 +521,12 @@ impl LibtorrentSession {
     /// Use this when cache_size = 0 to avoid any disk I/O
     pub fn new_memory_only(settings: SessionSettings) -> Result<Self, cxx::Exception> {
         let inner = ffi::create_session_memory_only(&settings)?;
+        Ok(Self { inner })
+    }
+
+    /// Create a new session with normal filesystem-backed storage.
+    pub fn new_disk_backed(settings: SessionSettings) -> Result<Self, cxx::Exception> {
+        let inner = ffi::create_session_disk_backed(&settings)?;
         Ok(Self { inner })
     }
 

@@ -11,11 +11,13 @@ use crate::backend::{
     metadata::MetadataInspector,
     priorities::{
         MAX_STARTUP_PIECES, MemoryPressure, PlaybackIntent, PlaybackPriorityPolicy,
-        PriorityContext, container_metadata_start,
+        PriorityContext, container_metadata_start, disk_backed_sequential_download,
     },
 };
 use libtorrent_sys::LibtorrentSession;
 
+use super::LibtorrentStorageMode;
+use super::disk_stream::LibtorrentDiskFileStream;
 use super::helpers::{default_stats, make_engine_stats};
 use super::stream::LibtorrentFileStream;
 
@@ -26,6 +28,7 @@ pub struct LibtorrentTorrentHandle {
     pub(crate) info_hash: String,
     pub(crate) save_path: PathBuf,
     pub(crate) config: crate::backend::BackendConfig,
+    pub(crate) storage_mode: LibtorrentStorageMode,
     pub(crate) stream_counter: Arc<std::sync::atomic::AtomicUsize>,
     /// In-memory piece cache for fast streaming
     pub(crate) piece_cache: Arc<crate::piece_cache::PieceCacheManager>,
@@ -34,11 +37,45 @@ pub struct LibtorrentTorrentHandle {
     /// Torrent/file metadata inspections already scheduled for this backend lifetime
     pub(crate) metadata_inspections:
         Arc<tokio::sync::Mutex<std::collections::HashSet<(String, usize)>>>,
+    /// Torrents whose file priorities have been initialized once metadata is known.
+    pub(crate) file_priority_initializations:
+        Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 impl LibtorrentTorrentHandle {
     fn label_memory_storage(&self) {
-        libtorrent_sys::memory_label_last_unlabeled_storage(&self.info_hash);
+        if matches!(self.storage_mode, LibtorrentStorageMode::MemoryOnly) {
+            libtorrent_sys::memory_label_last_unlabeled_storage(&self.info_hash);
+        }
+    }
+
+    async fn initialize_file_priorities_if_needed(
+        &self,
+        handle: &mut libtorrent_sys::LibtorrentHandle,
+    ) {
+        let should_initialize = {
+            let mut initialized = self.file_priority_initializations.lock().await;
+            initialized.insert(self.info_hash.clone())
+        };
+        if !should_initialize {
+            return;
+        }
+
+        let files = handle.files();
+        for (idx, file) in files.iter().enumerate() {
+            handle.set_file_priority(idx as i32, 0);
+            tracing::debug!(
+                info_hash = %self.info_hash,
+                file_idx = idx,
+                file_path = %file.path,
+                "file priority initialized to skip"
+            );
+        }
+        tracing::info!(
+            info_hash = %self.info_hash,
+            file_count = files.len(),
+            "torrent file priorities initialized after metadata"
+        );
     }
 }
 
@@ -181,26 +218,15 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
             handle.force_dht_announce();
         }
         if priority != 255 {
-            // Set file priorities for real playback. Internal readers must not
-            // change file selection while a direct stream is active.
-            let all_files = handle.files();
-            for (idx, f) in all_files.iter().enumerate() {
-                if idx == file_idx {
-                    tracing::debug!(
-                        "get_file_reader: Setting PRIORITY 7 (HIGHEST) for file idx={} name={}",
-                        idx,
-                        f.path
-                    );
-                    handle.set_file_priority(idx as i32, 7);
-                } else {
-                    tracing::debug!(
-                        "get_file_reader: Setting PRIORITY 0 (SKIP) for file idx={} name={}",
-                        idx,
-                        f.path
-                    );
-                    handle.set_file_priority(idx as i32, 0);
-                }
-            }
+            // Real playback/download readers should make their file wanted, but
+            // must not clear other wanted files. Several HTTP requests or
+            // torrents can be active at the same time.
+            tracing::debug!(
+                "get_file_reader: Setting PRIORITY 7 (HIGHEST) for file idx={} name={}",
+                file_idx,
+                file_info.path
+            );
+            handle.set_file_priority(file_idx as i32, 7);
         }
 
         let actual_start_piece: i32;
@@ -246,10 +272,14 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
 
         let playback_intent = if priority == 255 {
             PlaybackIntent::InternalProbe
-        } else if matches!(seek_type, SeekType::ContainerMetadata) {
-            PlaybackIntent::ContainerMetadata
         } else {
             match intent {
+                PlaybackIntent::DownloadFull | PlaybackIntent::DownloadRange => intent,
+                PlaybackIntent::Background => PlaybackIntent::Background,
+                PlaybackIntent::InternalProbe => PlaybackIntent::InternalProbe,
+                _ if matches!(seek_type, SeekType::ContainerMetadata) => {
+                    PlaybackIntent::ContainerMetadata
+                }
                 PlaybackIntent::HlsInitial
                 | PlaybackIntent::HlsSequential
                 | PlaybackIntent::HlsSeek => {
@@ -259,8 +289,6 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
                         PlaybackIntent::HlsSeek
                     }
                 }
-                PlaybackIntent::Background => PlaybackIntent::Background,
-                PlaybackIntent::InternalProbe => PlaybackIntent::InternalProbe,
                 _ => {
                     if start_offset == 0 {
                         PlaybackIntent::DirectInitial
@@ -272,18 +300,13 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
         };
 
         if priority != 255 {
-            let sequential_download = matches!(
-                playback_intent,
-                PlaybackIntent::DirectInitial
-                    | PlaybackIntent::DirectSequential
-                    | PlaybackIntent::HlsInitial
-                    | PlaybackIntent::HlsSequential
-            ) && start_offset == 0;
+            let sequential_download = disk_backed_sequential_download(playback_intent);
             handle.set_sequential_download(sequential_download);
             tracing::info!(
                 intent = ?playback_intent,
                 start_offset,
                 sequential_download,
+                storage_mode = ?self.storage_mode,
                 "streaming sequential mode configured"
             );
         }
@@ -292,15 +315,18 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
             // Calculate actual start piece
             actual_start_piece = ((global_file_offset + start_offset) / piece_length) as i32;
 
-            if matches!(
-                playback_intent,
-                PlaybackIntent::DirectInitial
-                    | PlaybackIntent::DirectSeek
-                    | PlaybackIntent::DirectSequential
-                    | PlaybackIntent::HlsInitial
-                    | PlaybackIntent::HlsSeek
-                    | PlaybackIntent::HlsSequential
-            ) {
+            if matches!(playback_intent, PlaybackIntent::DownloadFull)
+                || (matches!(self.storage_mode, LibtorrentStorageMode::MemoryOnly)
+                    && matches!(
+                        playback_intent,
+                        PlaybackIntent::DirectInitial
+                            | PlaybackIntent::DirectSeek
+                            | PlaybackIntent::DirectSequential
+                            | PlaybackIntent::HlsInitial
+                            | PlaybackIntent::HlsSeek
+                            | PlaybackIntent::HlsSequential
+                    ))
+            {
                 handle.clear_piece_deadlines();
                 tracing::info!(
                     intent = ?playback_intent,
@@ -368,17 +394,36 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
                 }
             }
 
+            if matches!(self.storage_mode, LibtorrentStorageMode::DiskBacked) {
+                tracing::info!(
+                    info_hash = %self.info_hash,
+                    file_idx,
+                    intent = ?playback_intent,
+                    current_piece = actual_start_piece,
+                    sequential_download = disk_backed_sequential_download(playback_intent),
+                    hot_window = decision.hot_window_pieces,
+                    warm_window = decision.warm_window_pieces,
+                    immediate_pieces = decision.immediate_pieces,
+                    reason = %decision.reason,
+                    "disk-backed priority configured"
+                );
+            }
+
             // PRE-REQUEST first piece via read_piece API if already downloaded
             // If the piece is already downloaded, read_piece() will load it from
             // memory storage into the cache. If NOT downloaded, skip - the
             // piece_finished_alert handler will call read_piece() when it's ready.
-            if handle.have_piece(actual_start_piece) {
+            if matches!(self.storage_mode, LibtorrentStorageMode::MemoryOnly)
+                && handle.have_piece(actual_start_piece)
+            {
                 let _ = handle.read_piece(actual_start_piece);
             }
 
             // For initial playback, tail metadata should only start after the head window
             // is already in flight so the first frame is not delayed by end-of-file work.
-            if matches!(seek_type, SeekType::InitialPlayback) {
+            if matches!(self.storage_mode, LibtorrentStorageMode::MemoryOnly)
+                && matches!(seek_type, SeekType::InitialPlayback)
+            {
                 if last_piece > actual_start_piece + applied_window_size {
                     tracing::debug!(
                         "get_file_reader: Deferring tail metadata deadlines until after startup"
@@ -420,11 +465,29 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
             );
         }
 
-        // Memory-only mode: no disk files to open or mmap
-
         let stream_id = self
             .stream_counter
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+        if matches!(self.storage_mode, LibtorrentStorageMode::DiskBacked) {
+            return Ok(Box::new(LibtorrentDiskFileStream::new(
+                handle.clone(),
+                self.info_hash.clone(),
+                self.save_path.join(&file_info.path),
+                file_info.path.clone(),
+                first_piece,
+                last_piece,
+                piece_length,
+                global_file_offset,
+                file_size,
+                file_idx,
+                stream_id,
+                playback_intent,
+                self.piece_waiter.clone(),
+            )));
+        }
+
+        // Memory-only mode: no disk files to open or mmap
 
         // Map local SeekType to stream's SeekType for deterministic handling
         let initial_seek_type = match seek_type {
@@ -476,9 +539,10 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
         // First check if metadata is already available (fast path)
         {
             let session = self.session.read().await;
-            if let Ok(handle) = session.find_torrent(&self.info_hash) {
+            if let Ok(mut handle) = session.find_torrent(&self.info_hash) {
                 self.label_memory_storage();
                 if handle.status().has_metadata {
+                    self.initialize_file_priorities_if_needed(&mut handle).await;
                     tracing::debug!("get_files: metadata already available (fast path)");
                     return handle
                         .files()
@@ -507,9 +571,10 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
             poll_interval_ms = (poll_interval_ms * 2).min(100);
 
             let session = self.session.read().await;
-            if let Ok(handle) = session.find_torrent(&self.info_hash) {
+            if let Ok(mut handle) = session.find_torrent(&self.info_hash) {
                 self.label_memory_storage();
                 if handle.status().has_metadata {
+                    self.initialize_file_priorities_if_needed(&mut handle).await;
                     tracing::info!(
                         "get_files: Metadata acquired in {:?}",
                         metadata_start.elapsed()
@@ -622,14 +687,10 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
             // range can starve the active playback piece. File switches and
             // delayed cleanup still clear deadlines explicitly.
 
-            // Set file priorities: target file = 1, all others = 0 (skip)
-            for (idx, _) in files.iter().enumerate() {
-                if idx == file_idx {
-                    handle.set_file_priority(idx as i32, 7); // Highest file priority; piece deadlines drive ordering.
-                } else {
-                    handle.set_file_priority(idx as i32, 0);
-                }
-            }
+            // Make the target file wanted without clearing other active files.
+            // Files are initialized as skipped when metadata arrives and are
+            // cleared by delayed cleanup after their own streams end.
+            handle.set_file_priority(file_idx as i32, 7);
 
             // REMOVED: First-8-pieces prioritization was causing seeks to fail
             // because it set highest priority on pieces 0-7 even when seeking to piece 118.
@@ -843,12 +904,10 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
             .find_torrent(&self.info_hash)
             .map_err(|e| anyhow!("Torrent not found: {}", e))?;
 
-        // Set file priority to 0 (skip) - no more pieces will be downloaded for this file
+        // Set file priority to 0 (skip) - no more pieces will be downloaded for this file.
+        // Do not clear global piece deadlines or sequential mode here because
+        // another file in the same torrent may still have an active stream.
         handle.set_file_priority(file_idx as i32, 0);
-        handle.set_sequential_download(false);
-
-        // Clear all piece deadlines to stop prioritizing this file's pieces
-        handle.clear_piece_deadlines();
 
         tracing::info!(
             "clear_file_streaming: Cleared streaming state for file {} in {}",
@@ -981,15 +1040,6 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
 
             let mut ready_pieces = 0u32;
             for ready_piece in piece..=last_piece.min(piece + target_pieces as i32 - 1) {
-                if self
-                    .piece_cache
-                    .has_piece(&self.info_hash, ready_piece)
-                    .await
-                {
-                    ready_pieces += 1;
-                    continue;
-                }
-
                 let have_piece = {
                     let session = self.session.read().await;
                     let handle = session
@@ -999,22 +1049,39 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
                     handle.have_piece(ready_piece)
                 };
 
-                if !have_piece {
+                if matches!(self.storage_mode, LibtorrentStorageMode::DiskBacked) {
+                    if have_piece {
+                        ready_pieces += 1;
+                        continue;
+                    }
                     break;
                 }
 
-                let piece_data =
-                    libtorrent_sys::memory_read_piece_direct(&self.info_hash, ready_piece);
-                if piece_data.is_empty() {
-                    break;
+                if self
+                    .piece_cache
+                    .has_piece(&self.info_hash, ready_piece)
+                    .await
+                {
+                    ready_pieces += 1;
+                    continue;
                 }
 
-                self.piece_cache
-                    .put_piece(&self.info_hash, ready_piece, piece_data)
-                    .await;
-                self.piece_waiter
-                    .notify_piece_finished(&self.info_hash, ready_piece);
-                ready_pieces += 1;
+                if have_piece {
+                    let piece_data =
+                        libtorrent_sys::memory_read_piece_direct(&self.info_hash, ready_piece);
+                    if piece_data.is_empty() {
+                        break;
+                    }
+
+                    self.piece_cache
+                        .put_piece(&self.info_hash, ready_piece, piece_data)
+                        .await;
+                    self.piece_waiter
+                        .notify_piece_finished(&self.info_hash, ready_piece);
+                    ready_pieces += 1;
+                } else {
+                    break;
+                }
             }
             best_ready_pieces = best_ready_pieces.max(ready_pieces);
 
@@ -1090,9 +1157,21 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
                         } else {
                             0
                         };
+                        let verified_piece_count = (first_piece..=last_piece)
+                            .filter(|p| handle.have_piece(*p))
+                            .count();
+                        let verified_bytes_estimate = (verified_piece_count as u64)
+                            .saturating_mul(piece_length)
+                            .min(file_size);
+                        let request_offset_percent = if file_size > 0 {
+                            (offset.min(file_size) as f64 / file_size as f64) * 100.0
+                        } else {
+                            0.0
+                        };
 
                         tracing::info!(
                             intent = ?intent,
+                            storage_mode = ?self.storage_mode,
                             piece,
                             elapsed_ms = start.elapsed().as_millis() as u64,
                             peers = status.num_peers,
@@ -1103,6 +1182,9 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
                             target_availability,
                             immediate_pieces = decision.immediate_pieces,
                             ready_immediate,
+                            verified_piece_count,
+                            verified_bytes_estimate,
+                            request_offset_percent,
                             native_storage_bytes = native_memory.total_bytes,
                             native_storage_pieces = native_memory.total_pieces,
                             reason = %decision.reason,

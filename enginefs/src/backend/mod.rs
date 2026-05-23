@@ -208,15 +208,37 @@ pub struct TorrentSpeedProfile {
     pub bt_request_timeout: u64,
 }
 
+pub const DEFAULT_BT_MAX_CONNECTIONS: u64 = 800;
+pub const LEGACY_UNLIMITED_BT_MAX_CONNECTIONS: u64 = 65535;
+pub const MAX_EFFECTIVE_BT_CONNECTIONS: u64 = 1200;
+pub const MIN_EFFECTIVE_BT_CONNECTIONS: u64 = 80;
+
+impl TorrentSpeedProfile {
+    pub fn effective_connection_limits(&self) -> (i32, i32, bool) {
+        let requested = self.bt_max_connections;
+        let normalized = if requested == 0 || requested >= LEGACY_UNLIMITED_BT_MAX_CONNECTIONS {
+            DEFAULT_BT_MAX_CONNECTIONS
+        } else {
+            requested.clamp(MIN_EFFECTIVE_BT_CONNECTIONS, MAX_EFFECTIVE_BT_CONNECTIONS)
+        };
+
+        let per_torrent = (normalized / 4).clamp(40, 200).min(normalized).max(1);
+
+        (
+            normalized as i32,
+            per_torrent as i32,
+            normalized != requested,
+        )
+    }
+}
+
 impl Default for TorrentSpeedProfile {
     fn default() -> Self {
-        // "MAXIMUM PERFORMANCE" - Remove arbitrary limits
         Self {
             bt_download_speed_hard_limit: 0.0, // 0 = unlimited
             bt_download_speed_soft_limit: 0.0, // 0 = unlimited
             bt_handshake_timeout: 20000,       // 20s - faster failure for dead peers
-            // 65535 is a safe high number for "unlimited" without overflowing i32 when cast or causing OS issues.
-            bt_max_connections: 65535,
+            bt_max_connections: DEFAULT_BT_MAX_CONNECTIONS,
             bt_min_peers_for_stable: 5, // Lower barrier to entry
             bt_request_timeout: 10000,  // 10s
         }

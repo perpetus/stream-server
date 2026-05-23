@@ -1,11 +1,11 @@
 use autocxx::prelude::*;
-use tokio::sync::mpsc;
-use std::sync::mpsc as std_mpsc;
 use std::ffi::c_void;
+use std::sync::mpsc as std_mpsc;
+use tokio::sync::mpsc;
 
 include_cpp! {
     #include "cpp/wrappers_api.h"
-    
+
     // Safety policy
     safety!(unsafe)
 
@@ -80,7 +80,11 @@ pub unsafe extern "C" fn rust_seek_cb(
     let ctx = unsafe { &*(ctx as *mut RustReaderContext) };
     let (resp_tx, resp_rx) = std_mpsc::channel();
 
-    if ctx.tx.send((ReaderRequest::Seek(offset, origin), resp_tx)).is_err() {
+    if ctx
+        .tx
+        .send((ReaderRequest::Seek(offset, origin), resp_tx))
+        .is_err()
+    {
         return -1;
     }
 

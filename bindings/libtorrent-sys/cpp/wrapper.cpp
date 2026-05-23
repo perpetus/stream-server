@@ -228,6 +228,11 @@ std::unique_ptr<Session> create_session(SessionSettings const &settings) {
 }
 
 std::unique_ptr<Session>
+create_session_disk_backed(SessionSettings const &settings) {
+  return create_session(settings);
+}
+
+std::unique_ptr<Session>
 create_session_memory_only(SessionSettings const &settings) {
   lt::settings_pack pack;
 
