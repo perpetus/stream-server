@@ -11,7 +11,7 @@ use crate::backend::{
     metadata::MetadataInspector,
     priorities::{
         MAX_STARTUP_PIECES, MemoryPressure, PlaybackIntent, PlaybackPriorityPolicy,
-        PriorityContext, container_metadata_start, disk_backed_sequential_download,
+        PriorityContext, disk_backed_sequential_download,
     },
 };
 use libtorrent_sys::LibtorrentSession;
@@ -259,14 +259,10 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
         let seek_type = {
             if start_offset == 0 {
                 SeekType::InitialPlayback
+            } else if matches!(intent, PlaybackIntent::ContainerMetadata) {
+                SeekType::ContainerMetadata
             } else {
-                // Near end of file = container metadata (last 10MB or last 5%)
-                let end_threshold = container_metadata_start(file_size);
-                if start_offset >= end_threshold {
-                    SeekType::ContainerMetadata
-                } else {
-                    SeekType::UserScrub
-                }
+                SeekType::UserScrub
             }
         };
 
@@ -275,11 +271,9 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
         } else {
             match intent {
                 PlaybackIntent::DownloadFull | PlaybackIntent::DownloadRange => intent,
+                PlaybackIntent::ContainerMetadata => PlaybackIntent::ContainerMetadata,
                 PlaybackIntent::Background => PlaybackIntent::Background,
                 PlaybackIntent::InternalProbe => PlaybackIntent::InternalProbe,
-                _ if matches!(seek_type, SeekType::ContainerMetadata) => {
-                    PlaybackIntent::ContainerMetadata
-                }
                 PlaybackIntent::HlsInitial
                 | PlaybackIntent::HlsSequential
                 | PlaybackIntent::HlsSeek => {

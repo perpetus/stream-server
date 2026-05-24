@@ -2,9 +2,16 @@ use serde::{Deserialize, Serialize};
 
 /// Minimum bytes needed before playback can start.
 pub const MIN_STARTUP_BYTES: u64 = 16 * 1024 * 1024; // 16MB
+pub const MAX_STARTUP_WINDOW_BYTES: u64 = 32 * 1024 * 1024;
+pub const MAX_SEEK_HOT_WINDOW_BYTES: u64 = 128 * 1024 * 1024;
+pub const MAX_WARM_WINDOW_BYTES: u64 = 256 * 1024 * 1024;
+pub const MAX_CONTAINER_METADATA_WINDOW_BYTES: u64 = 16 * 1024 * 1024;
+pub const MAX_DOWNLOAD_RANGE_WINDOW_BYTES: u64 = 32 * 1024 * 1024;
+pub const SMALL_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Maximum pieces to prioritize before first byte is delivered.
 pub const MAX_STARTUP_PIECES: i32 = 4;
+pub const MAX_SMALL_FILE_STARTUP_PIECES: i32 = 32;
 
 /// Minimum pieces to prioritize before first byte is delivered.
 pub const MIN_STARTUP_PIECES: i32 = 2;
@@ -20,9 +27,23 @@ pub const BLOCKED_REPLAN_INTERVAL_MS: u64 = 250;
 /// Start treating reads as "container metadata" when they fall in the last 10MB
 /// or the last 5% of the file, whichever starts earlier.
 pub fn container_metadata_start(file_size: u64) -> u64 {
-    file_size
-        .saturating_sub(10 * 1024 * 1024)
-        .min(file_size.saturating_mul(95) / 100)
+    if file_size == 0 {
+        0
+    } else if file_size < SMALL_FILE_BYTES {
+        file_size.saturating_mul(95) / 100
+    } else {
+        file_size
+            .saturating_sub(10 * 1024 * 1024)
+            .min(file_size.saturating_mul(95) / 100)
+    }
+}
+
+pub fn is_container_metadata_request(start: u64, requested_len: u64, file_size: u64) -> bool {
+    start > 0
+        && file_size > 0
+        && requested_len > 0
+        && requested_len <= MAX_CONTAINER_METADATA_WINDOW_BYTES
+        && start >= container_metadata_start(file_size)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,15 +95,33 @@ pub fn disk_backed_sequential_download(intent: PlaybackIntent) -> bool {
 
 pub fn disk_backed_forward_window_pieces(intent: PlaybackIntent) -> i32 {
     match intent {
-        PlaybackIntent::DownloadFull => 15,
-        PlaybackIntent::DownloadRange => 3,
+        PlaybackIntent::DownloadFull => 63,
+        PlaybackIntent::DownloadRange => 7,
         PlaybackIntent::DirectInitial | PlaybackIntent::HlsInitial => MAX_STARTUP_PIECES - 1,
-        PlaybackIntent::DirectSeek | PlaybackIntent::HlsSeek => 7,
-        PlaybackIntent::DirectSequential | PlaybackIntent::HlsSequential => 7,
+        PlaybackIntent::DirectSeek | PlaybackIntent::DirectSequential => 31,
+        PlaybackIntent::HlsSeek | PlaybackIntent::HlsSequential => 15,
         PlaybackIntent::ContainerMetadata => 1,
         PlaybackIntent::InternalProbe => 1,
         PlaybackIntent::Background => 0,
     }
+}
+
+pub fn disk_backed_forward_window_pieces_for(intent: PlaybackIntent, piece_length: u64) -> i32 {
+    let pieces = disk_backed_forward_window_pieces(intent);
+    let byte_cap = match intent {
+        PlaybackIntent::DownloadFull => MAX_WARM_WINDOW_BYTES,
+        PlaybackIntent::DownloadRange => MAX_DOWNLOAD_RANGE_WINDOW_BYTES,
+        PlaybackIntent::DirectInitial | PlaybackIntent::HlsInitial => MAX_STARTUP_WINDOW_BYTES,
+        PlaybackIntent::DirectSeek
+        | PlaybackIntent::HlsSeek
+        | PlaybackIntent::DirectSequential
+        | PlaybackIntent::HlsSequential => MAX_SEEK_HOT_WINDOW_BYTES,
+        PlaybackIntent::ContainerMetadata | PlaybackIntent::InternalProbe => {
+            MAX_CONTAINER_METADATA_WINDOW_BYTES
+        }
+        PlaybackIntent::Background => MAX_CONTAINER_METADATA_WINDOW_BYTES,
+    };
+    cap_pieces_by_bytes(pieces, piece_length, byte_cap)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -199,15 +238,29 @@ impl PlaybackPriorityPolicy {
 
         let (mut immediate, mut hot, mut warm) = match ctx.intent {
             PlaybackIntent::DirectInitial | PlaybackIntent::HlsInitial if !ctx.first_byte_sent => {
-                let target_bytes = ctx
-                    .bitrate_bytes_per_sec
-                    .map(|bitrate| bitrate.saturating_mul(10))
-                    .unwrap_or(MIN_STARTUP_BYTES)
-                    .max(MIN_STARTUP_BYTES)
-                    .max(ctx.piece_length);
+                let target_bytes = match ctx.bitrate_bytes_per_sec {
+                    Some(bitrate) => bitrate.saturating_mul(10).max(MIN_STARTUP_BYTES),
+                    None if ctx.file_size > 0 && ctx.file_size <= SMALL_FILE_BYTES => {
+                        ctx.file_size.min(MAX_STARTUP_WINDOW_BYTES)
+                    }
+                    None => MIN_STARTUP_BYTES,
+                }
+                .max(ctx.piece_length)
+                .min(MAX_STARTUP_WINDOW_BYTES.max(ctx.piece_length));
                 let pieces = target_bytes.saturating_add(ctx.piece_length.saturating_sub(1))
                     / ctx.piece_length;
-                let pieces = (pieces as i32).clamp(MIN_STARTUP_PIECES, MAX_STARTUP_PIECES);
+                let max_startup_pieces =
+                    if ctx.bitrate_bytes_per_sec.is_none() && ctx.file_size <= SMALL_FILE_BYTES {
+                        pieces_for_bytes(
+                            ctx.file_size.min(MAX_STARTUP_WINDOW_BYTES),
+                            ctx.piece_length,
+                        )
+                        .clamp(1, MAX_SMALL_FILE_STARTUP_PIECES)
+                    } else {
+                        MAX_STARTUP_PIECES
+                    };
+                let min_startup_pieces = MIN_STARTUP_PIECES.min(max_startup_pieces).max(1);
+                let pieces = (pieces as i32).clamp(min_startup_pieces, max_startup_pieces);
                 (pieces, pieces, 0)
             }
             PlaybackIntent::DirectInitial
@@ -259,6 +312,14 @@ impl PlaybackPriorityPolicy {
             warm = 0;
         }
 
+        let original_hot = hot;
+        let original_warm = warm;
+        hot = cap_pieces_by_bytes(hot, ctx.piece_length, hot_byte_cap(ctx.intent));
+        warm = cap_pieces_by_bytes(warm, ctx.piece_length, warm_byte_cap(ctx.intent));
+        if hot < original_hot || warm < original_warm {
+            reason.push_str("-byte-cap");
+        }
+
         hot = hot
             .clamp(0, MAX_HOT_PIECES)
             .min(max_cache_pieces)
@@ -294,6 +355,58 @@ impl PlaybackPriorityPolicy {
             warm_window_pieces: warm,
             reason,
         }
+    }
+}
+
+fn pieces_for_bytes(bytes: u64, piece_length: u64) -> i32 {
+    if bytes == 0 || piece_length == 0 {
+        return 0;
+    }
+
+    let pieces = bytes.saturating_add(piece_length.saturating_sub(1)) / piece_length;
+    pieces.clamp(1, i32::MAX as u64) as i32
+}
+
+fn cap_pieces_by_bytes(pieces: i32, piece_length: u64, max_bytes: u64) -> i32 {
+    if pieces <= 0 {
+        return 0;
+    }
+    if max_bytes == 0 {
+        return 0;
+    }
+
+    pieces.min(pieces_for_bytes(max_bytes, piece_length).max(1))
+}
+
+fn hot_byte_cap(intent: PlaybackIntent) -> u64 {
+    match intent {
+        PlaybackIntent::DirectInitial | PlaybackIntent::HlsInitial => MAX_STARTUP_WINDOW_BYTES,
+        PlaybackIntent::DirectSeek
+        | PlaybackIntent::HlsSeek
+        | PlaybackIntent::DirectSequential
+        | PlaybackIntent::HlsSequential => MAX_SEEK_HOT_WINDOW_BYTES,
+        PlaybackIntent::DownloadFull => MAX_WARM_WINDOW_BYTES,
+        PlaybackIntent::DownloadRange => MAX_DOWNLOAD_RANGE_WINDOW_BYTES,
+        PlaybackIntent::ContainerMetadata | PlaybackIntent::InternalProbe => {
+            MAX_CONTAINER_METADATA_WINDOW_BYTES
+        }
+        PlaybackIntent::Background => MAX_CONTAINER_METADATA_WINDOW_BYTES,
+    }
+}
+
+fn warm_byte_cap(intent: PlaybackIntent) -> u64 {
+    match intent {
+        PlaybackIntent::DirectInitial
+        | PlaybackIntent::DirectSeek
+        | PlaybackIntent::DirectSequential
+        | PlaybackIntent::HlsInitial
+        | PlaybackIntent::HlsSeek
+        | PlaybackIntent::HlsSequential
+        | PlaybackIntent::DownloadFull => MAX_WARM_WINDOW_BYTES,
+        PlaybackIntent::DownloadRange
+        | PlaybackIntent::ContainerMetadata
+        | PlaybackIntent::InternalProbe
+        | PlaybackIntent::Background => 0,
     }
 }
 
@@ -539,11 +652,86 @@ mod tests {
     }
 
     #[test]
+    fn small_file_metadata_starts_at_final_five_percent() {
+        let file_size = 8 * 1024 * 1024;
+        assert_eq!(container_metadata_start(file_size), file_size * 95 / 100);
+        assert!(!is_container_metadata_request(1024 * 1024, 1024, file_size));
+        assert!(is_container_metadata_request(
+            container_metadata_start(file_size),
+            1024,
+            file_size
+        ));
+    }
+
+    #[test]
+    fn large_near_end_playback_range_is_not_metadata_when_range_is_large() {
+        let file_size = 10 * 1024 * 1024 * 1024;
+        let start = container_metadata_start(file_size);
+
+        assert!(is_container_metadata_request(
+            start,
+            MAX_CONTAINER_METADATA_WINDOW_BYTES,
+            file_size
+        ));
+        assert!(!is_container_metadata_request(
+            start,
+            MAX_CONTAINER_METADATA_WINDOW_BYTES + 1,
+            file_size
+        ));
+    }
+
+    #[test]
     fn download_range_priority_is_bounded() {
         let decision = PlaybackPriorityPolicy::decide(base_context(PlaybackIntent::DownloadRange));
 
         assert_eq!(decision.hot_window_pieces, 4);
         assert_eq!(decision.warm_window_pieces, 0);
         assert_eq!(decision.assignments[0].piece_priority, 7);
+    }
+
+    #[test]
+    fn seek_window_is_capped_by_bytes_for_large_pieces() {
+        let mut ctx = base_context(PlaybackIntent::DirectSeek);
+        ctx.piece_length = 16 * 1024 * 1024;
+        ctx.download_rate_bytes_per_sec = 12 * 1024 * 1024;
+        let expected_hot = (MAX_SEEK_HOT_WINDOW_BYTES / ctx.piece_length) as i32;
+        let decision = PlaybackPriorityPolicy::decide(ctx);
+
+        assert_eq!(decision.hot_window_pieces, expected_hot);
+        assert!(decision.reason.contains("byte-cap"));
+    }
+
+    #[test]
+    fn startup_window_is_capped_by_bytes_for_huge_pieces() {
+        let mut ctx = base_context(PlaybackIntent::DirectInitial);
+        ctx.current_piece = 0;
+        ctx.first_byte_sent = false;
+        ctx.piece_length = 64 * 1024 * 1024;
+        let decision = PlaybackPriorityPolicy::decide(ctx);
+
+        assert_eq!(decision.hot_window_pieces, 1);
+        assert!(decision.target_window_pieces <= 1);
+    }
+
+    #[test]
+    fn small_file_startup_can_prioritize_more_than_default_four_pieces() {
+        let mut ctx = base_context(PlaybackIntent::DirectInitial);
+        ctx.current_piece = 0;
+        ctx.first_byte_sent = false;
+        ctx.file_size = 8 * 1024 * 1024;
+        ctx.last_piece = 7;
+        ctx.piece_length = 1024 * 1024;
+        let decision = PlaybackPriorityPolicy::decide(ctx);
+
+        assert_eq!(decision.hot_window_pieces, 8);
+        assert_eq!(decision.warm_window_pieces, 0);
+    }
+
+    #[test]
+    fn disk_backed_forward_window_respects_piece_size_byte_cap() {
+        assert_eq!(
+            disk_backed_forward_window_pieces_for(PlaybackIntent::DownloadRange, 64 * 1024 * 1024),
+            1
+        );
     }
 }

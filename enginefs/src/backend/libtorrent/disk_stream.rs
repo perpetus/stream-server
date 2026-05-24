@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::backend::priorities::{
-    PlaybackIntent, disk_backed_forward_window_pieces, disk_backed_sequential_download,
+    PlaybackIntent, disk_backed_forward_window_pieces_for, disk_backed_sequential_download,
 };
 use crate::piece_waiter::PieceWaiterRegistry;
 
@@ -117,18 +117,31 @@ impl LibtorrentDiskFileStream {
         }
         self.last_prioritized_piece = piece;
 
-        let sequential_download = disk_backed_sequential_download(self.playback_intent);
+        let priority_intent = if self.first_read_logged {
+            self.playback_intent.sequential_after_first_byte()
+        } else {
+            self.playback_intent
+        };
+        let sequential_download = disk_backed_sequential_download(priority_intent);
         self.handle.set_sequential_download(sequential_download);
-        let forward_window = disk_backed_forward_window_pieces(self.playback_intent);
-        let priority = if matches!(self.playback_intent, PlaybackIntent::Background) {
+        let forward_window =
+            disk_backed_forward_window_pieces_for(priority_intent, self.piece_length);
+        let priority = if matches!(priority_intent, PlaybackIntent::Background) {
             1
         } else {
             7
         };
+        let deadline_jitter = (self.stream_id % 10) as i32 * 5;
         for p in piece..=self.last_piece.min(piece + forward_window) {
             if !self.handle.have_piece(p) {
+                let distance = p - piece;
+                let deadline = if distance == 0 {
+                    0
+                } else {
+                    distance * 25 + deadline_jitter
+                };
                 self.handle.set_piece_priority(p, priority);
-                self.handle.set_piece_deadline(p, (p - piece) * 25);
+                self.handle.set_piece_deadline(p, deadline);
             }
         }
 
@@ -136,9 +149,11 @@ impl LibtorrentDiskFileStream {
             info_hash = %self.info_hash,
             file_idx = self.file_idx,
             intent = ?self.playback_intent,
+            priority_intent = ?priority_intent,
             piece,
             sequential_download,
             forward_window,
+            deadline_jitter,
             "disk-backed stream priority window configured"
         );
     }

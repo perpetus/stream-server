@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use crate::backend::priorities::{
     BLOCKED_REPLAN_INTERVAL_MS, EngineCacheConfig, MemoryPressure, PlaybackIntent,
-    PlaybackPriorityPolicy, PriorityBand, PriorityContext, container_metadata_start,
+    PlaybackPriorityPolicy, PriorityBand, PriorityContext,
 };
 
 /// Type of seek operation - determines priority behavior
@@ -720,10 +720,9 @@ impl tokio::io::AsyncSeek for LibtorrentFileStream {
             std::io::SeekFrom::End(delta) => (self.file_size as i64 + delta).max(0) as u64,
         };
 
-        // DETERMINISTIC: Detect seek type based on target position
-        let end_threshold = container_metadata_start(self.file_size);
-
-        self.seek_type = if new_pos >= end_threshold {
+        // DETERMINISTIC: Preserve route-level metadata classification. Near-tail
+        // playback ranges can be real playback, so do not reclassify them here.
+        self.seek_type = if matches!(self.playback_intent, PlaybackIntent::ContainerMetadata) {
             SeekType::ContainerMetadata
         } else {
             SeekType::UserScrub
