@@ -1,0 +1,19 @@
+[package]
+name = "updater-helper"
+version = "0.1.2"
+edition = "2024"
+
+[[bin]]
+name = "stream-server-updater"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+hex = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+sysinfo = "0.37"
+
+[build-dependencies]
+winres = "0.1"

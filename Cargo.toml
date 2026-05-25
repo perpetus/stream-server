@@ -7,4 +7,5 @@ members = [
     "bindings/libtorrent-sys",
     "bindings/async-sevenz",
     "stremio-runtime-stub",
+    "updater-helper",
 ]

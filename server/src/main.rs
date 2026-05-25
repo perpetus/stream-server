@@ -4,7 +4,7 @@ use axum::{Router, http::StatusCode, response::Redirect, routing::get};
 use enginefs::EngineFS; // This is a type alias in enginefs::lib.rs based on features
 use fslock::LockFile;
 use state::AppState;
-use std::{net::SocketAddr, sync::Arc};
+use std::{future::IntoFuture, net::SocketAddr, sync::Arc};
 use tao::event::Event;
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
@@ -23,11 +23,32 @@ mod ssdp;
 mod state;
 mod tray;
 mod tui;
+mod updater;
+
+#[derive(Clone, Copy, Debug)]
+enum ShutdownBehavior {
+    ExitProcessOnTimeout,
+    ReturnOnTimeout,
+}
+
+impl ShutdownBehavior {
+    fn exits_process_on_timeout(self) -> bool {
+        matches!(self, Self::ExitProcessOnTimeout)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ShutdownSource {
+    CtrlC,
+    Tui,
+    External,
+}
 
 async fn run_server(
     mut external_shutdown_rx: tokio::sync::mpsc::Receiver<()>,
     tray_stats: Option<std::sync::Arc<tray::TrayStats>>,
-) -> anyhow::Result<()> {
+    shutdown_behavior: ShutdownBehavior,
+) -> anyhow::Result<Option<ShutdownSource>> {
     // Check for --tui flag
     let use_tui = std::env::args().any(|arg| arg == "--tui");
 
@@ -205,6 +226,10 @@ async fn run_server(
     // Start Cache Cleaner
     cache_cleaner::start(Arc::new(state.clone()));
     diagnostics::start_memory_sampler(state.clone());
+    state
+        .updater
+        .clone()
+        .spawn_background_checker(state.clone());
 
     // Start SSDP Discovery
     diagnostics::logging::spawn_logged(
@@ -216,6 +241,8 @@ async fn run_server(
     if let Some(stats) = tray_stats {
         let engine_clone = state.engine.clone();
         let download_engine_clone = state.download_engine.clone();
+        let updater_clone = state.updater.clone();
+        let settings_clone = state.settings.clone();
         diagnostics::logging::spawn_logged("tray-stats", async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -237,6 +264,37 @@ async fn run_server(
                 }
 
                 stats.update(total_down, total_up, total_peers, active);
+
+                let settings = settings_clone.read().await.clone();
+                stats.set_auto_update_enabled(settings.auto_update_enabled);
+                let update_status = updater_clone.status(settings.update_channel).await;
+                let install_enabled = matches!(
+                    update_status.state,
+                    crate::updater::state::UpdateOperationState::Available
+                        | crate::updater::state::UpdateOperationState::Staged
+                );
+                let label = if let Some(version) = update_status.staged_version {
+                    format!("Update: v{} staged", version)
+                } else if let Some(version) = update_status.latest_version {
+                    format!("Update: v{} available", version)
+                } else {
+                    match update_status.state {
+                        crate::updater::state::UpdateOperationState::Checking => {
+                            "Update: checking".to_string()
+                        }
+                        crate::updater::state::UpdateOperationState::Downloading => {
+                            "Update: downloading".to_string()
+                        }
+                        crate::updater::state::UpdateOperationState::Installing => {
+                            "Update: installing".to_string()
+                        }
+                        crate::updater::state::UpdateOperationState::Failed => {
+                            "Update: failed".to_string()
+                        }
+                        _ => "Update: up to date".to_string(),
+                    }
+                };
+                stats.update_update_status(label, install_enabled);
             }
         });
     }
@@ -267,6 +325,7 @@ async fn run_server(
         .route("/heartbeat", get(routes::system::heartbeat))
         .route("/stats.json", get(routes::system::get_stats))
         .route("/network-info", get(routes::system::network_info))
+        .nest("/update", routes::update::router())
         .route("/diagnostics/memory", get(diagnostics::memory))
         .route("/diagnostics/streams", get(diagnostics::streams))
         .route("/diagnostics/crashes", get(diagnostics::crashes))
@@ -390,29 +449,27 @@ async fn run_server(
     println!("listening on {}", addr);
     println!("EngineFS server started at http://127.0.0.1:11470");
 
+    let (shutdown_started_tx, shutdown_started_rx) =
+        tokio::sync::oneshot::channel::<ShutdownSource>();
+
     // Shutdown signal
     let shutdown = async move {
-        tokio::select! {
+        let source = tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 tracing::info!("Ctrl+C received, shutting down");
+                ShutdownSource::CtrlC
             }
             _ = shutdown_rx.recv() => {
                 tracing::info!("Shutdown signal received from TUI, shutting down");
+                ShutdownSource::Tui
             }
             _ = external_shutdown_rx.recv() => {
                 tracing::info!("Shutdown signal received from Tray, shutting down");
+                ShutdownSource::External
             }
-        }
+        };
 
-        // FORCE EXIT TIMER
-        // Libtorrent often hangs on shutdown trying to contact trackers.
-        // We give the graceful shutdown 1 second to finish, otherwise we pull the plug.
-        // This stops the "hanging terminal" experience.
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            tracing::warn!("Shutdown taking too long, forcing exit...");
-            std::process::exit(0);
-        });
+        let _ = shutdown_started_tx.send(source);
     };
 
     // HTTPS Server (Port 12470)
@@ -442,14 +499,48 @@ async fn run_server(
         );
     }
 
-    axum::serve(
+    let server = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(shutdown)
-    .await?;
+    .into_future();
 
-    Ok(())
+    tokio::pin!(server);
+
+    let shutdown_source = tokio::select! {
+        result = &mut server => {
+            result?;
+            None
+        }
+        Ok(source) = shutdown_started_rx => {
+            let timeout = std::time::Duration::from_secs(3);
+            match tokio::time::timeout(timeout, &mut server).await {
+                Ok(result) => {
+                    result?;
+                }
+                Err(_) => {
+                    if shutdown_behavior.exits_process_on_timeout() {
+                        tracing::warn!(
+                            ?source,
+                            timeout_secs = timeout.as_secs(),
+                            "Shutdown taking too long, forcing process exit"
+                        );
+                        std::process::exit(0);
+                    }
+
+                    tracing::warn!(
+                        ?source,
+                        timeout_secs = timeout.as_secs(),
+                        "Shutdown taking too long, dropping server future so restart can continue"
+                    );
+                }
+            }
+            Some(source)
+        }
+    };
+
+    Ok(shutdown_source)
 }
 
 use std::io::IsTerminal;
@@ -460,8 +551,18 @@ fn main() -> anyhow::Result<()> {
     // even though we are a windows subsystem app.
     #[cfg(windows)]
     let attached_console = unsafe {
-        use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
-        AttachConsole(ATTACH_PARENT_PROCESS).is_ok()
+        use windows::Win32::System::Console::{
+            ATTACH_PARENT_PROCESS, AttachConsole, SetConsoleCtrlHandler,
+        };
+        let attached = AttachConsole(ATTACH_PARENT_PROCESS).is_ok();
+        if attached {
+            // GUI-subsystem processes that attach to a parent console have
+            // Ctrl+C handling disabled by default.  Re-enable it so
+            // tokio::signal::ctrl_c() (which relies on SetConsoleCtrlHandler
+            // internally) can actually receive the CTRL_C_EVENT.
+            let _ = SetConsoleCtrlHandler(None, false);
+        }
+        attached
     };
     #[cfg(not(windows))]
     let attached_console = true;
@@ -527,11 +628,26 @@ fn main() -> anyhow::Result<()> {
                 *server_control_clone.lock().unwrap() = Some(tx);
 
                 // Run server (blocking on runtime)
-                // We unwrap here because if run_server fails fatally, we might want to log it and retry or exit.
-                // For now, let's log and retry after a delay to prevent busy loops.
-                if let Err(e) = rt.block_on(run_server(rx, Some(tray_stats_clone.clone()))) {
-                    eprintln!("Server crashed: {}", e);
-                    std::thread::sleep(std::time::Duration::from_secs(2));
+                // run_server returns Ok(Some(source)) on graceful shutdown,
+                // Ok(None) if the server future completed without a signal.
+                match rt.block_on(run_server(
+                    rx,
+                    Some(tray_stats_clone.clone()),
+                    ShutdownBehavior::ReturnOnTimeout,
+                )) {
+                    Ok(Some(ShutdownSource::CtrlC)) => {
+                        // Ctrl+C should exit, not restart
+                        keep_running_clone.store(false, Ordering::Relaxed);
+                        break;
+                    }
+                    Ok(_) => {
+                        // External (tray restart) or server completed — loop will
+                        // check keep_running and either restart or exit.
+                    }
+                    Err(e) => {
+                        eprintln!("Server crashed: {}", e);
+                        std::thread::sleep(std::time::Duration::from_secs(2));
+                    }
                 }
 
                 // Clear the sender
@@ -552,6 +668,9 @@ fn main() -> anyhow::Result<()> {
 
         let tray_icon = tray_handle.tray_icon;
         let stats_item = tray_handle.stats_item;
+        let update_item = tray_handle.update_item;
+        let auto_update_item = tray_handle.auto_update_item;
+        let install_update_item = tray_handle.install_update_item;
 
         event_loop.run(move |event, _, control_flow| {
             *control_flow = ControlFlow::Wait;
@@ -566,13 +685,28 @@ fn main() -> anyhow::Result<()> {
                     }
                     tray::UserEvent::Restart => {
                         // Signal shutdown to current instance; loop will restart it since keep_running is true
-                        if let Some(tx) = server_control.lock().unwrap().take() {
+                        tracing::info!("Restart requested from tray");
+                        let tx = server_control.lock().unwrap().take();
+                        if let Some(tx) = tx {
                             let _ = tx.blocking_send(());
                         }
                     }
+                    tray::UserEvent::ToggleAutoUpdate => {
+                        let enabled = auto_update_item.is_checked();
+                        tray_stats.set_auto_update_enabled(enabled);
+                        tray::trigger_auto_update_toggle(enabled);
+                    }
+                    tray::UserEvent::CheckUpdates => {
+                        tray::trigger_update_check();
+                    }
+                    tray::UserEvent::InstallUpdate => {
+                        tray::trigger_update_install();
+                    }
                     tray::UserEvent::Quit => {
                         keep_running.store(false, Ordering::Relaxed);
-                        if let Some(tx) = server_control.lock().unwrap().take() {
+                        tracing::info!("Quit requested from tray");
+                        let tx = server_control.lock().unwrap().take();
+                        if let Some(tx) = tx {
                             let _ = tx.blocking_send(());
                         }
                         *control_flow = ControlFlow::Exit;
@@ -584,6 +718,9 @@ fn main() -> anyhow::Result<()> {
 
                         tray_icon.set_tooltip(Some(&tooltip)).ok();
                         stats_item.set_text(&stats_line);
+                        update_item.set_text(&tray_stats.format_update_line());
+                        auto_update_item.set_checked(tray_stats.auto_update_enabled());
+                        install_update_item.set_enabled(tray_stats.update_install_enabled());
                     }
                 },
                 _ => (),
@@ -593,7 +730,7 @@ fn main() -> anyhow::Result<()> {
         // Normal mode: Run on main thread (blocking), no tray
         // Create a dummy channel for external shutdown that we hold open but never send to
         let (_tx, rx) = tokio::sync::mpsc::channel(1);
-        rt.block_on(run_server(rx, None))?;
+        let _ = rt.block_on(run_server(rx, None, ShutdownBehavior::ExitProcessOnTimeout))?;
     }
 
     Ok(())

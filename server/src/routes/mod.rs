@@ -11,4 +11,5 @@ pub mod proxy;
 pub mod stream;
 pub mod subtitles;
 pub mod system;
+pub mod update;
 pub mod youtube;

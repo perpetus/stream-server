@@ -1,17 +1,23 @@
 use anyhow::Context;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+    RwLock,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+};
 use tao::event_loop::EventLoop;
 
 use tracing::{error, info};
 use tray_icon::{
     Icon, TrayIcon, TrayIconBuilder,
-    menu::{Menu, MenuEvent, MenuItem},
+    menu::{CheckMenuItem, Menu, MenuEvent, MenuItem},
 };
 
 pub enum UserEvent {
     OpenWeb,
     OpenLogs,
     Restart,
+    ToggleAutoUpdate,
+    CheckUpdates,
+    InstallUpdate,
     Quit,
     UpdateStats,
 }
@@ -24,6 +30,9 @@ pub struct TrayStats {
     upload_speed_bits: AtomicU64,
     peers: AtomicU64,
     active_torrents: AtomicU64,
+    update_status: RwLock<String>,
+    update_install_enabled: AtomicBool,
+    auto_update_enabled: AtomicBool,
 }
 
 impl TrayStats {
@@ -61,6 +70,33 @@ impl TrayStats {
 
     pub fn active_torrents(&self) -> u64 {
         self.active_torrents.load(Ordering::Relaxed)
+    }
+
+    pub fn update_update_status(&self, label: String, install_enabled: bool) {
+        if let Ok(mut guard) = self.update_status.write() {
+            *guard = label;
+        }
+        self.update_install_enabled
+            .store(install_enabled, Ordering::Relaxed);
+    }
+
+    pub fn set_auto_update_enabled(&self, enabled: bool) {
+        self.auto_update_enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn format_update_line(&self) -> String {
+        self.update_status
+            .read()
+            .map(|guard| guard.clone())
+            .unwrap_or_else(|_| "Update: unknown".to_string())
+    }
+
+    pub fn update_install_enabled(&self) -> bool {
+        self.update_install_enabled.load(Ordering::Relaxed)
+    }
+
+    pub fn auto_update_enabled(&self) -> bool {
+        self.auto_update_enabled.load(Ordering::Relaxed)
     }
 
     pub fn format_tooltip(&self) -> String {
@@ -112,6 +148,9 @@ pub fn load_icon() -> anyhow::Result<Icon> {
 pub struct TrayHandle {
     pub tray_icon: TrayIcon,
     pub stats_item: MenuItem,
+    pub update_item: MenuItem,
+    pub auto_update_item: CheckMenuItem,
+    pub install_update_item: MenuItem,
     #[allow(dead_code)]
     pub open_id: String,
     #[allow(dead_code)]
@@ -125,6 +164,10 @@ pub fn create_system_tray(event_loop: &EventLoop<UserEvent>) -> anyhow::Result<T
     let open_item = MenuItem::new("Open Stremio Web", true, None);
     let logs_item = MenuItem::new("Open Logs Folder", true, None);
     let restart_item = MenuItem::new("Restart Server", true, None);
+    let update_item = MenuItem::new("Update: unknown", false, None);
+    let auto_update_item = CheckMenuItem::new("Auto-check for Updates", true, true, None);
+    let check_update_item = MenuItem::new("Check for Updates", true, None);
+    let install_update_item = MenuItem::new("Install Update", false, None);
     let quit_item = MenuItem::new("Quit", true, None);
 
     let version_label = format!("v{}", env!("CARGO_PKG_VERSION"));
@@ -136,6 +179,10 @@ pub fn create_system_tray(event_loop: &EventLoop<UserEvent>) -> anyhow::Result<T
         &open_item,
         &logs_item,
         &restart_item,
+        &update_item,
+        &auto_update_item,
+        &check_update_item,
+        &install_update_item,
         &quit_item,
         &version_item,
     ])
@@ -154,11 +201,17 @@ pub fn create_system_tray(event_loop: &EventLoop<UserEvent>) -> anyhow::Result<T
     let open_id = open_item.id().0.clone();
     let logs_id = logs_item.id().0.clone();
     let restart_id = restart_item.id().0.clone();
+    let auto_update_id = auto_update_item.id().0.clone();
+    let check_update_id = check_update_item.id().0.clone();
+    let install_update_id = install_update_item.id().0.clone();
     let quit_id = quit_item.id().0.clone();
 
     let open_id_clone = open_id.clone();
     let logs_id_clone = logs_id.clone();
     let restart_id_clone = restart_id.clone();
+    let auto_update_id_clone = auto_update_id.clone();
+    let check_update_id_clone = check_update_id.clone();
+    let install_update_id_clone = install_update_id.clone();
     let quit_id_clone = quit_id.clone();
 
     tray_icon::menu::MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
@@ -169,6 +222,12 @@ pub fn create_system_tray(event_loop: &EventLoop<UserEvent>) -> anyhow::Result<T
             proxy.send_event(UserEvent::OpenLogs).ok();
         } else if id == restart_id_clone {
             proxy.send_event(UserEvent::Restart).ok();
+        } else if id == auto_update_id_clone {
+            proxy.send_event(UserEvent::ToggleAutoUpdate).ok();
+        } else if id == check_update_id_clone {
+            proxy.send_event(UserEvent::CheckUpdates).ok();
+        } else if id == install_update_id_clone {
+            proxy.send_event(UserEvent::InstallUpdate).ok();
         } else if id == quit_id_clone {
             proxy.send_event(UserEvent::Quit).ok();
         }
@@ -177,9 +236,56 @@ pub fn create_system_tray(event_loop: &EventLoop<UserEvent>) -> anyhow::Result<T
     Ok(TrayHandle {
         tray_icon,
         stats_item,
+        update_item,
+        auto_update_item,
+        install_update_item,
         open_id,
         quit_id,
     })
+}
+
+pub fn trigger_update_check() {
+    std::thread::spawn(|| {
+        if let Err(err) = reqwest::blocking::Client::new()
+            .post("http://127.0.0.1:11470/update/check")
+            .json(&serde_json::json!({ "force": true }))
+            .send()
+            .and_then(|response| response.error_for_status())
+        {
+            error!("Failed to trigger update check: {}", err);
+        }
+    });
+}
+
+pub fn trigger_update_install() {
+    std::thread::spawn(|| {
+        if let Err(err) = reqwest::blocking::Client::new()
+            .post("http://127.0.0.1:11470/update/install")
+            .json(&serde_json::json!({ "force": false }))
+            .send()
+            .and_then(|response| response.error_for_status())
+        {
+            error!("Failed to trigger update install: {}", err);
+        }
+    });
+}
+
+pub fn trigger_auto_update_toggle(enabled: bool) {
+    std::thread::spawn(move || {
+        if let Err(err) = reqwest::blocking::Client::new()
+            .post("http://127.0.0.1:11470/settings")
+            .json(&serde_json::json!({ "autoUpdateEnabled": enabled }))
+            .send()
+            .and_then(|response| response.error_for_status())
+        {
+            error!("Failed to toggle auto update: {}", err);
+            return;
+        }
+
+        if enabled {
+            trigger_update_check();
+        }
+    });
 }
 
 pub fn open_stremio_web() {
