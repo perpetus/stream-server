@@ -43,6 +43,14 @@ pub trait TorrentHandle: Send + Sync + Clone {
 
     async fn stats(&self) -> EngineStats;
     async fn add_trackers(&self, trackers: Vec<String>) -> Result<()>;
+    /// Resume torrent activity after an idle pause.
+    async fn resume_torrent(&self) -> Result<()> {
+        Ok(())
+    }
+    /// Pause torrent activity when no stream is currently using it.
+    async fn pause_torrent(&self) -> Result<()> {
+        Ok(())
+    }
     async fn get_file_reader(
         &self,
         file_idx: usize,

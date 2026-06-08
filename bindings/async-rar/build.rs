@@ -120,15 +120,24 @@ fn find_include_paths() -> Vec<PathBuf> {
     let mut found_sdk = false;
     for sdk_root in sdk_roots {
         if let Ok(entries) = std::fs::read_dir(&sdk_root) {
-            // Find latest version
-            if let Some(latest) = entries
+            // Find latest version that actually contains required headers.
+            // Some SDK versions (e.g. 10.0.28000.0) may be incomplete.
+            let mut candidates: Vec<PathBuf> = entries
                 .filter_map(Result::ok)
                 .filter(|e| e.path().is_dir())
                 .map(|e| e.path())
-                .filter(|p| p.file_name().unwrap().to_str().unwrap().starts_with("10."))
-                .max()
-            {
-                // println!("cargo:warning=Found Windows SDK at: {:?}", latest);
+                .filter(|p| {
+                    p.file_name()
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .starts_with("10.")
+                        && p.join("um").join("Windows.h").exists()
+                        && p.join("ucrt").exists()
+                })
+                .collect();
+            candidates.sort();
+            if let Some(latest) = candidates.pop() {
                 includes.push(latest.join("ucrt"));
                 includes.push(latest.join("shared"));
                 includes.push(latest.join("um"));

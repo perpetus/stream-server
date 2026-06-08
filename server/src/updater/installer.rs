@@ -15,7 +15,8 @@ pub struct ApplyPlan {
     pub parent_pid: u32,
     pub restart_command: Vec<String>,
     pub standalone_target: Option<PathBuf>,
-    pub stremio_dir: Option<PathBuf>,
+    #[serde(default)]
+    pub stremio_dirs: Vec<PathBuf>,
     pub assets: Vec<ApplyAsset>,
     pub allow_stop_stremio: bool,
     pub msi_source: Option<PathBuf>,
@@ -67,18 +68,17 @@ pub fn prepare_apply_plan(
         ));
     }
 
-    let stremio_dir = default_stremio_dir();
-    let mut plan_stremio_dir = None;
-    if let Some(dir) = stremio_dir {
+    let mut plan_stremio_dirs = Vec::new();
+    for dir in stremio_dirs() {
         let server_js = dir.join("server.js");
         if server_js.exists() {
-            plan_stremio_dir = Some(dir.clone());
+            plan_stremio_dirs.push(dir.clone());
             push_asset_unique(
                 &mut assets,
                 ApplyAsset {
                     source: staged.assets.runtime.clone(),
                     destination: dir.join("stremio-runtime.exe"),
-                    sha256: runtime_hash,
+                    sha256: runtime_hash.clone(),
                 },
             );
             push_asset_unique(
@@ -86,17 +86,9 @@ pub fn prepare_apply_plan(
                 ApplyAsset {
                     source: staged.assets.server.clone(),
                     destination: dir.join("stream-server.exe"),
-                    sha256: server_hash,
+                    sha256: server_hash.clone(),
                 },
             );
-        } else if dir.exists() {
-            return Err(UpdateError::new(
-                UpdateErrorKind::Conflict,
-                format!(
-                    "server.js was not found in Stremio directory {}",
-                    dir.display()
-                ),
-            ));
         }
     }
 
@@ -106,7 +98,7 @@ pub fn prepare_apply_plan(
         parent_pid: std::process::id(),
         restart_command,
         standalone_target: Some(current_exe),
-        stremio_dir: plan_stremio_dir,
+        stremio_dirs: plan_stremio_dirs,
         assets,
         allow_stop_stremio,
         msi_source,
@@ -171,11 +163,20 @@ fn parent_dir_writable(path: &Path) -> bool {
     }
 }
 
-fn default_stremio_dir() -> Option<PathBuf> {
+fn stremio_dirs() -> Vec<PathBuf> {
     if let Some(value) = std::env::var_os("STREMIO_INSTALL_DIR") {
-        return Some(PathBuf::from(value));
+        return vec![PathBuf::from(value)];
     }
-    std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .map(|dir| dir.join("Programs").join("Stremio"))
+    let local = match std::env::var_os("LOCALAPPDATA").map(PathBuf::from) {
+        Some(dir) => dir,
+        None => return Vec::new(),
+    };
+    let candidates = [
+        local.join("Programs").join("Stremio"),
+        local.join("Programs").join("LNV").join("Stremio-5"),
+    ];
+    candidates
+        .into_iter()
+        .filter(|dir| dir.exists())
+        .collect()
 }

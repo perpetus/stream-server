@@ -15,6 +15,7 @@ pub enum UserEvent {
     OpenWeb,
     OpenLogs,
     Restart,
+    ToggleSeeding,
     ToggleAutoUpdate,
     CheckUpdates,
     InstallUpdate,
@@ -33,11 +34,15 @@ pub struct TrayStats {
     update_status: RwLock<String>,
     update_install_enabled: AtomicBool,
     auto_update_enabled: AtomicBool,
+    seeding_enabled: AtomicBool,
 }
 
 impl TrayStats {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            seeding_enabled: AtomicBool::new(true),
+            ..Default::default()
+        }
     }
 
     pub fn update(
@@ -99,6 +104,14 @@ impl TrayStats {
         self.auto_update_enabled.load(Ordering::Relaxed)
     }
 
+    pub fn set_seeding_enabled(&self, enabled: bool) {
+        self.seeding_enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn seeding_enabled(&self) -> bool {
+        self.seeding_enabled.load(Ordering::Relaxed)
+    }
+
     pub fn format_tooltip(&self) -> String {
         let down = format_speed(self.download_speed());
         let up = format_speed(self.upload_speed());
@@ -150,6 +163,7 @@ pub struct TrayHandle {
     pub stats_item: MenuItem,
     pub update_item: MenuItem,
     pub auto_update_item: CheckMenuItem,
+    pub seeding_item: CheckMenuItem,
     pub install_update_item: MenuItem,
     #[allow(dead_code)]
     pub open_id: String,
@@ -164,6 +178,7 @@ pub fn create_system_tray(event_loop: &EventLoop<UserEvent>) -> anyhow::Result<T
     let open_item = MenuItem::new("Open Stremio Web", true, None);
     let logs_item = MenuItem::new("Open Logs Folder", true, None);
     let restart_item = MenuItem::new("Restart Server", true, None);
+    let seeding_item = CheckMenuItem::new("Seed After Download", true, true, None);
     let update_item = MenuItem::new("Update: unknown", false, None);
     let auto_update_item = CheckMenuItem::new("Auto-check for Updates", true, true, None);
     let check_update_item = MenuItem::new("Check for Updates", true, None);
@@ -179,6 +194,7 @@ pub fn create_system_tray(event_loop: &EventLoop<UserEvent>) -> anyhow::Result<T
         &open_item,
         &logs_item,
         &restart_item,
+        &seeding_item,
         &update_item,
         &auto_update_item,
         &check_update_item,
@@ -209,6 +225,8 @@ pub fn create_system_tray(event_loop: &EventLoop<UserEvent>) -> anyhow::Result<T
     let open_id_clone = open_id.clone();
     let logs_id_clone = logs_id.clone();
     let restart_id_clone = restart_id.clone();
+    let seeding_id = seeding_item.id().0.clone();
+    let seeding_id_clone = seeding_id.clone();
     let auto_update_id_clone = auto_update_id.clone();
     let check_update_id_clone = check_update_id.clone();
     let install_update_id_clone = install_update_id.clone();
@@ -222,6 +240,8 @@ pub fn create_system_tray(event_loop: &EventLoop<UserEvent>) -> anyhow::Result<T
             proxy.send_event(UserEvent::OpenLogs).ok();
         } else if id == restart_id_clone {
             proxy.send_event(UserEvent::Restart).ok();
+        } else if id == seeding_id_clone {
+            proxy.send_event(UserEvent::ToggleSeeding).ok();
         } else if id == auto_update_id_clone {
             proxy.send_event(UserEvent::ToggleAutoUpdate).ok();
         } else if id == check_update_id_clone {
@@ -238,6 +258,7 @@ pub fn create_system_tray(event_loop: &EventLoop<UserEvent>) -> anyhow::Result<T
         stats_item,
         update_item,
         auto_update_item,
+        seeding_item,
         install_update_item,
         open_id,
         quit_id,
@@ -266,6 +287,19 @@ pub fn trigger_update_install() {
             .and_then(|response| response.error_for_status())
         {
             error!("Failed to trigger update install: {}", err);
+        }
+    });
+}
+
+pub fn trigger_seeding_toggle(enabled: bool) {
+    std::thread::spawn(move || {
+        if let Err(err) = reqwest::blocking::Client::new()
+            .post("http://127.0.0.1:11470/settings")
+            .json(&serde_json::json!({ "seedingEnabled": enabled }))
+            .send()
+            .and_then(|response| response.error_for_status())
+        {
+            error!("Failed to toggle seeding: {}", err);
         }
     });
 }

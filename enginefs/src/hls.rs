@@ -52,6 +52,27 @@ impl TranscodeConfig {
             ..Self::default()
         }
     }
+
+    pub fn uses_hardware_encoder(&self) -> bool {
+        self.hwaccel
+            .as_ref()
+            .map(|hw| hw.is_hardware())
+            .unwrap_or(false)
+    }
+
+    pub fn force_software_encoder(&mut self, reason: &str) {
+        if let Some(hw) = self.hwaccel.as_ref() {
+            if hw.is_hardware() {
+                tracing::warn!(
+                    encoder = %hw.encoder,
+                    reason = %reason,
+                    "Falling back to software HLS encoder"
+                );
+            }
+        }
+        self.hwaccel = Some(HwAccelConfig::software());
+        self.video_bitrate = "8M".to_string();
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,6 +88,8 @@ pub struct VideoStream {
     pub lang: Option<String>,
     pub is_default: bool,
     pub profile: Option<String>,
+    #[serde(default)]
+    pub pix_fmt: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,6 +97,32 @@ pub struct ProbeResult {
     pub duration: f64, // seconds
     pub container: String,
     pub streams: Vec<VideoStream>,
+}
+
+impl VideoStream {
+    pub fn is_high_bit_depth_video(&self) -> bool {
+        if self.codec_type != "video" {
+            return false;
+        }
+
+        self.profile
+            .as_deref()
+            .map(text_mentions_high_bit_depth)
+            .unwrap_or(false)
+            || self
+                .pix_fmt
+                .as_deref()
+                .map(text_mentions_high_bit_depth)
+                .unwrap_or(false)
+    }
+}
+
+impl ProbeResult {
+    pub fn has_high_bit_depth_video(&self) -> bool {
+        self.streams
+            .iter()
+            .any(VideoStream::is_high_bit_depth_video)
+    }
 }
 
 #[derive(Clone)]
@@ -244,6 +293,11 @@ impl HlsEngine {
                 let height = re_dim.captures(line).and_then(|c| c[2].parse().ok());
                 let fps = re_fps.captures(line).and_then(|c| c[1].parse().ok());
                 let channels = parse_audio_channels(line, &re_channels);
+                let pix_fmt = if type_str == "video" {
+                    parse_video_pixel_format(line)
+                } else {
+                    None
+                };
                 let bitrate = re_bitrate
                     .captures(line)
                     .and_then(|c| c[1].parse().ok().map(|kb: u64| kb * 1000));
@@ -260,6 +314,7 @@ impl HlsEngine {
                     lang,
                     is_default: line.contains("(default)"),
                     profile,
+                    pix_fmt,
                 });
             }
         }
@@ -449,6 +504,7 @@ impl HlsEngine {
         config: &TranscodeConfig,
     ) -> anyhow::Result<TranscodeProcess> {
         let mut cmd = tokio::process::Command::new("ffmpeg");
+        configure_low_impact_ffmpeg(&mut cmd);
 
         // Reduce FFmpeg verbosity
         cmd.args(["-loglevel", "warning"]);
@@ -498,8 +554,8 @@ impl HlsEngine {
         // Duration limit (CRITICAL: prevent transcoding entire file)
         cmd.arg("-t").arg(format!("{:.3}", duration));
 
-        // Thread count
-        cmd.args(["-threads", "0"]);
+        let threads = video_thread_count(config);
+        cmd.args(["-threads", &threads]);
 
         // Metadata cleanup
         cmd.args(["-max_muxing_queue_size", "2048"]);
@@ -528,13 +584,22 @@ impl HlsEngine {
 
             // For software encoders, add video filter and profile settings
             if !hw.is_hardware() {
-                cmd.args(["-vf", "format=yuv420p"]);
+                let pix_fmt = hw.pix_fmt.as_deref().unwrap_or("yuv420p");
+                let filter = software_video_filter(pix_fmt);
+                cmd.arg("-vf").arg(&filter);
                 cmd.args(["-profile:v", "high", "-level", "51"]);
+                tracing::info!(
+                    threads = %threads,
+                    filter = %filter,
+                    "Configured low-impact software HLS video transcode"
+                );
+            } else if let Some(ref pix_fmt) = hw.pix_fmt {
+                cmd.arg("-pix_fmt").arg(pix_fmt);
             }
-            // Hardware encoders don't need pix_fmt or profile settings
         } else {
             // Default software encoding fallback
-            cmd.args(["-vf", "format=yuv420p"]);
+            let filter = software_video_filter("yuv420p");
+            cmd.arg("-vf").arg(&filter);
             cmd.args([
                 "-c:v",
                 "libx264",
@@ -547,6 +612,11 @@ impl HlsEngine {
                 "-level",
                 "51",
             ]);
+            tracing::info!(
+                threads = %threads,
+                filter = %filter,
+                "Configured low-impact software HLS video transcode"
+            );
         }
 
         // Fixed GOP for HLS V2 segment alignment
@@ -608,9 +678,9 @@ impl HlsEngine {
         config: &TranscodeConfig,
     ) -> anyhow::Result<TranscodeProcess> {
         let mut cmd = tokio::process::Command::new("ffmpeg");
+        configure_low_impact_ffmpeg(&mut cmd);
 
-        // Increase FFmpeg verbosity for debugging
-        cmd.args(["-loglevel", "info"]);
+        cmd.args(["-loglevel", "warning"]);
 
         // Input flags (Global) - match video transcoding approach
         cmd.args(["-fflags", "+genpts+discardcorrupt"]);
@@ -640,8 +710,7 @@ impl HlsEngine {
         // Output timestamp offset - REQUIRED to match video timestamps
         cmd.arg("-output_ts_offset").arg(format!("{:.3}", start));
 
-        // Thread count
-        cmd.args(["-threads", "0"]);
+        cmd.args(["-threads", "1"]);
 
         // Duration limit (CRITICAL)
         cmd.arg("-t").arg(format!("{:.3}", duration));
@@ -657,14 +726,13 @@ impl HlsEngine {
         cmd.arg("-map").arg(format!("0:{}", audio_stream_index));
         cmd.args(["-vn", "-sn"]);
 
-        // Audio encoding HLS V2: apad + async 1
+        // Audio encoding HLS V2: resample to keep segment timestamps monotonic,
+        // then pad short segments to avoid client-side under-runs.
         cmd.args([
             "-c:a",
             "aac",
-            "-filter:a",
-            "apad", // CRITICAL: Pad with silence to prevent gaps
-            "-async",
-            "1", // CRITICAL: Sync audio to timestamps
+            "-af",
+            "aresample=async=1:first_pts=0,apad",
             "-ac",
             "2",
             "-b:a",
@@ -677,14 +745,54 @@ impl HlsEngine {
         tracing::debug!("FFmpeg audio command (HLS V2): {:?}", cmd);
 
         #[allow(clippy::zombie_processes)]
-        let child = cmd
+        let mut child = cmd
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .with_context(|| format!("Failed to spawn ffmpeg for audio segment: {:?}", cmd))?;
 
+        if let Some(stderr) = child.stderr.take() {
+            tokio::spawn(async move {
+                use tokio::io::AsyncBufReadExt;
+                let mut reader = tokio::io::BufReader::new(stderr);
+                let mut line = String::new();
+                while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
+                    if !line.trim().is_empty() {
+                        tracing::warn!("FFmpeg audio stderr: {}", line.trim());
+                    }
+                    line.clear();
+                }
+            });
+        }
+
         Ok(TranscodeProcess { inner: child })
     }
+}
+
+fn configure_low_impact_ffmpeg(cmd: &mut Command) {
+    #[cfg(windows)]
+    {
+        const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(BELOW_NORMAL_PRIORITY_CLASS | CREATE_NO_WINDOW);
+    }
+}
+
+fn video_thread_count(config: &TranscodeConfig) -> String {
+    if config.uses_hardware_encoder() {
+        return "0".to_string();
+    }
+
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2)
+        .saturating_sub(2)
+        .clamp(1, 4);
+    threads.to_string()
+}
+
+fn software_video_filter(pix_fmt: &str) -> String {
+    format!("scale=w='min(1920,iw)':h=-2:flags=fast_bilinear,format={pix_fmt}")
 }
 
 fn parse_audio_channels(line: &str, re_channels: &Regex) -> Option<u8> {
@@ -705,4 +813,74 @@ fn parse_audio_channels(line: &str, re_channels: &Regex) -> Option<u8> {
         .captures(&line)
         .and_then(|caps| caps.get(1))
         .and_then(|m| m.as_str().parse::<u8>().ok())
+}
+
+fn parse_video_pixel_format(line: &str) -> Option<String> {
+    let (_, video_desc) = line.split_once("Video:")?;
+    let pix_fmt = video_desc.split(',').nth(1)?.trim();
+    let pix_fmt = pix_fmt
+        .split(['(', ' '])
+        .next()
+        .unwrap_or(pix_fmt)
+        .trim()
+        .to_ascii_lowercase();
+    (!pix_fmt.is_empty()).then_some(pix_fmt)
+}
+
+fn text_mentions_high_bit_depth(value: &str) -> bool {
+    let value = value.to_ascii_lowercase();
+    value.contains("main 10")
+        || value.contains("main10")
+        || value.contains("high 10")
+        || value.contains("high10")
+        || value.contains("10 bit")
+        || value.contains("10-bit")
+        || value.contains("12 bit")
+        || value.contains("12-bit")
+        || value.contains("p010")
+        || value.contains("p016")
+        || value.contains("yuv420p10")
+        || value.contains("yuv422p10")
+        || value.contains("yuv444p10")
+        || value.contains("yuv420p12")
+        || value.contains("yuv422p12")
+        || value.contains("yuv444p12")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn video_stream(profile: Option<&str>, pix_fmt: Option<&str>) -> VideoStream {
+        VideoStream {
+            index: 0,
+            codec_type: "video".to_string(),
+            codec_name: "hevc".to_string(),
+            width: Some(3840),
+            height: Some(2160),
+            channels: None,
+            bitrate: None,
+            fps: Some(23.976),
+            lang: None,
+            is_default: true,
+            profile: profile.map(str::to_string),
+            pix_fmt: pix_fmt.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn parses_ffmpeg_video_pixel_format() {
+        let line = "Stream #0:0: Video: hevc (Main 10), yuv420p10le(tv), 3840x2160, 23.98 fps";
+        assert_eq!(
+            parse_video_pixel_format(line).as_deref(),
+            Some("yuv420p10le")
+        );
+    }
+
+    #[test]
+    fn detects_high_bit_depth_from_profile_or_pixel_format() {
+        assert!(video_stream(Some("Main 10"), None).is_high_bit_depth_video());
+        assert!(video_stream(None, Some("p010le")).is_high_bit_depth_video());
+        assert!(!video_stream(Some("High"), Some("yuv420p")).is_high_bit_depth_video());
+    }
 }

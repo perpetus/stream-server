@@ -3,6 +3,7 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::debug;
@@ -31,7 +32,8 @@ use crate::backend::libtorrent::LibtorrentBackend;
 
 use crate::backend::{BackendMemoryDiagnostics, TorrentBackend, TorrentHandle, TorrentSource};
 
-const ENGINE_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
+const INACTIVE_TORRENT_REMOVE_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
+const INACTIVE_TORRENT_PAUSE_GRACE: Duration = Duration::from_secs(15);
 
 static START_TIME: OnceLock<Instant> = OnceLock::new();
 
@@ -67,6 +69,8 @@ pub struct BackendEngineFS<B: TorrentBackend> {
     active_file: Arc<RwLock<Option<(String, usize)>>>,
     /// Optional disk cache for persisting completed files
     disk_cache: Option<Arc<disk_cache::DiskCacheManager>>,
+    /// When false, torrents are paused once their download completes.
+    seeding_enabled: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -148,6 +152,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             active_file_streams: Arc::new(RwLock::new(HashMap::new())),
             active_file: Arc::new(RwLock::new(None)),
             disk_cache: None,
+            seeding_enabled: Arc::new(AtomicBool::new(true)),
         };
 
         let engines_clone = engines.clone();
@@ -155,6 +160,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         let active_streams_clone = efs.active_streams.clone();
         let active_file_streams_clone = efs.active_file_streams.clone();
         let active_file_clone = efs.active_file.clone();
+        let seeding_flag = efs.seeding_enabled.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(60)).await;
@@ -171,7 +177,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                             .last_accessed
                             .load(std::sync::atomic::Ordering::SeqCst);
                         let age_secs = now.saturating_sub(last);
-                        if age_secs <= ENGINE_TIMEOUT.as_secs() {
+                        if age_secs <= INACTIVE_TORRENT_REMOVE_TIMEOUT.as_secs() {
                             continue;
                         }
 
@@ -256,6 +262,27 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                                 removed = true,
                                 "Removed inactive torrent from backend"
                             );
+                        }
+                    }
+                }
+
+                // Pause finished torrents when seeding is disabled
+                if !seeding_flag.load(Ordering::Relaxed) {
+                    let read = engines_clone.read().await;
+                    for (hash, engine) in read.iter() {
+                        let stats = engine.handle.stats().await;
+                        if stats.stream_progress >= 1.0 && !stats.swarm_paused {
+                            tracing::info!(
+                                info_hash = %hash,
+                                "Pausing finished torrent (seeding disabled)"
+                            );
+                            if let Err(e) = engine.handle.pause_torrent().await {
+                                tracing::warn!(
+                                    info_hash = %hash,
+                                    error = %e,
+                                    "Failed to pause finished torrent"
+                                );
+                            }
                         }
                     }
                 }
@@ -398,6 +425,14 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         let info_hash = info_hash.to_lowercase();
         if let Some(engine) = self.get_engine(&info_hash).await {
             engine.touch();
+            if let Err(err) = engine.handle.resume_torrent().await {
+                tracing::warn!(
+                    info_hash = %info_hash,
+                    file_idx,
+                    error = %err,
+                    "Failed to resume torrent for active stream"
+                );
+            }
         }
 
         {
@@ -428,16 +463,20 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     pub async fn on_stream_end(&self, info_hash: &str, file_idx: usize) {
         let info_hash = info_hash.to_lowercase();
 
-        // Update legacy active_streams counter
-        {
+        let hash_streams_remaining = {
             let mut streams = self.active_streams.write().await;
             if let Some(count) = streams.get_mut(&info_hash) {
                 *count = count.saturating_sub(1);
                 if *count == 0 {
                     streams.remove(&info_hash);
+                    0
+                } else {
+                    *count
                 }
+            } else {
+                0
             }
-        }
+        };
 
         let file_streams_remaining = {
             let mut streams = self.active_file_streams.write().await;
@@ -455,6 +494,16 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             }
         };
 
+        if let Some(engine) = self.get_engine(&info_hash).await {
+            // Reset idle age so removal happens after the stream becomes
+            // inactive, not after the stream originally started.
+            engine.touch();
+        }
+
+        if hash_streams_remaining == 0 && file_streams_remaining == 0 {
+            self.schedule_torrent_pause(info_hash.clone());
+        }
+
         if file_streams_remaining == 0 {
             self.schedule_file_cleanup(info_hash.clone(), file_idx);
         }
@@ -467,6 +516,51 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             remaining,
             file_streams_remaining
         );
+    }
+
+    fn schedule_torrent_pause(&self, info_hash: String) {
+        let engines = self.engines.clone();
+        let active_streams = self.active_streams.clone();
+        let active_file_streams = self.active_file_streams.clone();
+
+        tokio::spawn(async move {
+            tokio::time::sleep(INACTIVE_TORRENT_PAUSE_GRACE).await;
+
+            let hash_active = {
+                let streams = active_streams.read().await;
+                streams.get(&info_hash).copied().unwrap_or(0) > 0
+            };
+            let file_active = {
+                let streams = active_file_streams.read().await;
+                streams
+                    .iter()
+                    .any(|((hash, _), count)| hash == &info_hash && *count > 0)
+            };
+            if hash_active || file_active {
+                tracing::debug!(
+                    info_hash = %info_hash,
+                    hash_active,
+                    file_active,
+                    "Skipping torrent pause because stream activity resumed"
+                );
+                return;
+            }
+
+            let engine = {
+                let engines = engines.read().await;
+                engines.get(&info_hash).cloned()
+            };
+            if let Some(engine) = engine {
+                engine.touch();
+                if let Err(err) = engine.handle.pause_torrent().await {
+                    tracing::warn!(
+                        info_hash = %info_hash,
+                        error = %err,
+                        "Failed to pause inactive torrent after grace period"
+                    );
+                }
+            }
+        });
     }
 
     fn schedule_file_cleanup(&self, info_hash: String, file_idx: usize) {
@@ -607,6 +701,15 @@ impl BackendEngineFS<LibtorrentBackend> {
     /// Update session settings dynamically (called when user changes torrent profile)
     pub async fn update_speed_profile(&self, profile: &crate::backend::TorrentSpeedProfile) {
         self.backend.update_session_settings(profile).await;
+    }
+
+    pub fn set_seeding_enabled(&self, enabled: bool) {
+        self.seeding_enabled.store(enabled, Ordering::Relaxed);
+        tracing::info!(seeding_enabled = enabled, "Seeding policy updated");
+    }
+
+    pub fn seeding_enabled(&self) -> bool {
+        self.seeding_enabled.load(Ordering::Relaxed)
     }
 
     /// Mark the torrent as active without pausing other active torrents.

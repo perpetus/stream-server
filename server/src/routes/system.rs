@@ -133,10 +133,20 @@ pub struct ServerSettings {
     /// URL to fetch public tracker list (configurable)
     #[serde(rename = "trackersSourceUrl", default = "default_trackers_url")]
     pub trackers_source_url: String,
+
+    /// When true (default), torrents continue seeding after download
+    /// completes, improving swarm health and download speeds from reciprocal
+    /// peers.  When false, torrents are paused once their download finishes.
+    #[serde(rename = "seedingEnabled", default = "default_seeding_enabled")]
+    pub seeding_enabled: bool,
 }
 
 pub fn default_trackers_url() -> String {
     "https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_best.txt".to_string()
+}
+
+pub fn default_seeding_enabled() -> bool {
+    true
 }
 
 pub fn default_auto_update_enabled() -> bool {
@@ -180,6 +190,7 @@ impl Default for ServerSettings {
             cached_trackers: Vec::new(),
             trackers_last_updated: 0,
             trackers_source_url: default_trackers_url(),
+            seeding_enabled: default_seeding_enabled(),
         }
     }
 }
@@ -282,7 +293,14 @@ pub async fn set_settings(
                 settings.update_check_interval_hours = hours.max(1);
             }
         }
+        if let Some(v) = obj.get("seedingEnabled") {
+            if let Some(enabled) = v.as_bool() {
+                settings.seeding_enabled = enabled;
+            }
+        }
     }
+
+    let seeding_enabled = settings.seeding_enabled;
 
     // Build new speed profile from updated settings
     let new_profile = enginefs::backend::TorrentSpeedProfile {
@@ -303,6 +321,9 @@ pub async fn set_settings(
         .download_engine
         .update_speed_profile(&new_profile)
         .await;
+
+    state.engine.set_seeding_enabled(seeding_enabled);
+    state.download_engine.set_seeding_enabled(seeding_enabled);
 
     // Save to disk
     if let Err(e) = state.save_settings().await {
@@ -327,7 +348,16 @@ pub async fn hwaccel_profiler() -> impl IntoResponse {
     }))
 }
 
+static HWACCEL_PROFILES: tokio::sync::OnceCell<Vec<String>> = tokio::sync::OnceCell::const_new();
+
 pub async fn probe_hwaccel() -> Vec<String> {
+    HWACCEL_PROFILES
+        .get_or_init(probe_hwaccel_uncached)
+        .await
+        .clone()
+}
+
+async fn probe_hwaccel_uncached() -> Vec<String> {
     let mut profiles = Vec::new();
     let output = match tokio::process::Command::new("ffmpeg")
         .args(["-hide_banner", "-encoders"])
@@ -340,30 +370,94 @@ pub async fn probe_hwaccel() -> Vec<String> {
 
     if output.contains("h264_nvenc") {
         profiles.push("nvenc".to_string());
+        if verify_h264_encoder("h264_nvenc").await {
+            profiles.push("nvenc:verified".to_string());
+        }
     }
     if output.contains("h264_vaapi") {
         profiles.push("vaapi".to_string());
+        if verify_h264_encoder("h264_vaapi").await {
+            profiles.push("vaapi:verified".to_string());
+        }
     }
     if output.contains("h264_vdpau") {
         profiles.push("vdpau".to_string());
     }
     if output.contains("h264_qsv") {
         profiles.push("qsv".to_string());
+        if verify_h264_encoder("h264_qsv").await {
+            profiles.push("qsv:verified".to_string());
+        }
     }
     if output.contains("h264_omx") {
         profiles.push("omx".to_string());
     }
     if output.contains("h264_v4l2m2m") {
         profiles.push("v4l2m2m".to_string());
+        if verify_h264_encoder("h264_v4l2m2m").await {
+            profiles.push("v4l2m2m:verified".to_string());
+        }
     }
     if output.contains("h264_videotoolbox") {
         profiles.push("videotoolbox".to_string());
+        if verify_h264_encoder("h264_videotoolbox").await {
+            profiles.push("videotoolbox:verified".to_string());
+        }
     }
     if output.contains("h264_mediacodec") {
         profiles.push("mediacodec".to_string());
     }
 
     profiles
+}
+
+async fn verify_h264_encoder(encoder: &str) -> bool {
+    let mut cmd = tokio::process::Command::new("ffmpeg");
+    cmd.args([
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=64x64:rate=1:duration=1",
+        "-frames:v",
+        "1",
+        "-an",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:v",
+        encoder,
+        "-f",
+        "null",
+        "-",
+    ]);
+
+    let output = match tokio::time::timeout(std::time::Duration::from_secs(5), cmd.output()).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(err)) => {
+            tracing::debug!(encoder, error = %err, "hardware encoder verification failed to spawn");
+            return false;
+        }
+        Err(_) => {
+            tracing::debug!(encoder, "hardware encoder verification timed out");
+            return false;
+        }
+    };
+
+    if output.status.success() {
+        tracing::info!(encoder, "hardware encoder verified");
+        true
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        tracing::warn!(
+            encoder,
+            status = ?output.status.code(),
+            stderr = %stderr.trim(),
+            "hardware encoder listed by FFmpeg but failed verification"
+        );
+        false
+    }
 }
 
 pub async fn get_https(

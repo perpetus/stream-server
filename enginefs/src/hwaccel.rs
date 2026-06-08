@@ -51,7 +51,7 @@ impl HwAccelConfig {
                 let hw_type = &p[3..];
                 match hw_type {
                     "nvenc" | "nvidia" | "cuda" => {
-                        if available.contains(&"nvenc".to_string()) {
+                        if encoder_listed(available, "nvenc") {
                             Self::nvenc()
                         } else {
                             tracing::warn!(
@@ -61,7 +61,7 @@ impl HwAccelConfig {
                         }
                     }
                     "qsv" | "intel" | "quicksync" => {
-                        if available.contains(&"qsv".to_string()) {
+                        if encoder_listed(available, "qsv") {
                             Self::qsv()
                         } else {
                             tracing::warn!(
@@ -71,7 +71,7 @@ impl HwAccelConfig {
                         }
                     }
                     "vaapi" => {
-                        if available.contains(&"vaapi".to_string()) {
+                        if encoder_listed(available, "vaapi") {
                             Self::vaapi()
                         } else {
                             tracing::warn!(
@@ -81,7 +81,7 @@ impl HwAccelConfig {
                         }
                     }
                     "videotoolbox" | "vt" | "apple" => {
-                        if available.contains(&"videotoolbox".to_string()) {
+                        if encoder_listed(available, "videotoolbox") {
                             Self::videotoolbox()
                         } else {
                             tracing::warn!(
@@ -91,7 +91,7 @@ impl HwAccelConfig {
                         }
                     }
                     "v4l2" | "v4l2m2m" => {
-                        if available.contains(&"v4l2m2m".to_string()) {
+                        if encoder_listed(available, "v4l2m2m") {
                             Self::v4l2m2m()
                         } else {
                             tracing::warn!(
@@ -115,7 +115,7 @@ impl HwAccelConfig {
             Some("auto") | None => Self::auto_select(available),
             // Accept bare hardware encoder names (nvenc, qsv, vaapi, etc.)
             Some("nvenc") | Some("nvidia") | Some("cuda") => {
-                if available.contains(&"nvenc".to_string()) {
+                if encoder_listed(available, "nvenc") {
                     Self::nvenc()
                 } else {
                     tracing::warn!("NVENC requested but not available, falling back to software");
@@ -123,7 +123,7 @@ impl HwAccelConfig {
                 }
             }
             Some("qsv") | Some("intel") | Some("quicksync") => {
-                if available.contains(&"qsv".to_string()) {
+                if encoder_listed(available, "qsv") {
                     Self::qsv()
                 } else {
                     tracing::warn!("QSV requested but not available, falling back to software");
@@ -131,7 +131,7 @@ impl HwAccelConfig {
                 }
             }
             Some("vaapi") => {
-                if available.contains(&"vaapi".to_string()) {
+                if encoder_listed(available, "vaapi") {
                     Self::vaapi()
                 } else {
                     tracing::warn!("VAAPI requested but not available, falling back to software");
@@ -139,7 +139,7 @@ impl HwAccelConfig {
                 }
             }
             Some("videotoolbox") | Some("vt") => {
-                if available.contains(&"videotoolbox".to_string()) {
+                if encoder_listed(available, "videotoolbox") {
                     Self::videotoolbox()
                 } else {
                     tracing::warn!(
@@ -149,7 +149,7 @@ impl HwAccelConfig {
                 }
             }
             Some("v4l2") | Some("v4l2m2m") => {
-                if available.contains(&"v4l2m2m".to_string()) {
+                if encoder_listed(available, "v4l2m2m") {
                     Self::v4l2m2m()
                 } else {
                     tracing::warn!("V4L2M2M requested but not available, falling back to software");
@@ -164,26 +164,41 @@ impl HwAccelConfig {
         }
     }
 
-    /// Auto-select best available encoder
-    /// Priority: nvenc > qsv > videotoolbox > vaapi > v4l2m2m > software
+    /// Auto-select best available encoder.
+    ///
+    /// The "available" list can come from `ffmpeg -encoders`, which only proves
+    /// the encoder was compiled into FFmpeg. It does not prove that the local
+    /// GPU, driver, pixel formats, or session limits can actually open it. Auto
+    /// mode therefore uses hardware only when the caller marks it as verified.
+    /// Explicit profiles such as `hw:nvenc` still opt in to listed encoders.
     fn auto_select(available: &[String]) -> Self {
-        if available.contains(&"nvenc".to_string()) {
+        if encoder_verified(available, "nvenc") {
             tracing::info!("Auto-selected NVENC hardware encoder");
             Self::nvenc()
-        } else if available.contains(&"qsv".to_string()) {
+        } else if encoder_verified(available, "qsv") {
             tracing::info!("Auto-selected Intel QSV hardware encoder");
             Self::qsv()
-        } else if available.contains(&"videotoolbox".to_string()) {
+        } else if encoder_verified(available, "videotoolbox") {
             tracing::info!("Auto-selected VideoToolbox hardware encoder");
             Self::videotoolbox()
-        } else if available.contains(&"vaapi".to_string()) {
+        } else if encoder_verified(available, "vaapi") {
             tracing::info!("Auto-selected VAAPI hardware encoder");
             Self::vaapi()
-        } else if available.contains(&"v4l2m2m".to_string()) {
+        } else if encoder_verified(available, "v4l2m2m") {
             tracing::info!("Auto-selected V4L2M2M hardware encoder");
             Self::v4l2m2m()
         } else {
-            tracing::info!("No hardware encoders available, using software (libx264)");
+            if ["nvenc", "qsv", "videotoolbox", "vaapi", "v4l2m2m"]
+                .iter()
+                .any(|encoder| encoder_listed(available, encoder))
+            {
+                tracing::info!(
+                    available = ?available,
+                    "Hardware encoders are listed but not verified for auto mode; using software (libx264)"
+                );
+            } else {
+                tracing::info!("No hardware encoders available, using software (libx264)");
+            }
             Self::software()
         }
     }
@@ -200,7 +215,7 @@ impl HwAccelConfig {
                 "-rc".into(),
                 "vbr".into(), // Variable bitrate
             ],
-            pix_fmt: None, // NVENC handles format internally
+            pix_fmt: Some("yuv420p".into()),
         }
     }
 
@@ -280,14 +295,45 @@ impl HwAccelConfig {
     }
 }
 
+fn encoder_verified(available: &[String], encoder: &str) -> bool {
+    available.iter().any(|name| {
+        let normalized = name.to_ascii_lowercase();
+        normalized == format!("{encoder}:verified")
+            || normalized == format!("{encoder}:usable")
+            || normalized == format!("{encoder}:ok")
+    })
+}
+
+fn encoder_listed(available: &[String], encoder: &str) -> bool {
+    available
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(encoder))
+        || encoder_verified(available, encoder)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_auto_select_with_nvenc() {
+    fn test_auto_select_ignores_unverified_nvenc() {
         let available = vec!["nvenc".to_string(), "qsv".to_string()];
         let config = HwAccelConfig::from_transcode_profile(&available, None);
+        assert_eq!(config.encoder, "libx264");
+    }
+
+    #[test]
+    fn test_auto_select_with_verified_nvenc() {
+        let available = vec!["nvenc:verified".to_string(), "qsv".to_string()];
+        let config = HwAccelConfig::from_transcode_profile(&available, None);
+        assert_eq!(config.encoder, "h264_nvenc");
+        assert_eq!(config.pix_fmt.as_deref(), Some("yuv420p"));
+    }
+
+    #[test]
+    fn test_explicit_nvenc_can_use_listed_encoder() {
+        let available = vec!["nvenc".to_string()];
+        let config = HwAccelConfig::from_transcode_profile(&available, Some("hw:nvenc"));
         assert_eq!(config.encoder, "h264_nvenc");
     }
 

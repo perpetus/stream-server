@@ -222,7 +222,15 @@ async fn run_server(
         log_dir.clone(),
     );
 
-    // Start Cache Cleaner
+    // Apply persisted seeding policy to engines
+    {
+        let settings = settings_arc.read().await;
+        state.engine.set_seeding_enabled(settings.seeding_enabled);
+        state
+            .download_engine
+            .set_seeding_enabled(settings.seeding_enabled);
+    }
+
     // Start Cache Cleaner
     cache_cleaner::start(Arc::new(state.clone()));
     diagnostics::start_memory_sampler(state.clone());
@@ -267,6 +275,7 @@ async fn run_server(
 
                 let settings = settings_clone.read().await.clone();
                 stats.set_auto_update_enabled(settings.auto_update_enabled);
+                stats.set_seeding_enabled(settings.seeding_enabled);
                 let update_status = updater_clone.status(settings.update_channel).await;
                 let install_enabled = matches!(
                     update_status.state,
@@ -636,9 +645,12 @@ fn main() -> anyhow::Result<()> {
                     ShutdownBehavior::ReturnOnTimeout,
                 )) {
                     Ok(Some(ShutdownSource::CtrlC)) => {
-                        // Ctrl+C should exit, not restart
-                        keep_running_clone.store(false, Ordering::Relaxed);
-                        break;
+                        // Ctrl+C should kill the entire process. We cannot
+                        // just break the loop because the main thread is
+                        // blocked inside the tao event loop (event_loop.run())
+                        // which would keep the process alive.
+                        tracing::info!("Ctrl+C in tray mode, forcing process exit");
+                        std::process::exit(0);
                     }
                     Ok(_) => {
                         // External (tray restart) or server completed — loop will
@@ -670,6 +682,7 @@ fn main() -> anyhow::Result<()> {
         let stats_item = tray_handle.stats_item;
         let update_item = tray_handle.update_item;
         let auto_update_item = tray_handle.auto_update_item;
+        let seeding_item = tray_handle.seeding_item;
         let install_update_item = tray_handle.install_update_item;
 
         event_loop.run(move |event, _, control_flow| {
@@ -690,6 +703,11 @@ fn main() -> anyhow::Result<()> {
                         if let Some(tx) = tx {
                             let _ = tx.blocking_send(());
                         }
+                    }
+                    tray::UserEvent::ToggleSeeding => {
+                        let enabled = seeding_item.is_checked();
+                        tray_stats.set_seeding_enabled(enabled);
+                        tray::trigger_seeding_toggle(enabled);
                     }
                     tray::UserEvent::ToggleAutoUpdate => {
                         let enabled = auto_update_item.is_checked();
@@ -720,6 +738,7 @@ fn main() -> anyhow::Result<()> {
                         stats_item.set_text(&stats_line);
                         update_item.set_text(&tray_stats.format_update_line());
                         auto_update_item.set_checked(tray_stats.auto_update_enabled());
+                        seeding_item.set_checked(tray_stats.seeding_enabled());
                         install_update_item.set_enabled(tray_stats.update_install_enabled());
                     }
                 },

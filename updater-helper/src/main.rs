@@ -17,7 +17,8 @@ struct ApplyPlan {
     parent_pid: u32,
     restart_command: Vec<String>,
     standalone_target: Option<PathBuf>,
-    stremio_dir: Option<PathBuf>,
+    #[serde(default)]
+    stremio_dirs: Vec<PathBuf>,
     assets: Vec<ApplyAsset>,
     allow_stop_stremio: bool,
     msi_source: Option<PathBuf>,
@@ -74,7 +75,7 @@ fn apply_update(plan_path: &Path) -> Result<()> {
     wait_for_parent_exit(plan.parent_pid, Duration::from_secs(30));
     verify_assets(&plan.assets)?;
 
-    if let Some(stremio_dir) = &plan.stremio_dir {
+    for stremio_dir in &plan.stremio_dirs {
         ensure_stremio_runtime_backup(stremio_dir)?;
     }
 

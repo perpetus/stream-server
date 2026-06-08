@@ -167,6 +167,40 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
         Ok(())
     }
 
+    async fn resume_torrent(&self) -> Result<()> {
+        let session = self.session.read().await;
+        let mut handle = session
+            .find_torrent(&self.info_hash)
+            .map_err(|e| anyhow!("Torrent not found: {}", e))?;
+        let status = handle.status();
+        if status.is_paused {
+            tracing::info!(
+                info_hash = %self.info_hash,
+                "Resuming torrent for active stream"
+            );
+            handle.resume();
+            handle.force_reannounce();
+            handle.force_dht_announce();
+        }
+        Ok(())
+    }
+
+    async fn pause_torrent(&self) -> Result<()> {
+        let session = self.session.read().await;
+        let mut handle = session
+            .find_torrent(&self.info_hash)
+            .map_err(|e| anyhow!("Torrent not found: {}", e))?;
+        let status = handle.status();
+        if !status.is_paused {
+            tracing::info!(
+                info_hash = %self.info_hash,
+                "Pausing torrent because stream is inactive"
+            );
+            handle.pause();
+        }
+        Ok(())
+    }
+
     async fn get_file_reader(
         &self,
         file_idx: usize,

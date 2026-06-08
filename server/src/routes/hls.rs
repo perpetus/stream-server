@@ -472,10 +472,16 @@ async fn get_segment(
 
     // Probe available hardware accelerators (cached in practice via the system endpoint)
     let available_hwaccels = crate::routes::system::probe_hwaccel().await;
-    let config = enginefs::hls::TranscodeConfig::with_hwaccel(
+    let mut config = enginefs::hls::TranscodeConfig::with_hwaccel(
         &available_hwaccels,
         transcode_profile.as_deref(),
     );
+    if audio_track_idx.is_none()
+        && probe.has_high_bit_depth_video()
+        && config.uses_hardware_encoder()
+    {
+        config.force_software_encoder("input video is high bit depth");
+    }
 
     // Dispatch to video or audio transcoding based on segment type
     let child = if let Some(audio_idx) = audio_track_idx {
