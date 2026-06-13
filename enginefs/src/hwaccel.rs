@@ -223,7 +223,7 @@ impl HwAccelConfig {
     pub fn qsv() -> Self {
         Self {
             encoder: "h264_qsv".into(),
-            hwaccel: Some("qsv".into()),
+            hwaccel: Some(if cfg!(target_os = "windows") { "d3d11va".into() } else { "qsv".into() }),
             device: None,
             extra_args: vec!["-preset".into(), "veryfast".into()],
             pix_fmt: None, // QSV handles format internally

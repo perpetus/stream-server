@@ -19,6 +19,7 @@ pub struct TranscodeConfig {
     pub audio_bitrate: String,          // "256k"
     pub gop_frames: u32,                // 96 frames (4s @ 24fps)
     pub hwaccel: Option<HwAccelConfig>, // Hardware acceleration config
+    pub is_high_bit_depth: bool,        // Input video has high bit depth (10-bit/12-bit)
 }
 
 impl Default for TranscodeConfig {
@@ -29,6 +30,7 @@ impl Default for TranscodeConfig {
             audio_bitrate: "256k".to_string(),
             gop_frames: 96,
             hwaccel: None, // Will be set based on transcode_profile
+            is_high_bit_depth: false,
         }
     }
 }
@@ -518,12 +520,27 @@ impl HlsEngine {
         cmd.args(["-analyzeduration", "2000000", "-probesize", "2000000"]);
 
         // Hardware acceleration INPUT flags (MUST be before -i)
-        if let Some(ref hw) = config.hwaccel {
-            if let Some(ref accel) = hw.hwaccel {
-                cmd.args(["-hwaccel", accel]);
+        // Disable hardware decoding only for native QSV decoding on high-bit-depth streams,
+        // as it is prone to driver and format compatibility crashes on Windows.
+        // Other methods like d3d11va, cuda, and vaapi are fully compatible and performant.
+        let use_hw_decoding = if let Some(ref hw) = config.hwaccel {
+            if hw.is_hardware() && config.is_high_bit_depth {
+                hw.hwaccel.as_deref() != Some("qsv")
+            } else {
+                hw.is_hardware()
             }
-            if let Some(ref device) = hw.device {
-                cmd.args(["-hwaccel_device", device]);
+        } else {
+            false
+        };
+
+        if use_hw_decoding {
+            if let Some(ref hw) = config.hwaccel {
+                if let Some(ref accel) = hw.hwaccel {
+                    cmd.args(["-hwaccel", accel]);
+                }
+                if let Some(ref device) = hw.device {
+                    cmd.args(["-hwaccel_device", device]);
+                }
             }
         }
 
@@ -593,8 +610,14 @@ impl HlsEngine {
                     filter = %filter,
                     "Configured low-impact software HLS video transcode"
                 );
-            } else if let Some(ref pix_fmt) = hw.pix_fmt {
-                cmd.arg("-pix_fmt").arg(pix_fmt);
+            } else {
+                // Hardware encoder: force a compatible 8-bit format for high bit depth inputs
+                if config.is_high_bit_depth {
+                    let pix_fmt = hw.pix_fmt.as_deref().unwrap_or("nv12");
+                    cmd.arg("-pix_fmt").arg(pix_fmt);
+                } else if let Some(ref pix_fmt) = hw.pix_fmt {
+                    cmd.arg("-pix_fmt").arg(pix_fmt);
+                }
             }
         } else {
             // Default software encoding fallback

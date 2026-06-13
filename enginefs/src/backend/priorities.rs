@@ -261,7 +261,10 @@ impl PlaybackPriorityPolicy {
                     };
                 let min_startup_pieces = MIN_STARTUP_PIECES.min(max_startup_pieces).max(1);
                 let pieces = (pieces as i32).clamp(min_startup_pieces, max_startup_pieces);
-                (pieces, pieces, 0)
+                // Keep the immediate band small so the swarm focuses bandwidth
+                // on the head pieces the player needs for its first bytes; the
+                // rest of the startup window rides in the hot band behind it.
+                (pieces.min(MAX_STARTUP_PIECES), pieces, 0)
             }
             PlaybackIntent::DirectInitial
             | PlaybackIntent::DirectSequential
@@ -725,6 +728,9 @@ mod tests {
 
         assert_eq!(decision.hot_window_pieces, 8);
         assert_eq!(decision.warm_window_pieces, 0);
+        // Immediate band stays focused on the head so the first pieces get
+        // all the bandwidth instead of the whole file downloading in parallel.
+        assert!(decision.immediate_pieces <= MAX_STARTUP_PIECES);
     }
 
     #[test]

@@ -270,6 +270,28 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 if !seeding_flag.load(Ordering::Relaxed) {
                     let read = engines_clone.read().await;
                     for (hash, engine) in read.iter() {
+                        // Never pause while anything is still streaming from this
+                        // torrent: pausing kicks all peers and the active stream
+                        // immediately resumes, creating a pause/resume war that
+                        // throttles playback.
+                        let engine_active = engine
+                            .active_streams
+                            .load(std::sync::atomic::Ordering::SeqCst)
+                            > 0;
+                        let hash_active = {
+                            let streams = active_streams_clone.read().await;
+                            streams.get(hash).copied().unwrap_or(0) > 0
+                        };
+                        let file_active = {
+                            let streams = active_file_streams_clone.read().await;
+                            streams
+                                .iter()
+                                .any(|((stream_hash, _), count)| stream_hash == hash && *count > 0)
+                        };
+                        if engine_active || hash_active || file_active {
+                            continue;
+                        }
+
                         let stats = engine.handle.stats().await;
                         if stats.stream_progress >= 1.0 && !stats.swarm_paused {
                             tracing::info!(

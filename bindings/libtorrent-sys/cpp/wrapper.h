@@ -122,6 +122,7 @@ int32_t handle_get_download_limit(TorrentHandle const &handle);
 void handle_force_recheck(TorrentHandle &handle);
 void handle_force_reannounce(TorrentHandle &handle);
 void handle_force_dht_announce(TorrentHandle &handle);
+void handle_flush_cache(TorrentHandle &handle);
 
 // Sequential/Streaming
 void handle_set_sequential_download(TorrentHandle &handle, bool enable);

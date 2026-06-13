@@ -419,6 +419,7 @@ mod ffi {
         fn handle_force_recheck(handle: Pin<&mut TorrentHandle>);
         fn handle_force_reannounce(handle: Pin<&mut TorrentHandle>);
         fn handle_force_dht_announce(handle: Pin<&mut TorrentHandle>);
+        fn handle_flush_cache(handle: Pin<&mut TorrentHandle>);
 
         // ------------------------------------------------------------------------
         // TorrentHandle - Sequential/Streaming
@@ -792,6 +793,13 @@ impl LibtorrentHandle {
     /// Force DHT announce
     pub fn force_dht_announce(&mut self) {
         ffi::handle_force_dht_announce(self.inner.pin_mut())
+    }
+
+    /// Ask libtorrent to flush its disk cache to the OS files. Verified
+    /// pieces can otherwise sit in the write cache while direct file reads
+    /// observe preallocated zeros.
+    pub fn flush_cache(&mut self) {
+        ffi::handle_flush_cache(self.inner.pin_mut())
     }
 
     /// Move storage to new path

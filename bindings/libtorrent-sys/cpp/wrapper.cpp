@@ -695,9 +695,17 @@ TorrentStatus handle_get_status(TorrentHandle const &handle) {
 // TORRENT HANDLE - CONTROL
 // ============================================================================
 
-void handle_pause(TorrentHandle &handle) { handle.handle.pause(); }
+void handle_pause(TorrentHandle &handle) {
+  // The session auto-manager resumes paused torrents that still carry the
+  // auto_managed flag, so the flag must be cleared for the pause to stick.
+  handle.handle.unset_flags(lt::torrent_flags::auto_managed);
+  handle.handle.pause();
+}
 
-void handle_resume(TorrentHandle &handle) { handle.handle.resume(); }
+void handle_resume(TorrentHandle &handle) {
+  handle.handle.set_flags(lt::torrent_flags::auto_managed);
+  handle.handle.resume();
+}
 
 void handle_set_upload_limit(TorrentHandle &handle, int32_t limit) {
   handle.handle.set_upload_limit(limit);
@@ -725,6 +733,10 @@ void handle_force_reannounce(TorrentHandle &handle) {
 
 void handle_force_dht_announce(TorrentHandle &handle) {
   handle.handle.force_dht_announce();
+}
+
+void handle_flush_cache(TorrentHandle &handle) {
+  handle.handle.flush_cache();
 }
 
 // ============================================================================

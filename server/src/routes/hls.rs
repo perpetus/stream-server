@@ -446,12 +446,20 @@ async fn get_segment(
     let port = 11470;
     let stream_url = hls_stream_url(port, &info_hash, file_idx);
 
-    // Get local file path for transcoding (HTTP seeking is unreliable)
-    let transcode_input_path = engine
-        .handle
-        .get_file_path(file_idx)
-        .await
-        .unwrap_or_else(|| stream_url.clone());
+    // Use local file path only if the file is fully downloaded.
+    // If not fully downloaded, stream via HTTP loopback to trigger piece downloading on demand.
+    let stats = engine.handle.stats().await;
+    let is_fully_downloaded = stats.files.get(file_idx).map(|f| f.progress >= 0.99).unwrap_or(false);
+
+    let transcode_input_path = if is_fully_downloaded {
+        engine
+            .handle
+            .get_file_path(file_idx)
+            .await
+            .unwrap_or_else(|| stream_url.clone())
+    } else {
+        stream_url.clone()
+    };
 
     let probe = match engine.get_probe_result(file_idx, &stream_url).await {
         Ok(p) => p,
@@ -476,15 +484,9 @@ async fn get_segment(
         &available_hwaccels,
         transcode_profile.as_deref(),
     );
-    if audio_track_idx.is_none()
-        && probe.has_high_bit_depth_video()
-        && config.uses_hardware_encoder()
-    {
-        config.force_software_encoder("input video is high bit depth");
-    }
-
+    config.is_high_bit_depth = probe.has_high_bit_depth_video();
     // Dispatch to video or audio transcoding based on segment type
-    let child = if let Some(audio_idx) = audio_track_idx {
+    let mut child = if let Some(audio_idx) = audio_track_idx {
         // Audio-only segment
         tracing::debug!(
             "Transcoding audio segment: track={}, segment={}, start={:.2}s, input={}",
@@ -512,6 +514,7 @@ async fn get_segment(
             seg_index,
             start
         );
+
         match enginefs::hls::HlsEngine::transcode_video_segment(
             &transcode_input_path,
             start,
@@ -521,9 +524,65 @@ async fn get_segment(
         .await
         {
             Ok(c) => c,
-            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+            Err(e) => {
+                if config.uses_hardware_encoder() {
+                    tracing::warn!(error = %e, "Hardware transcoding spawn failed, falling back to software");
+                    config.force_software_encoder("hardware spawn failed");
+                    match enginefs::hls::HlsEngine::transcode_video_segment(
+                        &transcode_input_path,
+                        start,
+                        duration,
+                        &config,
+                    )
+                    .await
+                    {
+                        Ok(c) => c,
+                        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+                    }
+                } else {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+                }
+            }
         }
     };
+
+    // If using hardware encoder, verify the process did not crash immediately during startup
+    if audio_track_idx.is_none() && config.uses_hardware_encoder() {
+        let mut startup_failed = false;
+        for _ in 0..10 {
+            match child.inner.try_wait() {
+                Ok(Some(status)) => {
+                    if !status.success() {
+                        startup_failed = true;
+                    }
+                    break;
+                }
+                Ok(None) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                Err(_) => {
+                    startup_failed = true;
+                    break;
+                }
+            }
+        }
+
+        if startup_failed {
+            tracing::warn!("Hardware transcoding crashed on startup, retrying with software");
+            config.force_software_encoder("hardware process crashed on startup");
+            child = match enginefs::hls::HlsEngine::transcode_video_segment(
+                &transcode_input_path,
+                start,
+                duration,
+                &config,
+            )
+            .await
+            {
+                Ok(c) => c,
+                Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+            };
+        }
+    }
 
     let stdout = match enginefs::hls::TranscodeStream::new(child) {
         Some(s) => s,
@@ -732,8 +791,12 @@ pub async fn legacy_hls_resource(
     headers: axum::http::HeaderMap,
     raw_query: axum::extract::RawQuery,
 ) -> Response {
-    let Some((info_hash, file_idx)) = legacy_pair(&first, &second) else {
+    let Some((info_hash, requested_idx)) = legacy_pair(&first, &second) else {
         return compat::unsupported("legacy file/url HLS resource");
+    };
+    let file_idx = match resolve_legacy_file_idx(&state, &info_hash, &requested_idx).await {
+        Ok(idx) => idx,
+        Err(response) => return response,
     };
 
     match resource.as_str() {
@@ -795,8 +858,12 @@ pub async fn legacy_hls_segment(
     Path((first, second, variant, seg)): Path<(String, String, String, String)>,
     raw_query: axum::extract::RawQuery,
 ) -> Response {
-    let Some((info_hash, file_idx)) = legacy_pair(&first, &second) else {
+    let Some((info_hash, requested_idx)) = legacy_pair(&first, &second) else {
         return compat::unsupported("legacy file/url HLS segment");
+    };
+    let file_idx = match resolve_legacy_file_idx(&state, &info_hash, &requested_idx).await {
+        Ok(idx) => idx,
+        Err(response) => return response,
     };
 
     if variant.starts_with("mp4stream") {
@@ -810,15 +877,36 @@ pub async fn legacy_hls_segment(
     compat::unsupported("legacy HLS segment variant")
 }
 
-fn legacy_pair(first: &str, second: &str) -> Option<(String, usize)> {
-    if compat::is_info_hash(first) {
-        second
-            .parse::<usize>()
-            .ok()
-            .map(|file_idx| (first.to_ascii_lowercase(), file_idx))
+fn legacy_pair(first: &str, second: &str) -> Option<(String, String)> {
+    if compat::is_info_hash(first) && (second == "-1" || second.parse::<usize>().is_ok()) {
+        Some((first.to_ascii_lowercase(), second.to_string()))
     } else {
         None
     }
+}
+
+/// Resolve a legacy path file index, accepting `-1` as "auto-pick the best
+/// video file". Autoplay requests the next episode with `-1` because the
+/// client does not know the file index before the torrent metadata loads.
+async fn resolve_legacy_file_idx(
+    state: &AppState,
+    info_hash: &str,
+    requested_idx: &str,
+) -> Result<usize, Response> {
+    if let Ok(idx) = requested_idx.parse::<usize>() {
+        return Ok(idx);
+    }
+
+    let engine = state.engine.get_or_add_engine(info_hash).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to load engine: {}", e),
+        )
+            .into_response()
+    })?;
+    resolve_hls_file_idx(&engine, requested_idx, "")
+        .await
+        .map_err(|err| (StatusCode::NOT_FOUND, err).into_response())
 }
 
 fn legacy_stream_playlist(resource: &str) -> bool {

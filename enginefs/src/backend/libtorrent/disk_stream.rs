@@ -4,7 +4,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::backend::priorities::{
-    PlaybackIntent, disk_backed_forward_window_pieces_for, disk_backed_sequential_download,
+    BLOCKED_REPLAN_INTERVAL_MS, PlaybackIntent, disk_backed_forward_window_pieces_for,
+    disk_backed_sequential_download,
 };
 use crate::piece_waiter::PieceWaiterRegistry;
 
@@ -28,6 +29,9 @@ pub(crate) struct LibtorrentDiskFileStream {
     last_retry_wake: Instant,
     last_wait_log: Instant,
     last_prioritized_piece: i32,
+    consecutive_waits: u32,
+    last_blocked_replan: Instant,
+    last_stall_reannounce: Instant,
 }
 
 impl LibtorrentDiskFileStream {
@@ -47,6 +51,12 @@ impl LibtorrentDiskFileStream {
         playback_intent: PlaybackIntent,
         piece_waiter: Arc<PieceWaiterRegistry>,
     ) -> Self {
+        let mut handle = handle;
+        // Pieces verified moments ago (e.g. the shared boundary piece of the
+        // previous episode) may still be in libtorrent's write cache; start a
+        // flush so direct file reads see real bytes instead of preallocated
+        // zeros.
+        handle.flush_cache();
         Self {
             handle,
             info_hash,
@@ -69,6 +79,11 @@ impl LibtorrentDiskFileStream {
                 .checked_sub(Duration::from_secs(5))
                 .unwrap_or_else(Instant::now),
             last_prioritized_piece: -1,
+            consecutive_waits: 0,
+            last_blocked_replan: Instant::now()
+                .checked_sub(Duration::from_millis(BLOCKED_REPLAN_INTERVAL_MS))
+                .unwrap_or_else(Instant::now),
+            last_stall_reannounce: Instant::now(),
         }
     }
 
@@ -158,12 +173,77 @@ impl LibtorrentDiskFileStream {
         );
     }
 
+    /// Re-assert deadlines for a blocking piece and expand the window when the
+    /// stream keeps waiting. Without this, `prioritize_from`'s
+    /// `last_prioritized_piece` guard means deadlines are set exactly once per
+    /// piece, so a choked swarm can stall the stream indefinitely with no
+    /// recovery until the player itself times out and re-requests.
+    fn escalate_blocked_piece(&mut self, piece: i32) {
+        if self.last_blocked_replan.elapsed() < Duration::from_millis(BLOCKED_REPLAN_INTERVAL_MS) {
+            return;
+        }
+        self.last_blocked_replan = Instant::now();
+
+        let priority_intent = if self.first_read_logged {
+            self.playback_intent.sequential_after_first_byte()
+        } else {
+            self.playback_intent
+        };
+        let mut forward_window =
+            disk_backed_forward_window_pieces_for(priority_intent, self.piece_length);
+        if self.consecutive_waits >= 3 {
+            forward_window = (forward_window * 2).min(63);
+        }
+
+        for p in piece..=self.last_piece.min(piece + forward_window) {
+            if !self.handle.have_piece(p) {
+                let distance = p - piece;
+                self.handle.set_piece_priority(p, 7);
+                self.handle.set_piece_deadline(p, distance * 25);
+            }
+        }
+
+        // A long stall with barely any progress usually means the current
+        // peers are choking us; announce to find fresh peers sooner.
+        if self.consecutive_waits >= 100
+            && self.last_stall_reannounce.elapsed() >= Duration::from_secs(30)
+        {
+            let status = self.handle.status();
+            if status.download_rate < 256 * 1024 {
+                self.last_stall_reannounce = Instant::now();
+                let _ = self.handle.force_reannounce();
+                let _ = self.handle.force_dht_announce();
+                tracing::info!(
+                    info_hash = %self.info_hash,
+                    file_idx = self.file_idx,
+                    piece,
+                    consecutive_waits = self.consecutive_waits,
+                    peers = status.num_peers,
+                    download_rate = status.download_rate,
+                    "disk-backed stream stalled; forcing tracker and DHT reannounce"
+                );
+            }
+        }
+
+        tracing::debug!(
+            info_hash = %self.info_hash,
+            file_idx = self.file_idx,
+            intent = ?priority_intent,
+            piece,
+            forward_window,
+            consecutive_waits = self.consecutive_waits,
+            "disk-backed blocked piece re-prioritized"
+        );
+    }
+
     fn wait_for_piece(
         &mut self,
         piece: i32,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
+        self.consecutive_waits = self.consecutive_waits.saturating_add(1);
         self.prioritize_from(piece);
+        self.escalate_blocked_piece(piece);
         self.piece_waiter
             .register(&self.info_hash, piece, self.stream_id, cx.waker().clone());
 
@@ -262,8 +342,30 @@ impl tokio::io::AsyncRead for LibtorrentDiskFileStream {
             Err(err) => return std::task::Poll::Ready(Err(err)),
         };
 
+        // A verified piece can still be in libtorrent's write cache before it
+        // reaches the OS file, in which case the preallocated region reads as
+        // zeros. No media container starts with an all-zero header, so treat
+        // zeros at the very start of the file as "not flushed yet" and wait
+        // instead of serving garbage that makes the player report an invalid
+        // file format.
+        if self.current_pos == 0
+            && !self.first_read_logged
+            && scratch[..read].iter().all(|&b| b == 0)
+        {
+            tracing::info!(
+                info_hash = %self.info_hash,
+                file_idx = self.file_idx,
+                piece,
+                read,
+                "disk-backed file head reads as zeros; waiting for disk cache flush"
+            );
+            self.handle.flush_cache();
+            return self.wait_for_piece(piece, cx);
+        }
+
         buf.put_slice(&scratch[..read]);
         self.current_pos += read as u64;
+        self.consecutive_waits = 0;
         if !self.first_read_logged {
             self.first_read_logged = true;
             tracing::info!(
