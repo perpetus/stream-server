@@ -1,5 +1,6 @@
 use crate::routes::system::ServerSettings;
 use enginefs::EngineFS;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -15,6 +16,9 @@ pub struct AppState {
     pub settings_path: PathBuf,
     pub config_dir: PathBuf,
     pub log_dir: PathBuf,
+    pub base_url: String,
+    pub http_addr: SocketAddr,
+    pub update_install_exit_enabled: bool,
     pub updater: Arc<crate::updater::UpdateManager>,
     pub local_index: LocalIndex,
     pub archive_cache: Arc<dashmap::DashMap<String, crate::archives::ArchiveSession>>,
@@ -79,6 +83,9 @@ impl AppState {
             settings_path,
             config_dir,
             log_dir,
+            base_url: "http://127.0.0.1:11470".to_string(),
+            http_addr: SocketAddr::from(([127, 0, 0, 1], 11470)),
+            update_install_exit_enabled: true,
             updater,
             local_index: LocalIndex::new(),
             archive_cache: Arc::new(dashmap::DashMap::new()),

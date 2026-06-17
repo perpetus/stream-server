@@ -20,6 +20,10 @@ Stream Server is a **fully open-source** replacement for Stremio's proprietary `
 
 **Built in Rust** for maximum performance, minimal memory footprint, and rock-solid reliability.
 
+### Projects using Stream Server
+
+* **[stremio-android](https://github.com/perpetus/stremio-android)**: A native Kotlin/Compose Stremio client app for Android that integrates `stream-server` as a local JNI library/service for high-performance torrent streaming.
+
 ---
 
 ## 🌟 Why Stream Server?

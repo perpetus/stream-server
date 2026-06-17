@@ -163,7 +163,11 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         let seeding_flag = efs.seeding_enabled.clone();
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(Duration::from_secs(60)).await;
+                // Run fairly frequently so seeding stops promptly after the
+                // user disables it; torrent removal is still gated by the much
+                // longer inactivity timeout below, so this only changes how
+                // quickly the seeding-disabled pause reacts.
+                tokio::time::sleep(Duration::from_secs(15)).await;
                 let mut to_remove = Vec::new();
                 let now = now_secs();
 
@@ -266,45 +270,49 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                     }
                 }
 
-                // Pause finished torrents when seeding is disabled
+                // Pause torrents that are only seeding when the user has seeding
+                // disabled. This is the backstop for `schedule_torrent_pause`,
+                // which can be skipped when a transient internal probe (media
+                // detection, opensub hashing) starts right as the real stream
+                // ends.
                 if !seeding_flag.load(Ordering::Relaxed) {
                     let read = engines_clone.read().await;
                     for (hash, engine) in read.iter() {
-                        // Never pause while anything is still streaming from this
-                        // torrent: pausing kicks all peers and the active stream
-                        // immediately resumes, creating a pause/resume war that
-                        // throttles playback.
-                        let engine_active = engine
-                            .active_streams
-                            .load(std::sync::atomic::Ordering::SeqCst)
-                            > 0;
-                        let hash_active = {
-                            let streams = active_streams_clone.read().await;
-                            streams.get(hash).copied().unwrap_or(0) > 0
-                        };
-                        let file_active = {
-                            let streams = active_file_streams_clone.read().await;
-                            streams
-                                .iter()
-                                .any(|((stream_hash, _), count)| stream_hash == hash && *count > 0)
-                        };
-                        if engine_active || hash_active || file_active {
+                        let stats = engine.handle.stats().await;
+                        if stats.swarm_paused {
                             continue;
                         }
 
-                        let stats = engine.handle.stats().await;
-                        if stats.stream_progress >= 1.0 && !stats.swarm_paused {
-                            tracing::info!(
+                        // Only pause a torrent that has FINISHED downloading its
+                        // wanted data and is therefore purely seeding. A torrent
+                        // that is still downloading -- or a freshly added magnet
+                        // that has not resolved metadata yet -- must stay active,
+                        // since `download_speed` can legitimately be 0 before the
+                        // first peer or metadata arrives. Pausing such a torrent
+                        // would stall the download / metadata fetch and prevent
+                        // playback from ever starting.
+                        //
+                        // Pausing a finished torrent is safe even while a stream
+                        // is open: a complete file is served straight from disk,
+                        // and the resume-gates (on_stream_start / focus_torrent /
+                        // get_file_reader / disk-stream prioritize_from) only wake
+                        // it when a read actually needs a missing piece.
+                        if !stats.has_metadata || !stats.is_finished {
+                            continue;
+                        }
+
+                        tracing::info!(
+                            info_hash = %hash,
+                            upload_speed = stats.upload_speed,
+                            download_speed = stats.download_speed,
+                            "Pausing idle torrent (seeding disabled)"
+                        );
+                        if let Err(e) = engine.handle.pause_torrent().await {
+                            tracing::warn!(
                                 info_hash = %hash,
-                                "Pausing finished torrent (seeding disabled)"
+                                error = %e,
+                                "Failed to pause idle torrent"
                             );
-                            if let Err(e) = engine.handle.pause_torrent().await {
-                                tracing::warn!(
-                                    info_hash = %hash,
-                                    error = %e,
-                                    "Failed to pause finished torrent"
-                                );
-                            }
                         }
                     }
                 }
@@ -447,13 +455,23 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         let info_hash = info_hash.to_lowercase();
         if let Some(engine) = self.get_engine(&info_hash).await {
             engine.touch();
-            if let Err(err) = engine.handle.resume_torrent().await {
-                tracing::warn!(
-                    info_hash = %info_hash,
-                    file_idx,
-                    error = %err,
-                    "Failed to resume torrent for active stream"
-                );
+            // Resume the torrent unless it has already finished downloading its
+            // wanted data. An unfinished torrent (still downloading, or a magnet
+            // still fetching metadata) MUST rejoin the swarm here or playback
+            // can never start. A finished torrent is served from disk, so when
+            // seeding is disabled we leave it paused to avoid re-seeding;
+            // get_file_reader / disk-stream still resume on demand if a later
+            // read needs a piece that turns out to be missing.
+            let needs_swarm = !engine.handle.is_finished().await;
+            if needs_swarm || self.seeding_enabled.load(Ordering::Relaxed) {
+                if let Err(err) = engine.handle.resume_torrent().await {
+                    tracing::warn!(
+                        info_hash = %info_hash,
+                        file_idx,
+                        error = %err,
+                        "Failed to resume torrent for active stream"
+                    );
+                }
             }
         }
 
@@ -737,7 +755,17 @@ impl BackendEngineFS<LibtorrentBackend> {
     /// Mark the torrent as active without pausing other active torrents.
     pub async fn focus_torrent(&self, target_info_hash: &str) {
         self.backend.set_streaming_mode(true).await;
-        self.backend.focus_torrent(target_info_hash).await;
+        // focus_torrent resumes the torrent and reannounces to the swarm. Only
+        // do that when the torrent still needs the swarm (not finished) or when
+        // seeding is enabled. A finished torrent with seeding disabled is served
+        // from disk and must stay paused so it is not re-seeded.
+        let needs_swarm = match self.get_engine(&target_info_hash.to_lowercase()).await {
+            Some(engine) => !engine.handle.is_finished().await,
+            None => false,
+        };
+        if needs_swarm || self.seeding_enabled.load(Ordering::Relaxed) {
+            self.backend.focus_torrent(target_info_hash).await;
+        }
     }
 
     /// Resume all paused torrents (called when streaming ends)

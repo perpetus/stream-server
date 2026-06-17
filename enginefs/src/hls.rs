@@ -792,12 +792,12 @@ impl HlsEngine {
     }
 }
 
-fn configure_low_impact_ffmpeg(cmd: &mut Command) {
+fn configure_low_impact_ffmpeg(_cmd: &mut Command) {
     #[cfg(windows)]
     {
         const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(BELOW_NORMAL_PRIORITY_CLASS | CREATE_NO_WINDOW);
+        _cmd.creation_flags(BELOW_NORMAL_PRIORITY_CLASS | CREATE_NO_WINDOW);
     }
 }
 

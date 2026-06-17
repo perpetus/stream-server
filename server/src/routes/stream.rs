@@ -182,7 +182,34 @@ fn content_type_for_name(name: &str) -> &'static str {
     }
 }
 
+// Refreshing the full disk list is a relatively expensive syscall sweep over
+// every mounted volume. A player fires a burst of probe requests at stream
+// start, each of which would otherwise re-run it on a tokio worker thread.
+// Free space does not change meaningfully between those, so cache the result
+// per root with a short TTL.
+static DISK_SPACE_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, (Instant, Option<u64>)>>,
+> = std::sync::OnceLock::new();
+const DISK_SPACE_CACHE_TTL: Duration = Duration::from_secs(3);
+
 fn available_space_for_path(path: &FsPath) -> Option<u64> {
+    let cache = DISK_SPACE_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    if let Ok(map) = cache.lock() {
+        if let Some((at, value)) = map.get(path) {
+            if at.elapsed() < DISK_SPACE_CACHE_TTL {
+                return *value;
+            }
+        }
+    }
+
+    let value = available_space_for_path_uncached(path);
+    if let Ok(mut map) = cache.lock() {
+        map.insert(path.to_path_buf(), (Instant::now(), value));
+    }
+    value
+}
+
+fn available_space_for_path_uncached(path: &FsPath) -> Option<u64> {
     let disks = sysinfo::Disks::new_with_refreshed_list();
     let mut best_match_len = 0usize;
     let mut best_available = None;

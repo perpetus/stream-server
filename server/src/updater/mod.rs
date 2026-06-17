@@ -214,7 +214,10 @@ impl UpdateManager {
         Ok(inner.status.clone())
     }
 
-    pub fn spawn_background_checker(self: Arc<Self>, app_state: AppState) {
+    pub fn spawn_background_checker(
+        self: Arc<Self>,
+        app_state: AppState,
+    ) -> tokio::task::JoinHandle<()> {
         crate::diagnostics::logging::spawn_logged("update-checker", async move {
             tokio::time::sleep(Duration::from_secs(30)).await;
             loop {
@@ -228,7 +231,7 @@ impl UpdateManager {
                 let interval = settings.update_check_interval_hours.max(1);
                 tokio::time::sleep(Duration::from_secs(interval.saturating_mul(3600))).await;
             }
-        });
+        })
     }
 
     async fn set_state(&self, state: UpdateOperationState, error: Option<String>) {

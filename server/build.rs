@@ -1,8 +1,3 @@
-#[cfg(target_os = "windows")]
-use chrono::{Datelike, Local};
-#[cfg(target_os = "windows")]
-use std::env;
-
 fn main() {
     if let Ok(output) = std::process::Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
@@ -14,11 +9,12 @@ fn main() {
         }
     }
 
-    #[cfg(target_os = "windows")]
-    {
-        let now = Local::now();
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if target_os == "windows" {
+        use chrono::Datelike;
+        let now = chrono::Local::now();
         let copyright = format!("Copyright © {} Perpetus", now.year());
-        let exe_name = format!("{}.exe", env::var("CARGO_PKG_NAME").unwrap());
+        let exe_name = format!("{}.exe", std::env::var("CARGO_PKG_NAME").unwrap());
 
         let mut res = winres::WindowsResource::new();
         res.set_manifest(

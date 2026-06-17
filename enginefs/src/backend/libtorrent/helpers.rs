@@ -136,6 +136,8 @@ pub(super) fn default_stats(info_hash: &str) -> EngineStats {
         swarm_connections: 0,
         swarm_paused: false,
         swarm_size: 0,
+        is_finished: false,
+        has_metadata: false,
     }
 }
 
@@ -195,5 +197,7 @@ pub(super) fn make_engine_stats(status: &TorrentStatus) -> EngineStats {
         swarm_connections: status.num_peers as u64,
         swarm_paused: status.is_paused,
         swarm_size: (status.num_complete + status.num_incomplete) as u64,
+        is_finished: status.is_finished,
+        has_metadata: status.has_metadata,
     }
 }

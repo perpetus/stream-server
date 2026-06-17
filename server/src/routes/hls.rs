@@ -25,10 +25,12 @@ fn stremio_format_name(container: &str) -> String {
     }
 }
 
-fn hls_stream_url(port: u16, info_hash: &str, file_idx: usize) -> String {
+fn hls_stream_url(base_url: &str, info_hash: &str, file_idx: usize) -> String {
     format!(
-        "http://127.0.0.1:{}/stream/{}/{}?enginefs-intent=hls",
-        port, info_hash, file_idx
+        "{}/stream/{}/{}?enginefs-intent=hls",
+        base_url.trim_end_matches('/'),
+        info_hash,
+        file_idx
     )
 }
 
@@ -72,7 +74,7 @@ pub async fn probe_by_url(
     let Some(media_url) = params.media_url.or(params.url) else {
         return (StatusCode::BAD_REQUEST, "Missing mediaURL").into_response();
     };
-    let media_url = normalize_media_url(&media_url);
+    let media_url = normalize_media_url(&media_url, &state.base_url);
     let (info_hash, requested_idx) = match compat::parse_media_url(&media_url) {
         Ok(parts) => parts,
         Err(err) => return (StatusCode::BAD_REQUEST, err).into_response(),
@@ -129,7 +131,7 @@ pub async fn master_playlist_by_url(
     let Some(media_url) = params.media_url else {
         return (StatusCode::BAD_REQUEST, "Missing mediaURL").into_response();
     };
-    let media_url = normalize_media_url(&media_url);
+    let media_url = normalize_media_url(&media_url, &state.base_url);
     let (info_hash, requested_idx) = match compat::parse_media_url(&media_url) {
         Ok(parts) => parts,
         Err(err) => return (StatusCode::BAD_REQUEST, err).into_response(),
@@ -164,15 +166,13 @@ pub async fn master_playlist_by_url(
     // Generate master playlist - use the REAL info_hash from mediaURL, not the path hash
     // This ensures subsequent stream/segment requests use the correct torrent identifier
     // Base URL for segments
-    let base_url = format!("http://127.0.0.1:11470");
-
     let query_str = raw_query.as_deref().unwrap_or("");
 
     let playlist = enginefs::hls::HlsEngine::get_master_playlist(
         &probe,
         &info_hash,
         file_idx,
-        &base_url,
+        &state.base_url,
         query_str,
         &[],
     );
@@ -209,8 +209,7 @@ pub async fn get_master_playlist(
     state.engine.on_stream_start(&info_hash, file_idx).await;
     state.engine.focus_torrent(&info_hash).await;
 
-    let port = 11470;
-    let stream_url = hls_stream_url(port, &info_hash, file_idx);
+    let stream_url = hls_stream_url(&state.base_url, &info_hash, file_idx);
 
     let probe = match engine.get_probe_result(file_idx, &stream_url).await {
         Ok(p) => p,
@@ -227,7 +226,7 @@ pub async fn get_master_playlist(
         &probe,
         &info_hash,
         file_idx,
-        &format!("http://127.0.0.1:{}", port),
+        &state.base_url,
         query_str,
         &subtitle_tracks,
     );
@@ -358,8 +357,7 @@ async fn get_stream_playlist(
         }
     };
 
-    let port = 11470;
-    let stream_url = hls_stream_url(port, &info_hash, file_idx);
+    let stream_url = hls_stream_url(&state.base_url, &info_hash, file_idx);
     let probe = match engine.get_probe_result(file_idx, &stream_url).await {
         Ok(p) => p,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -443,13 +441,16 @@ async fn get_segment(
         }
     };
 
-    let port = 11470;
-    let stream_url = hls_stream_url(port, &info_hash, file_idx);
+    let stream_url = hls_stream_url(&state.base_url, &info_hash, file_idx);
 
     // Use local file path only if the file is fully downloaded.
     // If not fully downloaded, stream via HTTP loopback to trigger piece downloading on demand.
     let stats = engine.handle.stats().await;
-    let is_fully_downloaded = stats.files.get(file_idx).map(|f| f.progress >= 0.99).unwrap_or(false);
+    let is_fully_downloaded = stats
+        .files
+        .get(file_idx)
+        .map(|f| f.progress >= 0.99)
+        .unwrap_or(false);
 
     let transcode_input_path = if is_fully_downloaded {
         engine
@@ -537,7 +538,10 @@ async fn get_segment(
                     .await
                     {
                         Ok(c) => c,
-                        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+                        Err(e) => {
+                            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+                                .into_response();
+                        }
                     }
                 } else {
                     return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
@@ -579,7 +583,9 @@ async fn get_segment(
             .await
             {
                 Ok(c) => c,
-                Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+                Err(e) => {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+                }
             };
         }
     }
@@ -623,8 +629,7 @@ pub async fn get_probe(
         None => return (StatusCode::NOT_FOUND, "Engine not found").into_response(),
     };
 
-    let port = 11470;
-    let stream_url = hls_stream_url(port, &info_hash, file_idx);
+    let stream_url = hls_stream_url(&state.base_url, &info_hash, file_idx);
     let probe = match engine.get_probe_result(file_idx, &stream_url).await {
         Ok(p) => p,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -632,9 +637,9 @@ pub async fn get_probe(
     Json(probe).into_response()
 }
 
-fn normalize_media_url(media_url: &str) -> String {
+fn normalize_media_url(media_url: &str, base_url: &str) -> String {
     if media_url.starts_with('/') {
-        format!("{}{}", compat::LOCAL_BASE_URL, media_url)
+        format!("{}{}", base_url.trim_end_matches('/'), media_url)
     } else {
         media_url.trim_end_matches('?').to_string()
     }
@@ -673,7 +678,7 @@ pub async fn get_tracks_by_url(State(state): State<AppState>, Path(url): Path<St
             None => return (StatusCode::NOT_FOUND, "Engine not found").into_response(),
         };
 
-        let stream_url = hls_stream_url(11470, &info_hash, file_idx);
+        let stream_url = hls_stream_url(&state.base_url, &info_hash, file_idx);
         let probe = match engine.get_probe_result(file_idx, &stream_url).await {
             Ok(probe) => probe,
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -681,7 +686,7 @@ pub async fn get_tracks_by_url(State(state): State<AppState>, Path(url): Path<St
         return Json(probe.streams).into_response();
     }
 
-    let media_url = normalize_media_url(&decoded);
+    let media_url = normalize_media_url(&decoded, &state.base_url);
     let (info_hash, requested_idx) = match compat::parse_media_url(&media_url) {
         Ok(parts) => parts,
         Err(err) => {
@@ -897,13 +902,17 @@ async fn resolve_legacy_file_idx(
         return Ok(idx);
     }
 
-    let engine = state.engine.get_or_add_engine(info_hash).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to load engine: {}", e),
-        )
-            .into_response()
-    })?;
+    let engine = state
+        .engine
+        .get_or_add_engine(info_hash)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to load engine: {}", e),
+            )
+                .into_response()
+        })?;
     resolve_hls_file_idx(&engine, requested_idx, "")
         .await
         .map_err(|err| (StatusCode::NOT_FOUND, err).into_response())

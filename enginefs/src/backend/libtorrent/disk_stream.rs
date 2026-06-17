@@ -115,16 +115,22 @@ impl LibtorrentDiskFileStream {
         }
 
         self.handle.set_file_priority(self.file_idx as i32, 7);
-        let status = self.handle.status();
-        if status.is_paused {
-            tracing::info!(
-                info_hash = %self.info_hash,
-                file_idx = self.file_idx,
-                "disk-backed download was paused while active; resuming torrent"
-            );
-            self.handle.resume();
-            let _ = self.handle.force_reannounce();
-            let _ = self.handle.force_dht_announce();
+        // Only rejoin the swarm when the piece we are about to serve is actually
+        // missing. Re-reading an already-downloaded piece must not resume a
+        // torrent that the seeding-disabled policy paused, or playback of a
+        // complete file would keep waking it back into seeding.
+        if !self.handle.have_piece(piece) {
+            let status = self.handle.status();
+            if status.is_paused {
+                tracing::info!(
+                    info_hash = %self.info_hash,
+                    file_idx = self.file_idx,
+                    "disk-backed download was paused while active; resuming torrent"
+                );
+                self.handle.resume();
+                let _ = self.handle.force_reannounce();
+                let _ = self.handle.force_dht_announce();
+            }
         }
 
         if self.last_prioritized_piece == piece {

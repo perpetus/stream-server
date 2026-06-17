@@ -2,10 +2,10 @@ use crate::local_addon::index::{IndexItem, LocalIndex};
 use crate::local_addon::parser::parse_filename;
 use crate::local_addon::resolver::resolve_imdb;
 use reqwest::Client;
-use tokio::task;
+use tokio::task::{self, JoinHandle};
 use walkdir::WalkDir;
 
-pub async fn scan_background(root: String, index: LocalIndex) {
+pub fn scan_background(root: String, index: LocalIndex) -> JoinHandle<()> {
     let root_path = root.clone();
     let index_ref = index.clone();
 
@@ -129,5 +129,5 @@ pub async fn scan_background(root: String, index: LocalIndex) {
             }
         }
         tracing::info!("Local Addon: Scan complete.");
-    });
+    })
 }

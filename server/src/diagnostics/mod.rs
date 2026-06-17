@@ -158,7 +158,7 @@ fn disk_tree_stats(root: &std::path::Path) -> (u64, u64) {
     (bytes, files)
 }
 
-pub fn start_memory_sampler(state: AppState) {
+pub fn start_memory_sampler(state: AppState) -> tokio::task::JoinHandle<()> {
     logging::spawn_logged("memory-sampler", async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
         let mut last_snapshot_log = Instant::now()
@@ -207,7 +207,7 @@ pub fn start_memory_sampler(state: AppState) {
                 last_rss = rss;
             }
         }
-    });
+    })
 }
 
 pub async fn memory(

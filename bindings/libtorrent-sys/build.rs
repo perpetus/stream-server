@@ -26,12 +26,16 @@ fn main() {
         // These are critical for both Windows and Linux to avoid linker errors
         build.define("TORRENT_LINKING_STATIC", None);
         build.define("BOOST_ASIO_STATIC_LINK", None);
-        build.define("BOOST_ASIO_SEPARATE_COMPILATION", None);
+
+        let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+        if target_os != "android" {
+            build.define("BOOST_ASIO_SEPARATE_COMPILATION", None);
+        }
     }
 
     build.define("TORRENT_USE_OPENSSL", None);
 
-    if cfg!(target_os = "windows") {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         build.flag_if_supported("/std:c++17");
         build.flag("/Zc:__cplusplus"); // Force correct C++ version
         build.flag_if_supported("/EHsc"); // Enable C++ exceptions
@@ -71,7 +75,8 @@ fn find_libtorrent() -> (Vec<std::path::PathBuf>, bool) {
 
     // Configure vcpkg crate
     let triplet_env = std::env::var("VCPKGRS_TRIPLET").ok();
-    let default_triplet = if cfg!(target_os = "windows") {
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let default_triplet = if target_os == "windows" {
         "x64-windows-static"
     } else {
         "x64-linux"
@@ -110,7 +115,7 @@ fn find_libtorrent() -> (Vec<std::path::PathBuf>, bool) {
                 println!("cargo:rustc-link-search=native={}", lib_path.display());
                 println!("cargo:rustc-link-lib=static=torrent-rasterbar");
                 // On Windows, we also need to link with some system libs for boost/vcpkg
-                if cfg!(target_os = "windows") {
+                if target_os == "windows" {
                     println!("cargo:rustc-link-lib=static=libssl");
                     println!("cargo:rustc-link-lib=static=libcrypto");
                     println!("cargo:rustc-link-lib=crypt32");

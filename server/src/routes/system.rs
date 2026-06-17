@@ -200,7 +200,7 @@ impl Default for ServerSettings {
 pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
     let settings = state.settings.read().await;
     Json(json!({
-        "baseUrl": "http://127.0.0.1:11470",
+        "baseUrl": state.base_url.clone(),
         "options": [],
         "values": settings.clone()
     }))
@@ -555,7 +555,7 @@ pub async fn get_https(
     Json(json!({
         "ipAddress": ip_address,
         "domain": domain,
-        "port": 11470 // Default port
+        "port": state.http_addr.port()
     }))
     .into_response()
 }

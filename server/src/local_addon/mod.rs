@@ -230,7 +230,8 @@ async fn handle_stream(
                     if let Some((archive_path, internal_path)) = content.split_once('|') {
                         // Use /zip/stream generic endpoint (works for all supported types via factory)
                         let url = format!(
-                            "http://127.0.0.1:11470/zip/stream?archive={}&file={}",
+                            "{}/zip/stream?archive={}&file={}",
+                            state.base_url,
                             urlencoding::encode(archive_path),
                             urlencoding::encode(internal_path)
                         );

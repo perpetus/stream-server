@@ -97,7 +97,9 @@ async fn install(
     let request = payload.map(|Json(payload)| payload).unwrap_or_default();
     match state.updater.install_update(&state, request.force).await {
         Ok(status) => {
-            schedule_process_exit_for_update();
+            if state.update_install_exit_enabled {
+                schedule_process_exit_for_update();
+            }
             Json(status).into_response()
         }
         Err(err) => update_error(err),

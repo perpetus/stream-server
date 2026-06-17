@@ -4,5 +4,11 @@
     "dependencies": [
         "libtorrent"
     ],
-    "builtin-baseline": "84bab45d415d22042bd0b9081aea57f362da3f35"
+    "builtin-baseline": "58613d018f126ccaa9dac9a02b11142cb0f4f4ea",
+    "overrides": [
+        {
+            "name": "libtorrent",
+            "version": "2.0.13"
+        }
+    ]
 }

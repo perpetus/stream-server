@@ -128,10 +128,13 @@ fn find_include_paths() -> Vec<PathBuf> {
 }
 
 fn main() {
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let is_windows = target_os == "windows";
+
     let mut extra_includes = Vec::new();
 
     // Attempt to locate libclang on Windows if not set
-    if cfg!(target_os = "windows") {
+    if is_windows {
         if let Some(path) = find_llvm_path() {
             println!("cargo:rustc-env=LIBCLANG_PATH={}", path.display());
             unsafe {
@@ -173,8 +176,7 @@ fn main() {
         PathBuf::from("src"),             // Add src for cpp/wrappers.hpp
     ];
 
-    // Core C++ files needed for 7z Format (Decoders + 7z handler)
-    // This is a minimal set; we might need to add more as linker errors appear.
+    // Core C++ files needed for 7z Format
     let mut files = vec![
         // Common
         root.join("Common/IntToString.cpp"),
@@ -187,7 +189,6 @@ fn main() {
         root.join("Common/StringToInt.cpp"),
         root.join("Common/UTFConvert.cpp"),
         root.join("Common/MyWindows.cpp"), // Needed for SysAllocStringLen on Linux
-        // root.join("Common/CRC.cpp"), // Likely redundant if we include C/7zCrc.c or 7zip/Common/CrcReg.cpp
         root.join("Windows/PropVariant.cpp"),
         root.join("Windows/PropVariantConv.cpp"),
         root.join("Windows/System.cpp"),
@@ -224,8 +225,6 @@ fn main() {
         root.join("7zip/Common/UniqBlocks.cpp"),
         root.join("7zip/Common/VirtThread.cpp"),
         // Archive Common
-        // root.join("7zip/Archive/Common/ParseProperties.cpp"), // Not needed for extraction
-        // root.join("7zip/Archive/Common/OutStreamWithCRC.cpp"), // Not needed for extraction
         root.join("7zip/Archive/Common/HandlerOut.cpp"), // Needed for SetCommonProperty
         root.join("7zip/Archive/Common/CoderMixer2.cpp"),
         // 7z Archive Support (Extraction only)
@@ -233,32 +232,13 @@ fn main() {
         root.join("7zip/Archive/7z/7zExtract.cpp"),
         root.join("7zip/Archive/7z/7zFolderInStream.cpp"),
         root.join("7zip/Archive/7z/7zHandler.cpp"),
-        // root.join("7zip/Archive/7z/7zHandlerOut.cpp"), // Not needed for extraction
         root.join("7zip/Archive/7z/7zHeader.cpp"),
         root.join("7zip/Archive/7z/7zIn.cpp"),
         root.join("7zip/Archive/7z/7zRegister.cpp"),
         root.join("7zip/Archive/7z/7zSpecStream.cpp"),
         root.join("7zip/Archive/7z/7zProperties.cpp"),
-        // root.join("7zip/Archive/7z/7zUpdate.cpp"), // Not needed for extraction
-
-        // root.join("7zip/Archive/7z/7zOut.cpp"), // Not needed for extraction
-        // root.join("7zip/Archive/7z/7zEncode.cpp"), // Not needed for extraction
-
-        // Compress/Codecs (Needed for extraction)
-        // This is tricky. 7z uses a dynamic codec registration.
-        // We might need to include specific codec files or link against a bigger library.
-        // For now, let's include basic ones.
-        // COPY, LZMA, LZMA2, BCJ, BCJ2, ARM, AES, etc.
-        // NOTE: These are often in C directory outside CPP?
-        // 7-Zip mixes C and C++.
     ];
 
-    // We also need C files from C directory?
-    // Usually 7-Zip wraps C code.
-    // The "unity build" approach of `7z.dll` project file is usually the reference.
-
-    // For now, let's start with our wrappers and see what links.
-    // files.push(PathBuf::from("src/cpp/stream.cpp")); // Moved to autocxx build
     files.push(PathBuf::from("src/cpp/guids.cpp"));
 
     let mut builder = cc::Build::new();
@@ -268,21 +248,25 @@ fn main() {
         .std("c++17")
         .includes(&includes)
         .files(files)
-        .define("_7ZIP_ST", None) // Single Threaded strictly (simplifies things)
+        .define("_7ZIP_ST", None) // Single Threaded strictly
         .define("Z7_EXTRACT_ONLY", None) // Exclude encoding functionality
         .define("_REENTRANT", None);
 
-    if cfg!(target_os = "windows") {
+    if is_windows {
         builder.define("ENV_MSVC", None);
         builder.flag_if_supported("/EHsc");
     } else {
         builder.define("ENV_UNIX", None);
         builder.define("_POSIX", None);
+        // Suppress warnings from 7zip vendor code
+        builder.flag_if_supported("-Wno-inconsistent-missing-override");
+        // 7zip C files (.c) are compiled as C++ intentionally — suppress deprecation warning
+        builder.flag_if_supported("-Wno-deprecated");
     }
 
     builder.compile("sevenz_cpp");
 
-    if cfg!(target_os = "windows") {
+    if is_windows {
         println!("cargo:rustc-link-lib=dylib=ole32");
         println!("cargo:rustc-link-lib=dylib=oleaut32");
         println!("cargo:rustc-link-lib=dylib=user32");
@@ -290,17 +274,55 @@ fn main() {
     }
 
     // Autocxx
-    // Add explicitly found includes
-    let extra_includes_refs: Vec<&str> = extra_includes.iter().map(|s| s.as_str()).collect();
+    let mut clang_args = extra_includes;
+
+    if target_os == "android" {
+        if let Ok(target) = env::var("TARGET") {
+            clang_args.push(format!("--target={}", target));
+        }
+        if let Ok(ndk) = env::var("ANDROID_NDK_HOME").or_else(|_| env::var("ANDROID_NDK_ROOT")) {
+            let host_tag = if cfg!(target_os = "windows") {
+                "windows-x86_64"
+            } else if cfg!(target_os = "macos") {
+                "darwin-x86_64"
+            } else {
+                "linux-x86_64"
+            };
+            let sysroot = format!("{}/toolchains/llvm/prebuilt/{}/sysroot", ndk, host_tag);
+            clang_args.push(format!("--sysroot={}", sysroot));
+
+            // Find clang's builtin header dir in NDK
+            let clang_dir = PathBuf::from(&ndk)
+                .join("toolchains")
+                .join("llvm")
+                .join("prebuilt")
+                .join(host_tag)
+                .join("lib")
+                .join("clang");
+            if let Ok(entries) = std::fs::read_dir(&clang_dir) {
+                for entry in entries.filter_map(Result::ok) {
+                    let include_path = entry.path().join("include");
+                    if include_path.join("stddef.h").exists() {
+                        clang_args.push(format!("-isystem{}", include_path.display()));
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    let clang_args_refs: Vec<&str> = clang_args.iter().map(|s| s.as_str()).collect();
 
     let mut b = autocxx_build::Builder::new("src/ffi.rs", &includes)
-        .extra_clang_args(&extra_includes_refs)
+        .extra_clang_args(&clang_args_refs)
         .build()
         .expect("autocxx failed");
 
     b.flag_if_supported("-std=c++17");
+    // Suppress warnings from 7zip vendor code (macros expand without 'override')
+    b.flag_if_supported("-Wno-inconsistent-missing-override");
 
-    if cfg!(target_os = "windows") {
+    if is_windows {
         b.flag_if_supported("/EHsc");
     }
 

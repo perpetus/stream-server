@@ -95,13 +95,24 @@ Rijndael::Rijndael()
 }
 
 
+#if defined(USE_SSE) && defined(__GNUC__) && !defined(_MSC_VER)
+static inline void __cpuid(int CPUInfo[4], int InfoType) {
+    __asm__ __volatile__ (
+        "cpuid"
+        : "=a" (CPUInfo[0]), "=b" (CPUInfo[1]), "=c" (CPUInfo[2]), "=d" (CPUInfo[3])
+        : "a" (InfoType), "c" (0)
+    );
+}
+#endif
+
+
 void Rijndael::Init(bool Encrypt,const byte *key,uint keyLen,const byte * initVector)
 {
   // Check SIMD here instead of constructor, so if object is a part of some
   // structure memset'ed before use, these variables are not lost.
 #if defined(USE_SSE)
 
-#ifdef _MSC_VER
+#if defined(_MSC_VER) || defined(__ANDROID__)
   int CPUInfo[4];
   __cpuid(CPUInfo, 0);
   if (CPUInfo[0]>=1) // Check the maximum supported cpuid function.

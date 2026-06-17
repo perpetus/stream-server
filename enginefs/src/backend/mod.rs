@@ -43,6 +43,13 @@ pub trait TorrentHandle: Send + Sync + Clone {
 
     async fn stats(&self) -> EngineStats;
     async fn add_trackers(&self, trackers: Vec<String>) -> Result<()>;
+    /// Cheap check for whether the torrent has finished downloading its wanted
+    /// data. Unlike `stats()`, this must not rebuild the full statistics or walk
+    /// every piece -- it is called on the hot stream-start path. Defaults to
+    /// `false` (treat as still needing the swarm) for backends that cannot tell.
+    async fn is_finished(&self) -> bool {
+        false
+    }
     /// Resume torrent activity after an idle pause.
     async fn resume_torrent(&self) -> Result<()> {
         Ok(())
@@ -326,4 +333,11 @@ pub struct EngineStats {
     pub swarm_connections: u64,
     pub swarm_paused: bool,
     pub swarm_size: u64,
+    /// All wanted pieces are downloaded (libtorrent `is_finished`). A finished
+    /// torrent is only seeding and can be paused; an unfinished one still needs
+    /// the swarm to download data or fetch metadata.
+    pub is_finished: bool,
+    /// Torrent metadata is available (false for a freshly added magnet that is
+    /// still resolving its info dictionary).
+    pub has_metadata: bool,
 }

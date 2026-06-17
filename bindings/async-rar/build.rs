@@ -105,10 +105,7 @@ fn find_include_paths() -> Vec<PathBuf> {
     }
 
     if let Some(p) = msvc_path {
-        // println!("cargo:warning=Found MSVC includes at: {:?}", p);
         includes.push(p);
-    } else {
-        // println!("cargo:warning=Could not find MSVC includes (checked standard paths)");
     }
 
     // 2. Find Windows SDK Includes
@@ -121,7 +118,6 @@ fn find_include_paths() -> Vec<PathBuf> {
     for sdk_root in sdk_roots {
         if let Ok(entries) = std::fs::read_dir(&sdk_root) {
             // Find latest version that actually contains required headers.
-            // Some SDK versions (e.g. 10.0.28000.0) may be incomplete.
             let mut candidates: Vec<PathBuf> = entries
                 .filter_map(Result::ok)
                 .filter(|e| e.path().is_dir())
@@ -155,10 +151,16 @@ fn find_include_paths() -> Vec<PathBuf> {
 }
 
 fn main() {
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let is_windows = target_os == "windows";
+    let is_macos = target_os == "macos";
+    let is_linux = target_os == "linux";
+    let is_android = target_os == "android";
+
     let mut extra_includes = Vec::new();
 
     // Attempt to locate libclang on Windows if not set
-    if cfg!(target_os = "windows") {
+    if is_windows {
         if let Some(path) = find_llvm_path() {
             println!("cargo:rustc-env=LIBCLANG_PATH={}", path.display());
             unsafe {
@@ -176,17 +178,12 @@ fn main() {
                 args.push_str(&format!("-I\"{}\" ", p));
             }
             if !args.is_empty() {
-                // println!("cargo:warning=Setting BINDGEN_EXTRA_CLANG_ARGS: {}", args);
                 println!("cargo:rustc-env=BINDGEN_EXTRA_CLANG_ARGS={}", args);
                 // Also set env var for current process (autocxx build)
                 unsafe {
                     env::set_var("BINDGEN_EXTRA_CLANG_ARGS", args);
                 }
-            } else {
-                // println!("cargo:warning=No include paths found!");
             }
-        } else {
-            // println!("cargo:warning=INCLUDE env var is set: {:?}", env::var("INCLUDE"));
         }
     }
 
@@ -200,8 +197,6 @@ fn main() {
     }
 
     // Collect all C++ source files
-    // Note: UnRAR uses #include for some .cpp files, so we exclude those that are
-    // included by other files to avoid duplicate symbol errors.
     let mut cpp_files: Vec<PathBuf> = glob::glob("vendor/unrar/*.cpp")
         .expect("Failed to read glob pattern")
         .filter_map(Result::ok)
@@ -247,12 +242,12 @@ fn main() {
             }
 
             // Platform-specific exclusions
-            if cfg!(windows) && matches!(name, "ulinks.cpp" | "uowners.cpp") {
+            if is_windows && matches!(name, "ulinks.cpp" | "uowners.cpp") {
                 return false;
             }
 
             // Unix: exclude threading files (CRITSECT_HANDLE not defined without RAR_SMP)
-            if cfg!(not(windows))
+            if !is_windows
                 && matches!(
                     name,
                     "threadmisc.cpp" | "threadpool.cpp" | "motw.cpp" | "isnt.cpp"
@@ -278,18 +273,14 @@ fn main() {
         .define("SILENT", None); // Disable console output
 
     // Platform-specific settings
-    #[cfg(target_os = "windows")]
-    {
+    if is_windows {
         cc_build
             .define("_WIN_ALL", None)
             .flag("/std:c++17")
             .flag("/EHsc") // Enable C++ exceptions
             // Force include rar.hpp - UnRAR uses precompiled headers
             .flag("/FIrar.hpp");
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
+    } else {
         cc_build
             .flag("-std=c++17")
             .flag("-fPIC")
@@ -306,53 +297,93 @@ fn main() {
             .flag("-Wno-switch")
             .flag("-Wno-unused-but-set-variable")
             .flag("-Wno-misleading-indentation")
-            .flag("-Wno-catch-value")
-            .flag("-Wno-class-memaccess")
+            .flag_if_supported("-Wno-catch-value")
+            .flag_if_supported("-Wno-class-memaccess")
             .flag("-Wno-comment")
             .flag("-Wno-extra");
 
-        #[cfg(target_os = "macos")]
-        {
+        if is_macos {
             cc_build.define("_APPLE", None);
         }
 
-        #[cfg(target_os = "linux")]
-        {
+        if is_linux {
             cc_build.define("_UNIX", None);
         }
+        // Note: for Android, _UNIX is already defined by raros.hpp when __ANDROID__ is set
     }
 
     cc_build.compile("unrar");
 
     // Generate autocxx bindings
-    let mut clang_args = vec!["-DRARDLL", "-DSILENT"];
+    let mut clang_args = vec!["-DRARDLL".to_string(), "-DSILENT".to_string()];
 
-    #[cfg(target_os = "windows")]
-    clang_args.extend(&["-D_WIN_ALL", "-std=c++17"]);
+    if is_windows {
+        clang_args.extend(vec!["-D_WIN_ALL".to_string(), "-std=c++17".to_string()]);
+    }
+    if is_macos {
+        clang_args.extend(vec!["-D_APPLE".to_string(), "-std=c++17".to_string()]);
+    }
+    if is_linux {
+        clang_args.extend(vec!["-D_UNIX".to_string(), "-std=c++17".to_string()]);
+    }
+    if is_android {
+        // Don't define _UNIX for Android - raros.hpp already defines it when __ANDROID__ is set
+        clang_args.push("-std=c++17".to_string());
 
-    #[cfg(target_os = "macos")]
-    clang_args.extend(&["-D_APPLE", "-std=c++17"]);
+        if let Ok(target) = env::var("TARGET") {
+            clang_args.push(format!("--target={}", target));
+        }
+        if let Ok(ndk) = env::var("ANDROID_NDK_HOME").or_else(|_| env::var("ANDROID_NDK_ROOT")) {
+            let host_tag = if cfg!(target_os = "windows") {
+                "windows-x86_64"
+            } else if cfg!(target_os = "macos") {
+                "darwin-x86_64"
+            } else {
+                "linux-x86_64"
+            };
+            let sysroot = format!("{}/toolchains/llvm/prebuilt/{}/sysroot", ndk, host_tag);
+            clang_args.push(format!("--sysroot={}", sysroot));
 
-    #[cfg(target_os = "linux")]
-    clang_args.extend(&["-D_UNIX", "-std=c++17"]);
+            // Find clang's builtin header dir in NDK
+            let clang_dir = PathBuf::from(&ndk)
+                .join("toolchains")
+                .join("llvm")
+                .join("prebuilt")
+                .join(host_tag)
+                .join("lib")
+                .join("clang");
+            if let Ok(entries) = std::fs::read_dir(&clang_dir) {
+                for entry in entries.filter_map(Result::ok) {
+                    let include_path = entry.path().join("include");
+                    if include_path.join("stddef.h").exists() {
+                        clang_args.push(format!("-isystem{}", include_path.display()));
+                        break;
+                    }
+                }
+            }
+        }
+    }
 
     // Add explicitly found includes
-    let extra_includes_refs: Vec<&str> = extra_includes.iter().map(|s| s.as_str()).collect();
-    clang_args.extend(extra_includes_refs);
+    for inc in extra_includes {
+        clang_args.push(inc);
+    }
+
+    let clang_args_refs: Vec<&str> = clang_args.iter().map(|s| s.as_str()).collect();
 
     let mut b = autocxx_build::Builder::new(
         "src/ffi.rs",
         &[unrar_src.as_path(), PathBuf::from("src/cpp").as_path()],
     )
-    .extra_clang_args(&clang_args)
+    .extra_clang_args(&clang_args_refs)
     .build()
     .expect("Failed to generate autocxx bindings");
 
-    #[cfg(target_os = "windows")]
-    b.flag("/std:c++17");
-
-    #[cfg(not(target_os = "windows"))]
-    b.flag("-std=c++17");
+    if is_windows {
+        b.flag("/std:c++17");
+    } else {
+        b.flag("-std=c++17");
+    }
 
     b.compile("async-rar-autocxx");
 

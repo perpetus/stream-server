@@ -2,12 +2,13 @@ use crate::state::AppState;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
 
-pub fn start(state: Arc<AppState>) {
+pub fn start(state: Arc<AppState>) -> JoinHandle<()> {
     tokio::spawn(async move {
         debug!("Cache cleaner started");
 
@@ -98,7 +99,7 @@ pub fn start(state: Arc<AppState>) {
                 }
             }
         }
-    });
+    })
 }
 
 async fn clean_cache(state: &Arc<AppState>) -> anyhow::Result<()> {
