@@ -703,7 +703,13 @@ void handle_pause(TorrentHandle &handle) {
 }
 
 void handle_resume(TorrentHandle &handle) {
-  handle.handle.set_flags(lt::torrent_flags::auto_managed);
+  // Keep the torrent MANUALLY managed while running. Re-arming auto_managed
+  // here lets libtorrent's queue manager immediately re-pause a torrent it
+  // considers a finished seed (e.g. only the already-watched files are wanted),
+  // which races our explicit resume and leaves the torrent paused with zero
+  // peers so a newly-requested file never starts downloading. With the flag
+  // cleared the torrent stays running until we explicitly pause it again.
+  handle.handle.unset_flags(lt::torrent_flags::auto_managed);
   handle.handle.resume();
 }
 

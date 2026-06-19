@@ -562,9 +562,16 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         let engines = self.engines.clone();
         let active_streams = self.active_streams.clone();
         let active_file_streams = self.active_file_streams.clone();
+        let seeding_enabled = self.seeding_enabled.clone();
 
         tokio::spawn(async move {
             tokio::time::sleep(INACTIVE_TORRENT_PAUSE_GRACE).await;
+
+            // Pausing only matters for the seeding-disabled policy. When seeding
+            // is enabled we never pause here.
+            if seeding_enabled.load(Ordering::Relaxed) {
+                return;
+            }
 
             let hash_active = {
                 let streams = active_streams.read().await;
@@ -592,6 +599,12 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             };
             if let Some(engine) = engine {
                 engine.touch();
+                // Only pause a FINISHED torrent (purely seeding). Pausing one
+                // that is still downloading would kick its peers and stall the
+                // download the user is about to resume.
+                if !engine.handle.is_finished().await {
+                    return;
+                }
                 if let Err(err) = engine.handle.pause_torrent().await {
                     tracing::warn!(
                         info_hash = %info_hash,
