@@ -55,6 +55,12 @@ jobs:
           VCPKG_INSTALLED_DIR: ${{ github.workspace }}/vcpkg_installed
           VCPKG_DEFAULT_TRIPLET: x64-windows-static-release
           VCPKG_OVERLAY_TRIPLETS: ${{ github.workspace }}/triplets
+          # libtorrent 2.0.13 is not yet packaged in vcpkg's registry (still on
+          # 2.0.11 as of the pinned vcpkgGitCommitId, and at vcpkg's HEAD too).
+          # vcpkg-overlays/libtorrent carries the patched port (verified
+          # SHA512 against the real arvidn/libtorrent v2.0.13 release tarball)
+          # so CI builds the same version used in local development.
+          VCPKG_OVERLAY_PORTS: ${{ github.workspace }}/vcpkg-overlays
 
       - name: Cargo Chef Prepare
         run: cargo chef prepare --recipe-path recipe.json
