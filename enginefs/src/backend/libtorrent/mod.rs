@@ -671,6 +671,13 @@ impl TorrentBackend for LibtorrentBackend {
             }
         };
 
+        // Newly added torrents are no longer auto_managed (see
+        // session_add_magnet), so nothing implicitly starts them anymore --
+        // we now own that responsibility. Without this, force_reannounce/
+        // force_dht_announce below are issued against a torrent that was
+        // never actually started, and metadata never arrives.
+        handle.resume();
+
         // Instant Loading Part 2: Tracker Injection & Force Reannounce
         let mut final_trackers: Vec<String> = trackers.clone();
         for &t in DEFAULT_TRACKERS {

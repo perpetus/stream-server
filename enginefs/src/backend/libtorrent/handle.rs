@@ -21,6 +21,12 @@ use super::disk_stream::LibtorrentDiskFileStream;
 use super::helpers::{default_stats, make_engine_stats};
 use super::stream::LibtorrentFileStream;
 
+/// Upload rate (bytes/sec) a finished, idle torrent is clamped to when seeding
+/// is disabled. A trickle rather than zero (0 means "unlimited" in libtorrent),
+/// low enough to count as "seeding off" while keeping peers connected so the
+/// next episode downloads instantly.
+const SEEDING_THROTTLE_UPLOAD_LIMIT: i32 = 1024;
+
 /// Handle to a torrent managed by libtorrent
 #[derive(Clone)]
 pub struct LibtorrentTorrentHandle {
@@ -209,6 +215,25 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
         Ok(())
     }
 
+    async fn set_upload_throttled(&self, throttled: bool) -> Result<()> {
+        let session = self.session.read().await;
+        let mut handle = session
+            .find_torrent(&self.info_hash)
+            .map_err(|e| anyhow!("Torrent not found: {}", e))?;
+        // libtorrent treats an upload limit of 0 as UNLIMITED, so a tiny
+        // positive value is used to clamp seeding to a trickle. The torrent
+        // stays active and connected either way -- connection persistence does
+        // not depend on the limit value, so the throttle is set as low as is
+        // meaningful to honour "seeding off".
+        let limit = if throttled {
+            SEEDING_THROTTLE_UPLOAD_LIMIT
+        } else {
+            0
+        };
+        handle.set_upload_limit(limit);
+        Ok(())
+    }
+
     async fn get_file_reader(
         &self,
         file_idx: usize,
@@ -254,12 +279,10 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
         // (e.g. paused by the seeding-disabled policy) must stay paused instead
         // of rejoining the swarm and re-seeding the completed data.
         let status = handle.status();
-        if status.is_paused && !is_complete {
+        let needs_resume = status.is_paused && !is_complete;
+        if needs_resume {
             tracing::info!("get_file_reader: Resuming paused torrent for streaming");
             handle.resume();
-            // Force reannounce to quickly re-acquire peers after pause
-            handle.force_reannounce();
-            handle.force_dht_announce();
         }
         if priority != 255 {
             // Real playback/download readers should make their file wanted, but
@@ -271,6 +294,18 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
                 file_info.path
             );
             handle.set_file_priority(file_idx as i32, 7);
+        }
+        if needs_resume {
+            // Reannounce AFTER the file priority change above, not before: an
+            // announce sent while the newly-requested file is still priority 0
+            // (e.g. right after switching episodes, before this line runs) can
+            // report the torrent as a complete seed with nothing left to want,
+            // which gets back a worse/empty peer list from some trackers. This
+            // one-time, post-pause reannounce is not in the hot per-poll path
+            // (unlike wait_for_piece_ready / disk_stream::prioritize_from), so
+            // it doesn't need the same rate-limit cooldown.
+            handle.force_reannounce();
+            handle.force_dht_announce();
         }
 
         let actual_start_piece: i32;
@@ -1074,6 +1109,18 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
         // Poll tightly at first so a piece that verifies mid-wait is served
         // almost immediately, then back off to keep idle cost low.
         let mut poll_interval_ms = 5u64;
+        // force_reannounce()/force_dht_announce() are expensive, rate-limited
+        // operations on the tracker/DHT side: a tracker will ignore repeat
+        // announces faster than its min-interval, and a DHT get_peers lookup
+        // needs several round-trips to finish, which a brand-new lookup every
+        // poll tick (5-25ms) cancels before it ever completes. Without a
+        // cooldown this loop calls both on every single iteration where the
+        // torrent reads as paused, which can starve the torrent of new peers
+        // indefinitely. Fire immediately on the first iteration, then back off.
+        let mut last_reannounce = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(10))
+            .unwrap_or_else(std::time::Instant::now);
+        const REANNOUNCE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(10);
 
         while start.elapsed() < timeout {
             // Memory-storage pieces that are downloaded but not yet copied into
@@ -1095,11 +1142,17 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
                 let rate = status.download_rate as u64;
 
                 // An unfinished, paused torrent must rejoin the swarm to make
-                // progress for the stream waiting on this piece.
+                // progress for the stream waiting on this piece. resume() is
+                // cheap and idempotent so it's safe to call every iteration,
+                // but reannounce/dht_announce are rate-limited; see comment
+                // above the loop for why those need the cooldown.
                 if status.is_paused && !status.is_finished {
                     handle.resume();
-                    handle.force_reannounce();
-                    handle.force_dht_announce();
+                    if last_reannounce.elapsed() >= REANNOUNCE_COOLDOWN {
+                        last_reannounce = std::time::Instant::now();
+                        handle.force_reannounce();
+                        handle.force_dht_announce();
+                    }
                 }
 
                 // Count contiguous ready pieces from the target. Disk-backed
@@ -1173,6 +1226,8 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
                         peers = status.num_peers,
                         download_rate = status.download_rate,
                         paused = status.is_paused,
+                        auto_managed = status.is_auto_managed,
+                        state = status.state,
                         finished = status.is_finished,
                         verified_piece_count,
                         request_offset_percent,

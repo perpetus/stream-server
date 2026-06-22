@@ -5,7 +5,7 @@ use crate::cache::DataCache;
 use anyhow::Context;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 use tokio::io::AsyncSeekExt;
 use tokio::sync::Mutex;
@@ -26,6 +26,11 @@ pub struct Engine<H: TorrentHandle> {
     pub active_streams: Arc<AtomicUsize>,
     pub probe_cache: Mutex<HashMap<usize, crate::hls::ProbeResult>>,
     pub data_cache: DataCache,
+    /// Whether this torrent's upload is currently clamped to a trickle because
+    /// it finished while seeding is disabled. Tracked so the seeding-control
+    /// loop only flips (and logs) the throttle on real state changes, and so a
+    /// starting stream knows to restore full upload.
+    pub upload_throttled: AtomicBool,
 }
 
 impl<H: TorrentHandle> Engine<H> {
@@ -40,6 +45,7 @@ impl<H: TorrentHandle> Engine<H> {
                 .weigher(|_key, value: &Arc<Vec<u8>>| value.len() as u32)
                 .max_capacity(64 * 1024 * 1024) // 64MB cache per engine
                 .build(),
+            upload_throttled: AtomicBool::new(false),
         }
     }
 

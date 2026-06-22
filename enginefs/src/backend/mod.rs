@@ -58,6 +58,17 @@ pub trait TorrentHandle: Send + Sync + Clone {
     async fn pause_torrent(&self) -> Result<()> {
         Ok(())
     }
+    /// Throttle (or restore) the torrent's upload rate to control seeding
+    /// WITHOUT disconnecting peers. Pausing a torrent disconnects every peer,
+    /// and after a long idle the swarm cannot be reliably re-acquired (tracker
+    /// min-announce-intervals reject the reannounce and the DHT routing table
+    /// decays), which stalls the next episode's download indefinitely. Clamping
+    /// upload instead stops seeding while keeping the torrent connected, so a
+    /// newly-requested file downloads immediately from the existing peers.
+    /// `true` = clamp upload to a trickle; `false` = restore unlimited upload.
+    async fn set_upload_throttled(&self, _throttled: bool) -> Result<()> {
+        Ok(())
+    }
     async fn get_file_reader(
         &self,
         file_idx: usize,

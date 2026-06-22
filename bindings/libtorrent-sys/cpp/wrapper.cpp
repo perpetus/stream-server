@@ -443,6 +443,16 @@ std::unique_ptr<TorrentHandle> session_add_magnet(Session &session,
 
   p.save_path = rust_str_to_std(save_path);
 
+  // Unlike session_add_torrent (which reads an explicit auto_managed param
+  // from Rust), this path left add_torrent_params at its library default,
+  // which includes torrent_flags::auto_managed. Every torrent created via a
+  // magnet link -- i.e. every torrent the streaming routes ever create --
+  // was therefore left under libtorrent's own session-wide queue/seed
+  // fairness management, which can pause/resume it independently of (and in
+  // direct conflict with) our explicit handle_pause/handle_resume calls. We
+  // always want full manual control, so clear the flag at creation time.
+  p.flags &= ~lt::torrent_flags::auto_managed;
+
   lt::torrent_handle h = session.session.add_torrent(p);
   if (!h.is_valid())
     throw std::runtime_error("Failed to add torrent");

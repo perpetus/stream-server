@@ -128,8 +128,19 @@ impl LibtorrentDiskFileStream {
                     "disk-backed download was paused while active; resuming torrent"
                 );
                 self.handle.resume();
-                let _ = self.handle.force_reannounce();
-                let _ = self.handle.force_dht_announce();
+                // prioritize_from is called on every retry (~every 50ms via the
+                // wait_for_piece wake timer), but reannounce/dht_announce are
+                // rate-limited on the tracker/DHT side -- a tracker ignores
+                // repeat announces faster than its min-interval, and a DHT
+                // get_peers lookup needs several round-trips to finish, which a
+                // brand-new lookup every 50ms cancels before it ever completes.
+                // Reuse the same cooldown as the stall-escalation reannounce
+                // below so the two paths can't double up on spam either.
+                if self.last_stall_reannounce.elapsed() >= Duration::from_secs(10) {
+                    self.last_stall_reannounce = Instant::now();
+                    let _ = self.handle.force_reannounce();
+                    let _ = self.handle.force_dht_announce();
+                }
             }
         }
 
@@ -289,6 +300,9 @@ impl LibtorrentDiskFileStream {
                 peers = status.num_peers,
                 download_rate = status.download_rate,
                 paused = status.is_paused,
+                auto_managed = status.is_auto_managed,
+                state = status.state,
+                finished = status.is_finished,
                 "disk-backed download waiting for verified piece"
             );
         }
