@@ -188,7 +188,7 @@ dependencies = [
 
 [[package]]
 name = "async-rar"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "autocxx",
  "autocxx-build",
@@ -202,7 +202,7 @@ dependencies = [
 
 [[package]]
 name = "async-sevenz"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "autocxx",
  "autocxx-build",
@@ -1828,7 +1828,7 @@ dependencies = [
 
 [[package]]
 name = "enginefs"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3755,7 +3755,7 @@ dependencies = [
 
 [[package]]
 name = "libtorrent-sys"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "cxx",
  "cxx-build",
@@ -5846,7 +5846,7 @@ dependencies = [
 
 [[package]]
 name = "server"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -6089,7 +6089,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "stremio-runtime-stub"
-version = "0.1.5"
+version = "0.1.6"
 
 [[package]]
 name = "string_cache"
@@ -6875,7 +6875,7 @@ checksum = "6d49784317cd0d1ee7ec5c716dd598ec5b4483ea832a2dced265471cc0f690ae"
 
 [[package]]
 name = "updater-helper"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "hex 0.4.3",

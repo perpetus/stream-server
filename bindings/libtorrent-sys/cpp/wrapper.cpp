@@ -207,6 +207,17 @@ std::unique_ptr<Session> create_session(SessionSettings const &settings) {
   pack.set_int(lt::settings_pack::request_queue_time,
                3); // Default 5, reduce for faster requests
 
+  // Disk write pipeline. At 12+ MB/s the default ~1 MiB disk write queue is
+  // under 100 ms of buffering, so write back-pressure can periodically stall
+  // the download. A larger queue plus more I/O threads keeps the network side
+  // fed while pieces are flushed to disk in parallel (disk-backed download
+  // mode).
+  pack.set_int(lt::settings_pack::max_queued_disk_bytes,
+               64 * 1024 * 1024);                   // 64 MiB (default ~1 MiB)
+  pack.set_int(lt::settings_pack::aio_threads, 16); // parallel disk I/O
+  pack.set_int(lt::settings_pack::whole_pieces_threshold,
+               30); // request whole pieces from peers that can finish them fast
+
   // Outgoing connections
   pack.set_int(lt::settings_pack::unchoke_slots_limit, 20); // (was 8)
 

@@ -4,10 +4,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::backend::priorities::{
-    BLOCKED_REPLAN_INTERVAL_MS, PlaybackIntent, disk_backed_forward_window_pieces_for,
-    disk_backed_sequential_download,
+    BLOCKED_REPLAN_INTERVAL_MS, PlaybackIntent, disk_backed_file_baseline_priority,
+    disk_backed_forward_window_pieces_for, disk_backed_sequential_download,
 };
 use crate::piece_waiter::PieceWaiterRegistry;
+
+const INITIAL_FIRST_BYTE_WINDOW_PIECES: i32 = 3;
+const URGENT_REASSERT_INTERVAL_MS: u64 = 250;
 
 pub(crate) struct LibtorrentDiskFileStream {
     handle: libtorrent_sys::LibtorrentHandle,
@@ -32,6 +35,8 @@ pub(crate) struct LibtorrentDiskFileStream {
     consecutive_waits: u32,
     last_blocked_replan: Instant,
     last_stall_reannounce: Instant,
+    last_urgent_reassert: Instant,
+    urgent_reassert_count: u32,
 }
 
 impl LibtorrentDiskFileStream {
@@ -84,6 +89,10 @@ impl LibtorrentDiskFileStream {
                 .checked_sub(Duration::from_millis(BLOCKED_REPLAN_INTERVAL_MS))
                 .unwrap_or_else(Instant::now),
             last_stall_reannounce: Instant::now(),
+            last_urgent_reassert: Instant::now()
+                .checked_sub(Duration::from_millis(URGENT_REASSERT_INTERVAL_MS))
+                .unwrap_or_else(Instant::now),
+            urgent_reassert_count: 0,
         }
     }
 
@@ -109,12 +118,35 @@ impl LibtorrentDiskFileStream {
             .min(usize::MAX as u64) as usize
     }
 
+    fn active_forward_window(&self, intent: PlaybackIntent, configured_forward_window: i32) -> i32 {
+        if self.first_read_logged {
+            return configured_forward_window;
+        }
+
+        match intent {
+            // Cold starts only need a tiny head cluster before the first byte;
+            // seeks need the full configured cluster because players commonly
+            // pull several pieces immediately for demux/decode after the seek.
+            PlaybackIntent::DirectInitial | PlaybackIntent::HlsInitial => {
+                configured_forward_window.min(INITIAL_FIRST_BYTE_WINDOW_PIECES)
+            }
+            _ => configured_forward_window,
+        }
+    }
+
+    fn priority_intent(&self) -> PlaybackIntent {
+        if self.first_read_logged {
+            self.playback_intent.sequential_after_first_byte()
+        } else {
+            self.playback_intent
+        }
+    }
+
     fn prioritize_from(&mut self, piece: i32) {
         if piece < self.first_piece || piece > self.last_piece {
             return;
         }
 
-        self.handle.set_file_priority(self.file_idx as i32, 7);
         // Only rejoin the swarm when the piece we are about to serve is actually
         // missing. Re-reading an already-downloaded piece must not resume a
         // torrent that the seeding-disabled policy paused, or playback of a
@@ -149,20 +181,24 @@ impl LibtorrentDiskFileStream {
         }
         self.last_prioritized_piece = piece;
 
-        let priority_intent = if self.first_read_logged {
-            self.playback_intent.sequential_after_first_byte()
-        } else {
-            self.playback_intent
-        };
+        let priority_intent = self.priority_intent();
         let sequential_download = disk_backed_sequential_download(priority_intent);
         self.handle.set_sequential_download(sequential_download);
-        let forward_window =
+        let configured_forward_window =
             disk_backed_forward_window_pieces_for(priority_intent, self.piece_length);
+        let forward_window = self.active_forward_window(priority_intent, configured_forward_window);
         let priority = if matches!(priority_intent, PlaybackIntent::Background) {
             1
         } else {
             7
         };
+        // Set the file's baseline first, then raise only the active forward
+        // window below. Cold playback/metadata requests use baseline 0 so stale
+        // priorities cannot keep unrelated pieces ahead of the requested one;
+        // sequential reads relax to baseline 1 after the first byte.
+        let file_baseline = disk_backed_file_baseline_priority(priority_intent);
+        self.handle
+            .set_file_priority(self.file_idx as i32, file_baseline);
         let deadline_jitter = (self.stream_id % 10) as i32 * 5;
         for p in piece..=self.last_piece.min(piece + forward_window) {
             if !self.handle.have_piece(p) {
@@ -176,6 +212,7 @@ impl LibtorrentDiskFileStream {
                 self.handle.set_piece_deadline(p, deadline);
             }
         }
+        self.reassert_requested_piece(piece, "initial-window");
 
         tracing::debug!(
             info_hash = %self.info_hash,
@@ -185,9 +222,45 @@ impl LibtorrentDiskFileStream {
             piece,
             sequential_download,
             forward_window,
+            configured_forward_window,
+            file_baseline,
             deadline_jitter,
             "disk-backed stream priority window configured"
         );
+    }
+
+    fn reassert_requested_piece(&mut self, piece: i32, reason: &'static str) {
+        if piece < self.first_piece || piece > self.last_piece || self.handle.have_piece(piece) {
+            return;
+        }
+
+        let priority_intent = self.priority_intent();
+        let file_baseline = disk_backed_file_baseline_priority(priority_intent);
+        if file_baseline == 0 {
+            self.handle.set_file_priority(self.file_idx as i32, 0);
+        }
+        self.handle.set_piece_priority(piece, 7);
+        self.handle.set_piece_deadline(piece, 0);
+        self.last_urgent_reassert = Instant::now();
+        self.urgent_reassert_count = self.urgent_reassert_count.saturating_add(1);
+
+        if self.urgent_reassert_count <= 3 || self.urgent_reassert_count % 20 == 0 {
+            let status = self.handle.status();
+            tracing::info!(
+                info_hash = %self.info_hash,
+                file_idx = self.file_idx,
+                intent = ?self.playback_intent,
+                priority_intent = ?priority_intent,
+                piece,
+                reassert_count = self.urgent_reassert_count,
+                peers = status.num_peers,
+                download_rate = status.download_rate,
+                file_baseline,
+                elapsed_ms = self.created_at.elapsed().as_millis() as u64,
+                reason,
+                "requested piece forced urgent"
+            );
+        }
     }
 
     /// Re-assert deadlines for a blocking piece and expand the window when the
@@ -201,17 +274,18 @@ impl LibtorrentDiskFileStream {
         }
         self.last_blocked_replan = Instant::now();
 
-        let priority_intent = if self.first_read_logged {
-            self.playback_intent.sequential_after_first_byte()
-        } else {
-            self.playback_intent
-        };
+        let priority_intent = self.priority_intent();
         let mut forward_window =
             disk_backed_forward_window_pieces_for(priority_intent, self.piece_length);
+        forward_window = self.active_forward_window(priority_intent, forward_window);
         if self.consecutive_waits >= 3 {
             forward_window = (forward_window * 2).min(63);
         }
 
+        let file_baseline = disk_backed_file_baseline_priority(priority_intent);
+        if file_baseline == 0 {
+            self.handle.set_file_priority(self.file_idx as i32, 0);
+        }
         for p in piece..=self.last_piece.min(piece + forward_window) {
             if !self.handle.have_piece(p) {
                 let distance = p - piece;
@@ -219,6 +293,7 @@ impl LibtorrentDiskFileStream {
                 self.handle.set_piece_deadline(p, distance * 25);
             }
         }
+        self.reassert_requested_piece(piece, "blocked-replan");
 
         // A long stall with barely any progress usually means the current
         // peers are choking us; announce to find fresh peers sooner.
@@ -248,6 +323,7 @@ impl LibtorrentDiskFileStream {
             intent = ?priority_intent,
             piece,
             forward_window,
+            file_baseline,
             consecutive_waits = self.consecutive_waits,
             "disk-backed blocked piece re-prioritized"
         );
@@ -260,6 +336,10 @@ impl LibtorrentDiskFileStream {
     ) -> std::task::Poll<std::io::Result<()>> {
         self.consecutive_waits = self.consecutive_waits.saturating_add(1);
         self.prioritize_from(piece);
+        if self.last_urgent_reassert.elapsed() >= Duration::from_millis(URGENT_REASSERT_INTERVAL_MS)
+        {
+            self.reassert_requested_piece(piece, "wait-reassert");
+        }
         self.escalate_blocked_piece(piece);
         self.piece_waiter
             .register(&self.info_hash, piece, self.stream_id, cx.waker().clone());
@@ -282,6 +362,22 @@ impl LibtorrentDiskFileStream {
             let verified_bytes_estimate = (verified_piece_count as u64)
                 .saturating_mul(self.piece_length)
                 .min(self.file_size);
+            let configured_forward_window =
+                disk_backed_forward_window_pieces_for(self.playback_intent, self.piece_length);
+            let active_forward_window =
+                self.active_forward_window(self.playback_intent, configured_forward_window);
+            let cluster_end = self.last_piece.min(piece + active_forward_window);
+            let ready_in_active_window = (piece..=cluster_end)
+                .filter(|p| self.handle.have_piece(*p))
+                .count();
+            let missing_in_active_window =
+                (cluster_end.saturating_sub(piece) + 1).max(0) as usize - ready_in_active_window;
+            let piece_availability = self
+                .handle
+                .piece_availability()
+                .get(piece as usize)
+                .copied()
+                .unwrap_or(-1);
             let request_offset_percent = if self.file_size > 0 {
                 (self.current_pos.min(self.file_size) as f64 / self.file_size as f64) * 100.0
             } else {
@@ -297,6 +393,10 @@ impl LibtorrentDiskFileStream {
                 request_offset_percent,
                 verified_piece_count,
                 verified_bytes_estimate,
+                active_forward_window,
+                ready_in_active_window,
+                missing_in_active_window,
+                piece_availability,
                 peers = status.num_peers,
                 download_rate = status.download_rate,
                 paused = status.is_paused,

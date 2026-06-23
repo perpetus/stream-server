@@ -93,6 +93,21 @@ pub fn disk_backed_sequential_download(intent: PlaybackIntent) -> bool {
     matches!(intent, PlaybackIntent::DownloadFull)
 }
 
+pub fn disk_backed_file_baseline_priority(intent: PlaybackIntent) -> i32 {
+    match intent {
+        PlaybackIntent::DownloadFull | PlaybackIntent::DownloadRange => 7,
+        PlaybackIntent::DirectInitial
+        | PlaybackIntent::DirectSeek
+        | PlaybackIntent::HlsInitial
+        | PlaybackIntent::HlsSeek
+        | PlaybackIntent::ContainerMetadata => 0,
+        PlaybackIntent::DirectSequential
+        | PlaybackIntent::HlsSequential
+        | PlaybackIntent::InternalProbe
+        | PlaybackIntent::Background => 1,
+    }
+}
+
 pub fn disk_backed_forward_window_pieces(intent: PlaybackIntent) -> i32 {
     match intent {
         PlaybackIntent::DownloadFull => 63,
@@ -453,7 +468,7 @@ fn assignment_for(
     hot_pieces: i32,
 ) -> (PriorityBand, i32, i32) {
     match ctx.intent {
-        PlaybackIntent::ContainerMetadata => (PriorityBand::Metadata, 4, 150 + distance * 50),
+        PlaybackIntent::ContainerMetadata => (PriorityBand::Metadata, 7, distance * 10),
         PlaybackIntent::InternalProbe => (PriorityBand::Background, 1, 1_000 + distance * 250),
         PlaybackIntent::Background => (PriorityBand::Background, 1, 20_000 + distance * 200),
         _ if distance < immediate_pieces => (PriorityBand::Immediate, 7, distance * 25),
@@ -652,6 +667,39 @@ mod tests {
             disk_backed_forward_window_pieces(PlaybackIntent::DownloadFull)
                 > disk_backed_forward_window_pieces(PlaybackIntent::DownloadRange)
         );
+    }
+
+    #[test]
+    fn disk_backed_blocking_streams_use_strict_file_baseline() {
+        assert_eq!(
+            disk_backed_file_baseline_priority(PlaybackIntent::DirectInitial),
+            0
+        );
+        assert_eq!(
+            disk_backed_file_baseline_priority(PlaybackIntent::DirectSeek),
+            0
+        );
+        assert_eq!(
+            disk_backed_file_baseline_priority(PlaybackIntent::ContainerMetadata),
+            0
+        );
+        assert_eq!(
+            disk_backed_file_baseline_priority(PlaybackIntent::DirectSequential),
+            1
+        );
+        assert_eq!(
+            disk_backed_file_baseline_priority(PlaybackIntent::DownloadFull),
+            7
+        );
+    }
+
+    #[test]
+    fn blocking_container_metadata_is_urgent() {
+        let decision =
+            PlaybackPriorityPolicy::decide(base_context(PlaybackIntent::ContainerMetadata));
+
+        assert_eq!(decision.assignments[0].piece_priority, 7);
+        assert_eq!(decision.assignments[0].deadline, 0);
     }
 
     #[test]

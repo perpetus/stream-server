@@ -11,7 +11,7 @@ use crate::backend::{
     metadata::MetadataInspector,
     priorities::{
         MAX_STARTUP_PIECES, MemoryPressure, PlaybackIntent, PlaybackPriorityPolicy,
-        PriorityContext, disk_backed_sequential_download,
+        PriorityContext, disk_backed_file_baseline_priority, disk_backed_sequential_download,
     },
 };
 use libtorrent_sys::LibtorrentSession;
@@ -26,6 +26,9 @@ use super::stream::LibtorrentFileStream;
 /// low enough to count as "seeding off" while keeping peers connected so the
 /// next episode downloads instantly.
 const SEEDING_THROTTLE_UPLOAD_LIMIT: i32 = 1024;
+const DISK_READINESS_BUFFER_BYTES: u64 = 8 * 1024 * 1024;
+const DISK_READINESS_MAX_PIECES: u32 = 4;
+const DISK_READINESS_REASSERT_MS: u64 = 250;
 
 /// Handle to a torrent managed by libtorrent
 #[derive(Clone)]
@@ -82,6 +85,48 @@ impl LibtorrentTorrentHandle {
             file_count = files.len(),
             "torrent file priorities initialized after metadata"
         );
+    }
+
+    fn disk_readiness_target_pieces(
+        intent: PlaybackIntent,
+        piece: i32,
+        last_piece: i32,
+        piece_length: u64,
+        storage_mode: LibtorrentStorageMode,
+    ) -> u32 {
+        let remaining = (last_piece.saturating_sub(piece) + 1).max(1) as u32;
+        if !matches!(storage_mode, LibtorrentStorageMode::DiskBacked)
+            || piece_length == 0
+            || !matches!(
+                intent,
+                PlaybackIntent::DirectInitial
+                    | PlaybackIntent::DirectSeek
+                    | PlaybackIntent::DirectSequential
+                    | PlaybackIntent::HlsInitial
+                    | PlaybackIntent::HlsSeek
+                    | PlaybackIntent::HlsSequential
+            )
+        {
+            return 1.min(remaining);
+        }
+
+        let pieces_for_buffer = DISK_READINESS_BUFFER_BYTES
+            .saturating_add(piece_length.saturating_sub(1))
+            / piece_length;
+        (pieces_for_buffer as u32)
+            .clamp(1, DISK_READINESS_MAX_PIECES)
+            .min(remaining)
+    }
+
+    fn file_baseline_priority_for(&self, intent: PlaybackIntent) -> i32 {
+        if matches!(self.storage_mode, LibtorrentStorageMode::DiskBacked) {
+            disk_backed_file_baseline_priority(intent)
+        } else {
+            match intent {
+                PlaybackIntent::DownloadFull | PlaybackIntent::DownloadRange => 7,
+                _ => 1,
+            }
+        }
     }
 }
 
@@ -284,30 +329,6 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
             tracing::info!("get_file_reader: Resuming paused torrent for streaming");
             handle.resume();
         }
-        if priority != 255 {
-            // Real playback/download readers should make their file wanted, but
-            // must not clear other wanted files. Several HTTP requests or
-            // torrents can be active at the same time.
-            tracing::debug!(
-                "get_file_reader: Setting PRIORITY 7 (HIGHEST) for file idx={} name={}",
-                file_idx,
-                file_info.path
-            );
-            handle.set_file_priority(file_idx as i32, 7);
-        }
-        if needs_resume {
-            // Reannounce AFTER the file priority change above, not before: an
-            // announce sent while the newly-requested file is still priority 0
-            // (e.g. right after switching episodes, before this line runs) can
-            // report the torrent as a complete seed with nothing left to want,
-            // which gets back a worse/empty peer list from some trackers. This
-            // one-time, post-pause reannounce is not in the hot per-poll path
-            // (unlike wait_for_piece_ready / disk_stream::prioritize_from), so
-            // it doesn't need the same rate-limit cooldown.
-            handle.force_reannounce();
-            handle.force_dht_announce();
-        }
-
         let actual_start_piece: i32;
 
         // PRIORITY 255 = Internal reader (e.g., metadata inspection)
@@ -371,6 +392,34 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
                 }
             }
         };
+
+        if priority != 255 {
+            // Disk-backed streaming uses a strict baseline of 0 for cold
+            // playback/metadata requests. The explicit piece window below is
+            // raised immediately after this, which prevents stale/background
+            // file priority from downloading unrelated pieces while the player
+            // is blocked on one exact piece.
+            let file_baseline = self.file_baseline_priority_for(playback_intent);
+            tracing::debug!(
+                "get_file_reader: Setting file baseline priority {} for idx={} name={}",
+                file_baseline,
+                file_idx,
+                file_info.path
+            );
+            handle.set_file_priority(file_idx as i32, file_baseline);
+        }
+        if needs_resume {
+            // Reannounce AFTER the file priority change above, not before: an
+            // announce sent while the newly-requested file is still priority 0
+            // (e.g. right after switching episodes, before this line runs) can
+            // report the torrent as a complete seed with nothing left to want,
+            // which gets back a worse/empty peer list from some trackers. This
+            // one-time, post-pause reannounce is not in the hot per-poll path
+            // (unlike wait_for_piece_ready / disk_stream::prioritize_from), so
+            // it doesn't need the same rate-limit cooldown.
+            handle.force_reannounce();
+            handle.force_dht_announce();
+        }
 
         if priority != 255 {
             let sequential_download = disk_backed_sequential_download(playback_intent);
@@ -495,16 +544,15 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
             // For initial playback, prefetch the container tail (the moov atom
             // for MP4/MKV lives at the end of the file). A player almost always
             // issues a ContainerMetadata probe against the last pieces right
-            // after starting; prefetching them here -- for BOTH memory and
-            // disk-backed storage -- turns that otherwise-cold ~750ms tail seek
-            // into a cache hit. Deadlines start after the head window is in
-            // flight so the first frame is never delayed by end-of-file work.
+            // after starting. Keep this eager path memory-only: disk-backed
+            // cold starts must give the exact requested head piece the first
+            // shot, and background metadata inspection below starts after that
+            // head piece is ready.
             if matches!(seek_type, SeekType::InitialPlayback)
+                && !matches!(self.storage_mode, LibtorrentStorageMode::DiskBacked)
                 && last_piece > actual_start_piece + applied_window_size
             {
-                tracing::debug!(
-                    "get_file_reader: Prefetching container tail metadata pieces"
-                );
+                tracing::debug!("get_file_reader: Prefetching container tail metadata pieces");
                 // The moov atom can span a few pieces; prefetch the last few.
                 const TAIL_PREFETCH_PIECES: i32 = 4;
                 let tail_start = (last_piece - TAIL_PREFETCH_PIECES + 1).max(first_piece);
@@ -769,10 +817,21 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
             // range can starve the active playback piece. File switches and
             // delayed cleanup still clear deadlines explicitly.
 
-            // Make the target file wanted without clearing other active files.
+            // Make the target file known without clearing other active files.
             // Files are initialized as skipped when metadata arrives and are
             // cleared by delayed cleanup after their own streams end.
-            handle.set_file_priority(file_idx as i32, 7);
+            //
+            // Disk-backed mode keeps the baseline at 0 until an actual request
+            // supplies its offset and raises a focused piece window. That avoids
+            // the prepare step starting a whole-file low-priority download that
+            // can beat the requested piece to the request queue.
+            let prepare_baseline = if matches!(self.storage_mode, LibtorrentStorageMode::DiskBacked)
+            {
+                0
+            } else {
+                1
+            };
+            handle.set_file_priority(file_idx as i32, prepare_baseline);
 
             // REMOVED: First-8-pieces prioritization was causing seeks to fail
             // because it set highest priority on pieces 0-7 even when seeking to piece 118.
@@ -786,6 +845,7 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
                 let p = first_piece + i;
                 if p <= last_piece && !handle.have_piece(p) {
                     // Safety net: very low urgency to give metadata inspector a head start
+                    handle.set_piece_priority(p, 4);
                     handle.set_piece_deadline(p, 3000 + i * 25);
                 }
             }
@@ -1074,6 +1134,10 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
                 consecutive_waits: 0,
                 first_byte_sent: false,
             });
+            let file_baseline = self.file_baseline_priority_for(intent);
+            if matches!(self.storage_mode, LibtorrentStorageMode::DiskBacked) {
+                handle.set_file_priority(file_idx as i32, file_baseline);
+            }
             for assignment in &decision.assignments {
                 if !handle.have_piece(assignment.piece_idx) {
                     handle.set_piece_priority(assignment.piece_idx, assignment.piece_priority);
@@ -1088,6 +1152,7 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
                 peers = status.num_peers,
                 download_rate = status.download_rate,
                 reason = %decision.reason,
+                file_baseline,
                 "priority_seek_readiness_begin"
             );
             (
@@ -1099,7 +1164,13 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
             )
         };
 
-        let target_pieces = 1u32.min((last_piece.saturating_sub(piece) + 1).max(1) as u32);
+        let target_pieces = Self::disk_readiness_target_pieces(
+            intent,
+            piece,
+            last_piece,
+            piece_length,
+            self.storage_mode,
+        );
         let mut best_ready_pieces = 0u32;
         // Only re-run the priority policy when the swarm picture changes; doing
         // it every tick is wasted work, especially under the parallel-probe
@@ -1121,6 +1192,9 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
             .checked_sub(std::time::Duration::from_secs(10))
             .unwrap_or_else(std::time::Instant::now);
         const REANNOUNCE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(10);
+        let mut last_cluster_reassert = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_millis(DISK_READINESS_REASSERT_MS))
+            .unwrap_or_else(std::time::Instant::now);
 
         while start.elapsed() < timeout {
             // Memory-storage pieces that are downloaded but not yet copied into
@@ -1173,9 +1247,28 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
                     }
                 }
 
-                let disk_satisfied =
-                    matches!(self.storage_mode, LibtorrentStorageMode::DiskBacked)
-                        && ready >= target_pieces;
+                let disk_satisfied = matches!(self.storage_mode, LibtorrentStorageMode::DiskBacked)
+                    && ready >= target_pieces;
+                if !disk_satisfied
+                    && matches!(self.storage_mode, LibtorrentStorageMode::DiskBacked)
+                    && last_cluster_reassert.elapsed()
+                        >= std::time::Duration::from_millis(DISK_READINESS_REASSERT_MS)
+                {
+                    last_cluster_reassert = std::time::Instant::now();
+                    let file_baseline = self.file_baseline_priority_for(intent);
+                    if file_baseline == 0 {
+                        handle.set_file_priority(file_idx as i32, 0);
+                    }
+                    let cluster_end =
+                        last_piece.min(piece + target_pieces.saturating_sub(1) as i32);
+                    for p in piece..=cluster_end {
+                        if !handle.have_piece(p) {
+                            let distance = p.saturating_sub(piece);
+                            handle.set_piece_priority(p, 7);
+                            handle.set_piece_deadline(p, distance * 10);
+                        }
+                    }
+                }
                 let rate_bucket = rate / (64 * 1024);
                 if !disk_satisfied
                     && (peers != last_decide_peers || rate_bucket != last_decide_rate_bucket)
@@ -1230,6 +1323,8 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
                         state = status.state,
                         finished = status.is_finished,
                         verified_piece_count,
+                        ready_pieces = ready,
+                        target_pieces,
                         request_offset_percent,
                         "direct stream readiness waiting"
                     );
@@ -1246,7 +1341,11 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
             } else {
                 let mut ready = 0u32;
                 for ready_piece in piece..=last_piece.min(piece + target_pieces as i32 - 1) {
-                    if self.piece_cache.has_piece(&self.info_hash, ready_piece).await {
+                    if self
+                        .piece_cache
+                        .has_piece(&self.info_hash, ready_piece)
+                        .await
+                    {
                         ready += 1;
                         continue;
                     }
