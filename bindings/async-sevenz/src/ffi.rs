@@ -1,3 +1,5 @@
+#![allow(clippy::module_inception)]
+
 use autocxx::prelude::*;
 use std::ffi::c_void;
 use std::sync::mpsc as std_mpsc;
@@ -23,7 +25,6 @@ include_cpp! {
 }
 
 // Re-export generated items so they are directly in crate::ffi
-#[allow(clippy::module_inception)]
 pub use ffi::*;
 
 pub enum ReaderRequest {
