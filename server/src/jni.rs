@@ -1,4 +1,4 @@
-use jni::JNIEnv;
+use jni::EnvUnowned;
 use jni::objects::{JClass, JString};
 use jni::sys::jstring;
 use once_cell::sync::Lazy;
@@ -11,59 +11,74 @@ static SERVER_HANDLE: Lazy<Mutex<Option<ServerHandle>>> = Lazy::new(|| Mutex::ne
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn Java_com_stremio_mobile_server_JniStreamingServerController_startServerNative(
-    mut env: JNIEnv,
+    mut env: EnvUnowned,
     _class: JClass,
     config_dir: JString,
     cache_dir: JString,
     port: jni::sys::jint,
 ) -> jstring {
-    let config_dir_str: String = match env.get_string(&config_dir) {
-        Ok(s) => s.into(),
-        Err(_) => {
-            let _ = env.throw_new("java/lang/IllegalArgumentException", "Invalid configDir string");
-            return std::ptr::null_mut();
-        }
-    };
+    env.with_env(|env| -> jni::errors::Result<jstring> {
+        let config_dir_str: String = match config_dir.try_to_string(env) {
+            Ok(s) => s,
+            Err(_) => {
+                let _ = env.throw_new(
+                    jni::jni_str!("java/lang/IllegalArgumentException"),
+                    jni::jni_str!("Invalid configDir string"),
+                );
+                return Ok(std::ptr::null_mut());
+            }
+        };
 
-    let cache_dir_str: String = match env.get_string(&cache_dir) {
-        Ok(s) => s.into(),
-        Err(_) => {
-            let _ = env.throw_new("java/lang/IllegalArgumentException", "Invalid cacheDir string");
-            return std::ptr::null_mut();
-        }
-    };
+        let cache_dir_str: String = match cache_dir.try_to_string(env) {
+            Ok(s) => s,
+            Err(_) => {
+                let _ = env.throw_new(
+                    jni::jni_str!("java/lang/IllegalArgumentException"),
+                    jni::jni_str!("Invalid cacheDir string"),
+                );
+                return Ok(std::ptr::null_mut());
+            }
+        };
 
-    let mut handle_lock = SERVER_HANDLE.lock().unwrap();
-    if handle_lock.is_some() {
-        let bound_addr = handle_lock.as_ref().unwrap().bound_http_addr();
-        let url = format!("http://{}", bound_addr);
-        return env.new_string(url).unwrap().into_raw();
-    }
-
-    let mut cfg = ServerConfig::embedded();
-    cfg.config_dir = Some(PathBuf::from(config_dir_str));
-    cfg.cache_dir = Some(PathBuf::from(cache_dir_str));
-    cfg.http_addr = SocketAddr::from(([127, 0, 0, 1], port as u16));
-    cfg.init_logging = true;
-
-    match crate::start(cfg) {
-        Ok(handle) => {
-            let bound_addr = handle.bound_http_addr();
+        let mut handle_lock = SERVER_HANDLE.lock().unwrap();
+        if handle_lock.is_some() {
+            let bound_addr = handle_lock.as_ref().unwrap().bound_http_addr();
             let url = format!("http://{}", bound_addr);
-            *handle_lock = Some(handle);
-            env.new_string(url).unwrap().into_raw()
+            return Ok(env.new_string(url)?.into_raw());
         }
-        Err(err) => {
-            let err_msg = format!("Failed to start server: {}", err);
-            let _ = env.throw_new("java/lang/RuntimeException", err_msg);
-            std::ptr::null_mut()
+
+        let mut cfg = ServerConfig::embedded();
+        cfg.config_dir = Some(PathBuf::from(config_dir_str));
+        cfg.cache_dir = Some(PathBuf::from(cache_dir_str));
+        cfg.http_addr = SocketAddr::from(([127, 0, 0, 1], port as u16));
+        cfg.init_logging = true;
+
+        match crate::start(cfg) {
+            Ok(handle) => {
+                let bound_addr = handle.bound_http_addr();
+                let url = format!("http://{}", bound_addr);
+                *handle_lock = Some(handle);
+                Ok(env.new_string(url)?.into_raw())
+            }
+            Err(err) => {
+                let err_msg = format!("Failed to start server: {}", err);
+                let jni_err_msg = jni::strings::JNIString::try_from(err_msg).unwrap_or_else(|_| {
+                    jni::strings::JNIString::from(jni::jni_str!("Failed to start server due to encoding error"))
+                });
+                let _ = env.throw_new(
+                    jni::jni_str!("java/lang/RuntimeException"),
+                    jni_err_msg,
+                );
+                Ok(std::ptr::null_mut())
+            }
         }
-    }
+    })
+    .resolve::<jni::errors::ThrowRuntimeExAndDefault>()
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn Java_com_stremio_mobile_server_JniStreamingServerController_stopServerNative(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _class: JClass,
 ) {
     let mut handle_lock = SERVER_HANDLE.lock().unwrap();
@@ -75,15 +90,18 @@ pub unsafe extern "C" fn Java_com_stremio_mobile_server_JniStreamingServerContro
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn Java_com_stremio_mobile_server_JniStreamingServerController_getServerUrlNative(
-    env: JNIEnv,
+    mut env: EnvUnowned,
     _class: JClass,
 ) -> jstring {
-    let handle_lock = SERVER_HANDLE.lock().unwrap();
-    if let Some(handle) = handle_lock.as_ref() {
-        let bound_addr = handle.bound_http_addr();
-        let url = format!("http://{}", bound_addr);
-        env.new_string(url).unwrap().into_raw()
-    } else {
-        std::ptr::null_mut()
-    }
+    env.with_env(|env| -> jni::errors::Result<jstring> {
+        let handle_lock = SERVER_HANDLE.lock().unwrap();
+        if let Some(handle) = handle_lock.as_ref() {
+            let bound_addr = handle.bound_http_addr();
+            let url = format!("http://{}", bound_addr);
+            Ok(env.new_string(url)?.into_raw())
+        } else {
+            Ok(std::ptr::null_mut())
+        }
+    })
+    .resolve::<jni::errors::ThrowRuntimeExAndDefault>()
 }
