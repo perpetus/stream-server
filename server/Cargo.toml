@@ -74,7 +74,7 @@ fslock = "0.2.1"
 open = "5.3.3"
 image = "0.25.9"
 ico = "0.5.0"
-zip = "7.0.0"
+zip = "8.6.0"
 async-sevenz = { path = "../bindings/async-sevenz" }
 chrono = "0.4.42"
 sysinfo = "0.37"
