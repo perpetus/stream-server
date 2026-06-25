@@ -15,7 +15,8 @@ fn main() {
         .file("cpp/memory_storage.cpp")
         .std("c++17")
         .flag_if_supported("-Wno-unused-parameter")
-        .flag_if_supported("-Wno-missing-field-initializers");
+        .flag_if_supported("-Wno-missing-field-initializers")
+        .flag_if_supported("-Wno-maybe-uninitialized");
 
     // Only set TORRENT_ABI_VERSION when using vcpkg-built libtorrent
     // System packages (e.g., Arch Linux) usually don't need this specific ABI version 3
