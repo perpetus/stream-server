@@ -16,6 +16,7 @@ pub mod files;
 pub mod hls;
 pub mod hwaccel;
 pub mod metadata_cache;
+pub mod metadata_pins;
 pub mod piece_cache;
 pub mod piece_waiter;
 pub mod subtitles;

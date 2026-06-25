@@ -225,8 +225,15 @@ pub async fn set_settings(
             }
         }
         if let Some(v) = obj.get("cacheSize") {
-            if let Some(n) = v.as_f64() {
+            if v.is_null() {
+                settings.cache_size = 0.0;
+            } else if let Some(n) = v.as_f64() {
                 settings.cache_size = n;
+            }
+        }
+        if let Some(v) = obj.get("cacheRoot") {
+            if let Some(s) = v.as_str() {
+                settings.cache_root = s.to_string();
             }
         }
         if let Some(v) = obj.get("proxyStreamsEnabled") {
@@ -450,7 +457,7 @@ async fn verify_h264_encoder(encoder: &str) -> bool {
         true
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        tracing::warn!(
+        tracing::debug!(
             encoder,
             status = ?output.status.code(),
             stderr = %stderr.trim(),
@@ -650,7 +657,7 @@ pub async fn get_file_stats(
         }
     };
 
-    let stats = engine.get_statistics().await;
+    let mut stats = engine.get_statistics().await;
     if idx >= stats.files.len() {
         return (
             axum::http::StatusCode::NOT_FOUND,
@@ -658,6 +665,19 @@ pub async fn get_file_stats(
         )
             .into_response();
     }
+    // Report progress for the exact file the client asked about. The guess
+    // inside get_statistics can resolve to a different file in a multi-file
+    // torrent, and downloaded/length stays stable during cold start (unlike the
+    // torrent's total_wanted set, which briefly collapses to the metadata
+    // window and spikes the percentage just before playback).
+    let file = &stats.files[idx];
+    stats.stream_name = file.name.clone();
+    stats.stream_len = file.length;
+    stats.stream_progress = if file.length > 0 {
+        (file.downloaded as f64 / file.length as f64).min(1.0)
+    } else {
+        0.0
+    };
     Json(serde_json::to_value(stats).unwrap()).into_response()
 }
 

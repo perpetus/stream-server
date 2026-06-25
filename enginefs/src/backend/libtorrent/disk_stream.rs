@@ -7,6 +7,7 @@ use crate::backend::priorities::{
     BLOCKED_REPLAN_INTERVAL_MS, PlaybackIntent, disk_backed_file_baseline_priority,
     disk_backed_forward_window_pieces_for, disk_backed_sequential_download,
 };
+use crate::metadata_pins::MetadataPinRegistry;
 use crate::piece_waiter::PieceWaiterRegistry;
 
 const INITIAL_FIRST_BYTE_WINDOW_PIECES: i32 = 3;
@@ -27,6 +28,7 @@ pub(crate) struct LibtorrentDiskFileStream {
     stream_id: usize,
     playback_intent: PlaybackIntent,
     piece_waiter: Arc<PieceWaiterRegistry>,
+    metadata_pins: Arc<MetadataPinRegistry>,
     created_at: Instant,
     first_read_logged: bool,
     last_retry_wake: Instant,
@@ -55,6 +57,7 @@ impl LibtorrentDiskFileStream {
         stream_id: usize,
         playback_intent: PlaybackIntent,
         piece_waiter: Arc<PieceWaiterRegistry>,
+        metadata_pins: Arc<MetadataPinRegistry>,
     ) -> Self {
         let mut handle = handle;
         // Pieces verified moments ago (e.g. the shared boundary piece of the
@@ -77,6 +80,7 @@ impl LibtorrentDiskFileStream {
             stream_id,
             playback_intent,
             piece_waiter,
+            metadata_pins,
             created_at: Instant::now(),
             first_read_logged: false,
             last_retry_wake: Instant::now(),
@@ -142,6 +146,41 @@ impl LibtorrentDiskFileStream {
         }
     }
 
+    /// Pinned metadata (Cues/moov) pieces for this torrent that are still
+    /// missing. Verified pins are dropped as a side effect so the set shrinks
+    /// toward empty and the head-window cap lifts automatically.
+    fn pinned_metadata_missing(&self) -> Vec<i32> {
+        let pinned = self.metadata_pins.pinned(&self.info_hash);
+        if pinned.is_empty() {
+            return Vec::new();
+        }
+        let mut verified = Vec::new();
+        let mut missing = Vec::new();
+        for p in pinned {
+            if self.handle.have_piece(p) {
+                verified.push(p);
+            } else {
+                missing.push(p);
+            }
+        }
+        if !verified.is_empty() {
+            self.metadata_pins.unpin_pieces(&self.info_hash, &verified);
+        }
+        missing
+    }
+
+    /// Re-assert pinned metadata pieces at top priority with an immediate
+    /// deadline so a head stream's `set_file_priority` can't strip the rare
+    /// Cues/moov region while it is still downloading.
+    fn apply_pinned_metadata(&mut self, pinned_missing: &[i32]) {
+        for &p in pinned_missing {
+            if p >= self.first_piece && p <= self.last_piece && !self.handle.have_piece(p) {
+                self.handle.set_piece_priority(p, 7);
+                self.handle.set_piece_deadline(p, 0);
+            }
+        }
+    }
+
     fn prioritize_from(&mut self, piece: i32) {
         if piece < self.first_piece || piece > self.last_piece {
             return;
@@ -154,9 +193,13 @@ impl LibtorrentDiskFileStream {
         if !self.handle.have_piece(piece) {
             let status = self.handle.status();
             if status.is_paused {
-                tracing::info!(
+                tracing::warn!(
                     info_hash = %self.info_hash,
                     file_idx = self.file_idx,
+                    state = status.state,
+                    finished = status.is_finished,
+                    auto_managed = status.is_auto_managed,
+                    error = %status.error,
                     "disk-backed download was paused while active; resuming torrent"
                 );
                 self.handle.resume();
@@ -187,15 +230,42 @@ impl LibtorrentDiskFileStream {
         let configured_forward_window =
             disk_backed_forward_window_pieces_for(priority_intent, self.piece_length);
         let forward_window = self.active_forward_window(priority_intent, configured_forward_window);
+
+        // A tail-seek (Cues/moov) stream records its window as metadata-critical
+        // so concurrent head streams rank it above their own read-ahead until it
+        // verifies. The background metadata inspector pins the same region, so a
+        // head stream backs off even before the player issues the tail request.
+        let is_metadata_stream = matches!(
+            priority_intent,
+            PlaybackIntent::ContainerMetadata | PlaybackIntent::InternalProbe
+        );
+        if is_metadata_stream {
+            let window_end = self.last_piece.min(piece + forward_window);
+            let window: Vec<i32> = (piece..=window_end)
+                .filter(|p| !self.handle.have_piece(*p))
+                .collect();
+            self.metadata_pins.pin_pieces(&self.info_hash, window);
+        }
+        let pinned_missing = self.pinned_metadata_missing();
+        let cues_pending = !pinned_missing.is_empty();
+
+        // While rare Cues/moov pieces are still missing, a head stream drops its
+        // read-ahead window from 7 to 4 so the few peers that hold the tail feed
+        // it first. The head's CURRENT piece still stays urgent via
+        // reassert_requested_piece below; only read-ahead yields. The metadata
+        // stream itself keeps full priority; background reads stay at 1.
         let priority = if matches!(priority_intent, PlaybackIntent::Background) {
             1
+        } else if cues_pending && !is_metadata_stream {
+            4
         } else {
             7
         };
-        // Set the file's baseline first, then raise only the active forward
-        // window below. Cold playback/metadata requests use baseline 0 so stale
-        // priorities cannot keep unrelated pieces ahead of the requested one;
-        // sequential reads relax to baseline 1 after the first byte.
+        // Set the file's baseline (whole file at priority 1 for streaming so it
+        // stays "wanted" and the torrent never falsely finishes after the head;
+        // 7 for explicit downloads) first, then raise only the active forward
+        // window below. set_file_priority resets stale per-piece priorities so a
+        // previous request's window cannot keep unrelated pieces ahead.
         let file_baseline = disk_backed_file_baseline_priority(priority_intent);
         self.handle
             .set_file_priority(self.file_idx as i32, file_baseline);
@@ -213,6 +283,9 @@ impl LibtorrentDiskFileStream {
             }
         }
         self.reassert_requested_piece(piece, "initial-window");
+        // Re-assert pinned Cues/moov LAST so the set_file_priority above (and the
+        // baseline-0 wipe inside reassert) can't strip the rare tail region.
+        self.apply_pinned_metadata(&pinned_missing);
 
         tracing::debug!(
             info_hash = %self.info_hash,
@@ -224,6 +297,7 @@ impl LibtorrentDiskFileStream {
             forward_window,
             configured_forward_window,
             file_baseline,
+            cues_pending,
             deadline_jitter,
             "disk-backed stream priority window configured"
         );
@@ -294,6 +368,10 @@ impl LibtorrentDiskFileStream {
             }
         }
         self.reassert_requested_piece(piece, "blocked-replan");
+        // Keep pinned Cues/moov urgent (deadline 0) so they out-rank this
+        // window's read-ahead deadlines even though both sit at priority 7.
+        let pinned_missing = self.pinned_metadata_missing();
+        self.apply_pinned_metadata(&pinned_missing);
 
         // A long stall with barely any progress usually means the current
         // peers are choking us; announce to find fresh peers sooner.
@@ -457,7 +535,15 @@ impl tokio::io::AsyncRead for LibtorrentDiskFileStream {
 
         let mut scratch = vec![0u8; to_read.min(256 * 1024)];
         let read = match file.read(&mut scratch) {
-            Ok(0) => return self.wait_for_piece(piece, cx),
+            // A verified piece (have_piece == true) whose bytes are not yet on
+            // disk -- write-back lag, or the file not yet extended -- reads as
+            // EOF here. Force a flush so it materialises instead of waiting
+            // forever; without this the stream can deadlock when the torrent has
+            // gone idle and would never flush on its own.
+            Ok(0) => {
+                self.handle.flush_cache();
+                return self.wait_for_piece(piece, cx);
+            }
             Ok(read) => read,
             Err(err) => return std::task::Poll::Ready(Err(err)),
         };

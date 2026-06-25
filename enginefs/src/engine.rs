@@ -191,9 +191,16 @@ impl<H: TorrentHandle> Engine<H> {
             stats.stream_name = file.name.clone();
             stats.stream_len = file.length;
 
-            // Note: stats.stream_progress is already populated by the backend
-            // using total_wanted_done / total_wanted, which is accurate for
-            // multi-file torrents where only the streaming file is "wanted".
+            // Derive stream progress from the streaming file's own
+            // downloaded/length, NOT the torrent's total_wanted set. During cold
+            // start the file baseline is dropped to 0 so only a few metadata
+            // pieces are "wanted"; total_wanted_done/total_wanted then spikes
+            // toward 100% just before playback until the head priorities widen
+            // the wanted set again. The per-file fraction is stable across those
+            // priority changes (downloaded counts verified pieces in range).
+            if file.length > 0 {
+                stats.stream_progress = (file.downloaded as f64 / file.length as f64).min(1.0);
+            }
 
             tracing::debug!(
                 "get_statistics: file_idx={} file.progress={:.2}% total_done={} stream_progress={:.2}%",

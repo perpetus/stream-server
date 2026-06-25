@@ -33,6 +33,86 @@ pub fn uptime_secs() -> u64 {
     PROCESS_START.get_or_init(Instant::now).elapsed().as_secs()
 }
 
+/// Render every request header as `name=value` pairs for diagnostic logging.
+/// Credential headers are redacted to their byte length so logs can be shared
+/// without leaking secrets; non-UTF8 values are shown as `<binary:N bytes>` so
+/// the line always stays printable.
+fn format_headers(headers: &axum::http::HeaderMap) -> String {
+    fn is_sensitive(name: &axum::http::HeaderName) -> bool {
+        matches!(
+            name.as_str(),
+            "authorization" | "proxy-authorization" | "cookie" | "set-cookie"
+        )
+    }
+
+    let mut out = String::new();
+    for (name, value) in headers {
+        if !out.is_empty() {
+            out.push_str(", ");
+        }
+        out.push_str(name.as_str());
+        out.push('=');
+        if is_sensitive(name) {
+            out.push_str(&format!("<redacted:{} bytes>", value.len()));
+        } else {
+            match value.to_str() {
+                Ok(v) => out.push_str(v),
+                Err(_) => out.push_str(&format!("<binary:{} bytes>", value.len())),
+            }
+        }
+    }
+    out
+}
+
+/// Emit an ERROR log describing an unhandled route or request (a 404 fallback,
+/// a 405 method mismatch, or a catch-all route that matched but could not be
+/// served) with as much request context as is available: peer address, method,
+/// full URI, HTTP version, the common diagnostic headers broken out as their
+/// own fields, and a dump of every header. Centralised so that every
+/// "we did not serve this" code path logs identically and greppably.
+pub fn log_unhandled(
+    reason: &str,
+    status: u16,
+    peer: Option<std::net::SocketAddr>,
+    method: &axum::http::Method,
+    uri: &axum::http::Uri,
+    version: Option<axum::http::Version>,
+    headers: &axum::http::HeaderMap,
+) {
+    use axum::http::header;
+    let header_value = |name: &header::HeaderName| -> String {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string()
+    };
+    let peer = peer
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    tracing::error!(
+        reason,
+        status,
+        peer = %peer,
+        method = %method,
+        uri = %uri,
+        path = uri.path(),
+        query = uri.query().unwrap_or(""),
+        version = ?version,
+        host = %header_value(&header::HOST),
+        user_agent = %header_value(&header::USER_AGENT),
+        referer = %header_value(&header::REFERER),
+        origin = %header_value(&header::ORIGIN),
+        range = %header_value(&header::RANGE),
+        content_type = %header_value(&header::CONTENT_TYPE),
+        content_length = %header_value(&header::CONTENT_LENGTH),
+        header_count = headers.len(),
+        headers = %format_headers(headers),
+        "unhandled request"
+    );
+}
+
 pub fn active_direct_streams() -> u64 {
     ACTIVE_DIRECT_STREAMS.load(Ordering::Relaxed)
 }

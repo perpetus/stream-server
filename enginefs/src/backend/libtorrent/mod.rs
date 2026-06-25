@@ -45,6 +45,8 @@ pub struct LibtorrentBackend {
     piece_cache: Arc<crate::piece_cache::PieceCacheManager>,
     /// Registry of wakers waiting for pieces to finish downloading
     piece_waiter: Arc<crate::piece_waiter::PieceWaiterRegistry>,
+    /// Pinned metadata-critical (Cues/moov) pieces that out-rank the playback head
+    metadata_pins: Arc<crate::metadata_pins::MetadataPinRegistry>,
     /// Torrent/file metadata inspections already scheduled for this backend lifetime
     metadata_inspections: Arc<tokio::sync::Mutex<std::collections::HashSet<(String, usize)>>>,
     /// Torrents whose files have been initialized to priority 0 after metadata arrival.
@@ -163,6 +165,7 @@ impl LibtorrentBackend {
         ));
 
         let piece_waiter = Arc::new(crate::piece_waiter::PieceWaiterRegistry::new());
+        let metadata_pins = Arc::new(crate::metadata_pins::MetadataPinRegistry::new());
         let metadata_inspections =
             Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
         let file_priority_initializations =
@@ -177,6 +180,7 @@ impl LibtorrentBackend {
             stream_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             piece_cache,
             piece_waiter,
+            metadata_pins,
             metadata_inspections,
             file_priority_initializations,
         };
@@ -236,6 +240,7 @@ impl LibtorrentBackend {
         ));
 
         let piece_waiter = Arc::new(crate::piece_waiter::PieceWaiterRegistry::new());
+        let metadata_pins = Arc::new(crate::metadata_pins::MetadataPinRegistry::new());
         let metadata_inspections =
             Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
         let file_priority_initializations =
@@ -250,6 +255,7 @@ impl LibtorrentBackend {
             stream_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             piece_cache,
             piece_waiter,
+            metadata_pins,
             metadata_inspections,
             file_priority_initializations,
         };
@@ -737,6 +743,7 @@ impl TorrentBackend for LibtorrentBackend {
             stream_counter: self.stream_counter.clone(),
             piece_cache: self.piece_cache.clone(),
             piece_waiter: self.piece_waiter.clone(),
+            metadata_pins: self.metadata_pins.clone(),
             metadata_inspections: self.metadata_inspections.clone(),
             file_priority_initializations: self.file_priority_initializations.clone(),
         })
@@ -754,6 +761,7 @@ impl TorrentBackend for LibtorrentBackend {
                 stream_counter: self.stream_counter.clone(),
                 piece_cache: self.piece_cache.clone(),
                 piece_waiter: self.piece_waiter.clone(),
+                metadata_pins: self.metadata_pins.clone(),
                 metadata_inspections: self.metadata_inspections.clone(),
                 file_priority_initializations: self.file_priority_initializations.clone(),
             }),

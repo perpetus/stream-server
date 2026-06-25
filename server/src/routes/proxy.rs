@@ -19,16 +19,19 @@ pub fn router() -> Router<AppState> {
 
 pub async fn proxy_handler(
     Path(rest): Path<String>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
     method: Method,
 ) -> impl IntoResponse {
     // Porting the logic from express_805.js
     // Format 1: ?d=URL (standard)
-    // Format 2: /<query_params>/<path> (Core) where query_params contains d=ORIGIN&h=HEADER
+    // Format 2: /<query_params>/<path> (Core) where query_params contains d=ORIGIN&h=HEADER&r=RESPONSE_HEADER
 
     let mut target_url = String::new();
     let mut custom_headers = HashMap::new();
+    let mut custom_response_headers = HashMap::new();
+    let mut is_path_format = false;
 
     // Check for standard query param '?d='
     if let Some(d) = params.get("d") {
@@ -36,6 +39,7 @@ pub async fn proxy_handler(
         // Fallback: If rest is not empty and d is just origin, we might need to append rest?
         // But usually ?d=FULL_URL
     } else {
+        is_path_format = true;
         // Handle path-based format: /proxy/d=...&h=.../path/to/file
         // Split rest by first slash to get query_segment and path
         let (query_seg, path_seg) = match rest.split_once('/') {
@@ -51,6 +55,12 @@ pub async fn proxy_handler(
                     // Header format "Name:Value"
                     if let Some((name, value)) = val.split_once(':') {
                         custom_headers.insert(name.trim().to_string(), value.trim().to_string());
+                    }
+                }
+                "r" => {
+                    // Response header format "Name:Value"
+                    if let Some((name, value)) = val.split_once(':') {
+                        custom_response_headers.insert(name.trim().to_string(), value.trim().to_string());
                     }
                 }
                 _ => {}
@@ -74,10 +84,16 @@ pub async fn proxy_handler(
         }
     }
 
-    let url = match Url::parse(&target_url) {
+    let mut url = match Url::parse(&target_url) {
         Ok(u) => u,
         Err(_) => return (StatusCode::BAD_REQUEST, "Invalid target URL").into_response(),
     };
+
+    if is_path_format {
+        if let Some(q) = raw_query {
+            url.set_query(Some(&q));
+        }
+    }
 
     let client = Client::builder()
         .danger_accept_invalid_certs(true) // Parity with rejectUnauthorized: false
@@ -135,6 +151,11 @@ pub async fn proxy_handler(
         if let Some(value) = res_headers.get(name) {
             res_builder = res_builder.header(name, value);
         }
+    }
+
+    // Apply custom response headers (Core format)
+    for (name, value) in custom_response_headers {
+        res_builder = res_builder.header(name, value);
     }
 
     // CORS headers

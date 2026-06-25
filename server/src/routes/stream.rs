@@ -737,12 +737,15 @@ pub async fn stream_video(
             (_, true, PlaybackIntent::DirectInitial | PlaybackIntent::HlsInitial) => {
                 Some(Duration::from_secs(2))
             }
+            // Tail Cues/moov live on the rare pieces at the end of the file and
+            // can take a few seconds to arrive even when prioritized; wait longer
+            // (still non-fatal) so the route doesn't return a 206 whose body then
+            // hangs and drives the player into a ~60s retry loop.
+            (_, true, PlaybackIntent::ContainerMetadata) => Some(Duration::from_secs(4)),
             (
                 _,
                 true,
-                PlaybackIntent::DirectSeek
-                | PlaybackIntent::HlsSeek
-                | PlaybackIntent::ContainerMetadata,
+                PlaybackIntent::DirectSeek | PlaybackIntent::HlsSeek,
             ) => Some(Duration::from_millis(750)),
             (_, true, _) => None,
             (_, false, PlaybackIntent::DirectInitial) => Some(Duration::from_secs(5)),

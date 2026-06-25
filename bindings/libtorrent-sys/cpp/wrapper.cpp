@@ -463,6 +463,11 @@ std::unique_ptr<TorrentHandle> session_add_magnet(Session &session,
   // direct conflict with) our explicit handle_pause/handle_resume calls. We
   // always want full manual control, so clear the flag at creation time.
   p.flags &= ~lt::torrent_flags::auto_managed;
+  // The library default flags also include torrent_flags::paused, so a magnet
+  // torrent is added PAUSED and every peer connection waits until something
+  // resumes it. Clear it here so the torrent starts running immediately and a
+  // stream never has to fight an initial (or spuriously re-applied) pause.
+  p.flags &= ~lt::torrent_flags::paused;
 
   lt::torrent_handle h = session.session.add_torrent(p);
   if (!h.is_valid())

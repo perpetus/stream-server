@@ -273,10 +273,20 @@ async fn run_inner(
         let json_writer = log_writers.json_writer;
         let guards = log_writers.guards;
 
-        let registry = tracing_subscriber::registry().with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "server=info,tower_http=info,enginefs=info".into()),
-        );
+        // Default log directives, applied WITHOUT any environment variable. The
+        // application code lives in the `stream_server` lib crate (targets
+        // `stream_server::*`); `server` covers the thin `server` bin
+        // (src/main.rs). Both must be listed or the lib rename silently filters
+        // out every log line. `RUST_LOG` only overrides this when it is set to a
+        // non-empty value; an unset or blank `RUST_LOG` keeps the default below.
+        const DEFAULT_LOG_FILTER: &str =
+            "server=info,stream_server=info,tower_http=info,enginefs=info";
+        let log_filter = std::env::var("RUST_LOG")
+            .ok()
+            .filter(|directives| !directives.trim().is_empty())
+            .map(tracing_subscriber::EnvFilter::new)
+            .unwrap_or_else(|| tracing_subscriber::EnvFilter::new(DEFAULT_LOG_FILTER));
+        let registry = tracing_subscriber::registry().with(log_filter);
         let human_file_layer = tracing_subscriber::fmt::layer()
             .with_writer(human_writer)
             .with_ansi(false);
@@ -518,6 +528,42 @@ async fn run_inner(
         }
     }
 
+    fn peer_from_request(req: &axum::extract::Request) -> Option<SocketAddr> {
+        req.extensions()
+            .get::<axum::extract::ConnectInfo<SocketAddr>>()
+            .map(|info| info.0)
+    }
+
+    async fn fallback_handler(
+        req: axum::extract::Request,
+    ) -> impl axum::response::IntoResponse {
+        diagnostics::logging::log_unhandled(
+            "no matching route (404)",
+            StatusCode::NOT_FOUND.as_u16(),
+            peer_from_request(&req),
+            req.method(),
+            req.uri(),
+            Some(req.version()),
+            req.headers(),
+        );
+        StatusCode::NOT_FOUND
+    }
+
+    async fn method_not_allowed_handler(
+        req: axum::extract::Request,
+    ) -> impl axum::response::IntoResponse {
+        diagnostics::logging::log_unhandled(
+            "method not allowed for matched route (405)",
+            StatusCode::METHOD_NOT_ALLOWED.as_u16(),
+            peer_from_request(&req),
+            req.method(),
+            req.uri(),
+            Some(req.version()),
+            req.headers(),
+        );
+        StatusCode::METHOD_NOT_ALLOWED
+    }
+
     let app = Router::new()
         .route("/", get(root_redirect))
         .route("/heartbeat", get(routes::system::heartbeat))
@@ -541,6 +587,7 @@ async fn run_inner(
             "/{infoHash}/create",
             get(routes::engine::create_magnet_get).post(routes::engine::create_magnet),
         )
+        .nest("/{ipc_key}/downloader", routes::downloader::router())
         .route("/{infoHash}/remove", get(routes::engine::remove_engine))
         .route(
             "/{infoHash}/stats.json",
@@ -626,7 +673,17 @@ async fn run_inner(
         .route("/thumb.jpg", get(|| async { StatusCode::NOT_FOUND }))
         .nest("/casting", routes::casting::router())
         .route("/favicon.ico", get(|| async { StatusCode::NOT_FOUND }))
-        .layer(TraceLayer::new_for_http())
+        .fallback(fallback_handler)
+        .method_not_allowed_fallback(method_not_allowed_handler)
+        .layer(
+            TraceLayer::new_for_http().make_span_with(|request: &axum::http::Request<_>| {
+                tracing::info_span!(
+                    "request",
+                    method = %request.method(),
+                    uri = %request.uri(),
+                )
+            }),
+        )
         .layer(CorsLayer::permissive())
         .with_state(state);
 

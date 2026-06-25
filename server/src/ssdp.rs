@@ -11,6 +11,7 @@ pub struct Device {
     pub name: String,
     pub address: String,
     pub port: u16,
+    #[serde(rename = "type")]
     pub device_type: String,
     pub model: Option<String>,
 }

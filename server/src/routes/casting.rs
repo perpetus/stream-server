@@ -138,9 +138,17 @@ pub async fn transcode(Query(params): Query<TranscodeParams>) -> Response {
 }
 
 pub async fn player_control(
+    method: axum::http::Method,
     Path(dev_id): Path<String>,
-    Query(params): Query<PlayerParams>,
+    Query(query_params): Query<PlayerParams>,
+    body: Option<Json<PlayerParams>>,
 ) -> impl IntoResponse {
+    let params = if method == axum::http::Method::POST {
+        body.map(|Json(b)| b).unwrap_or(query_params)
+    } else {
+        query_params
+    };
+
     let response_json = json!({
         "deviceId": dev_id,
         "status": "not_implemented",

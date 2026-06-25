@@ -96,12 +96,20 @@ pub fn disk_backed_sequential_download(intent: PlaybackIntent) -> bool {
 pub fn disk_backed_file_baseline_priority(intent: PlaybackIntent) -> i32 {
     match intent {
         PlaybackIntent::DownloadFull | PlaybackIntent::DownloadRange => 7,
+        // Every streaming intent keeps the WHOLE file minimally wanted
+        // (priority 1). A baseline of 0 leaves only the forward window wanted, so
+        // once that small window verifies the torrent reports is_finished and
+        // drops to seeding/idle -- the download rate craters, read-ahead stops,
+        // and (with seeding disabled) the upload is throttled mid-stream. With
+        // baseline 1 the file stays "downloading" until it is actually complete;
+        // the forward window (priority 7 + deadlines) still concentrates
+        // bandwidth on the requested region, so seek/startup stay fast.
         PlaybackIntent::DirectInitial
         | PlaybackIntent::DirectSeek
         | PlaybackIntent::HlsInitial
         | PlaybackIntent::HlsSeek
-        | PlaybackIntent::ContainerMetadata => 0,
-        PlaybackIntent::DirectSequential
+        | PlaybackIntent::ContainerMetadata
+        | PlaybackIntent::DirectSequential
         | PlaybackIntent::HlsSequential
         | PlaybackIntent::InternalProbe
         | PlaybackIntent::Background => 1,
@@ -115,7 +123,11 @@ pub fn disk_backed_forward_window_pieces(intent: PlaybackIntent) -> i32 {
         PlaybackIntent::DirectInitial | PlaybackIntent::HlsInitial => MAX_STARTUP_PIECES - 1,
         PlaybackIntent::DirectSeek | PlaybackIntent::DirectSequential => 31,
         PlaybackIntent::HlsSeek | PlaybackIntent::HlsSequential => 15,
-        PlaybackIntent::ContainerMetadata => 1,
+        // The container seek index (MKV Cues / MP4 moov) spans several pieces;
+        // 16 lets the 16 MB MAX_CONTAINER_METADATA_WINDOW_BYTES cap govern (via
+        // cap_pieces_by_bytes) so the whole region downloads in parallel instead
+        // of one rare piece at a time.
+        PlaybackIntent::ContainerMetadata => 16,
         PlaybackIntent::InternalProbe => 1,
         PlaybackIntent::Background => 0,
     }
@@ -658,10 +670,13 @@ mod tests {
     }
 
     #[test]
-    fn disk_backed_container_metadata_uses_tiny_window() {
+    fn disk_backed_container_metadata_window_covers_cues_region() {
+        // The Cues/moov region spans several pieces; the window is wide enough
+        // for the 16 MB byte cap (cap_pieces_by_bytes) to govern so the whole
+        // index downloads in parallel instead of one rare piece at a time.
         assert_eq!(
             disk_backed_forward_window_pieces(PlaybackIntent::ContainerMetadata),
-            1
+            16
         );
         assert!(
             disk_backed_forward_window_pieces(PlaybackIntent::DownloadFull)
@@ -670,18 +685,22 @@ mod tests {
     }
 
     #[test]
-    fn disk_backed_blocking_streams_use_strict_file_baseline() {
+    fn disk_backed_streaming_keeps_whole_file_wanted() {
+        // Streaming intents keep the whole file minimally wanted (priority 1) so
+        // the torrent never reports is_finished after just the forward window
+        // completes (which stalls read-ahead / idles the download). Downloads
+        // stay at 7.
         assert_eq!(
             disk_backed_file_baseline_priority(PlaybackIntent::DirectInitial),
-            0
+            1
         );
         assert_eq!(
             disk_backed_file_baseline_priority(PlaybackIntent::DirectSeek),
-            0
+            1
         );
         assert_eq!(
             disk_backed_file_baseline_priority(PlaybackIntent::ContainerMetadata),
-            0
+            1
         );
         assert_eq!(
             disk_backed_file_baseline_priority(PlaybackIntent::DirectSequential),

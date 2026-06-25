@@ -792,12 +792,24 @@ pub async fn hls_v2_resource(
 
 pub async fn legacy_hls_resource(
     State(state): State<AppState>,
+    method: axum::http::Method,
+    uri: axum::http::Uri,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
     Path((first, second, resource)): Path<(String, String, String)>,
     headers: axum::http::HeaderMap,
     raw_query: axum::extract::RawQuery,
 ) -> Response {
     let Some((info_hash, requested_idx)) = legacy_pair(&first, &second) else {
-        return compat::unsupported("legacy file/url HLS resource");
+        crate::diagnostics::logging::log_unhandled(
+            "matched legacy HLS resource wildcard but not a valid info-hash/idx pair (404)",
+            StatusCode::NOT_FOUND.as_u16(),
+            Some(peer),
+            &method,
+            &uri,
+            None,
+            &headers,
+        );
+        return (StatusCode::NOT_FOUND, "legacy file/url HLS resource not found").into_response();
     };
     let file_idx = match resolve_legacy_file_idx(&state, &info_hash, &requested_idx).await {
         Ok(idx) => idx,
@@ -853,18 +865,41 @@ pub async fn legacy_hls_resource(
             )
             .await
         }
-        _ => (StatusCode::NOT_FOUND, "legacy HLS resource not found").into_response(),
+        _ => {
+            crate::diagnostics::logging::log_unhandled(
+                "legacy HLS resource resolved torrent but resource is unknown (404)",
+                StatusCode::NOT_FOUND.as_u16(),
+                Some(peer),
+                &method,
+                &uri,
+                None,
+                &headers,
+            );
+            (StatusCode::NOT_FOUND, "legacy HLS resource not found").into_response()
+        }
     }
 }
 
 pub async fn legacy_hls_segment(
     State(state): State<AppState>,
+    method: axum::http::Method,
+    uri: axum::http::Uri,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
     headers: axum::http::HeaderMap,
     Path((first, second, variant, seg)): Path<(String, String, String, String)>,
     raw_query: axum::extract::RawQuery,
 ) -> Response {
     let Some((info_hash, requested_idx)) = legacy_pair(&first, &second) else {
-        return compat::unsupported("legacy file/url HLS segment");
+        crate::diagnostics::logging::log_unhandled(
+            "matched legacy HLS segment wildcard but not a valid info-hash/idx pair (404)",
+            StatusCode::NOT_FOUND.as_u16(),
+            Some(peer),
+            &method,
+            &uri,
+            None,
+            &headers,
+        );
+        return (StatusCode::NOT_FOUND, "legacy file/url HLS segment not found").into_response();
     };
     let file_idx = match resolve_legacy_file_idx(&state, &info_hash, &requested_idx).await {
         Ok(idx) => idx,

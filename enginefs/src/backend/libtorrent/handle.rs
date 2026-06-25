@@ -43,6 +43,8 @@ pub struct LibtorrentTorrentHandle {
     pub(crate) piece_cache: Arc<crate::piece_cache::PieceCacheManager>,
     /// Registry of wakers waiting for pieces to finish downloading
     pub(crate) piece_waiter: Arc<crate::piece_waiter::PieceWaiterRegistry>,
+    /// Pinned metadata-critical (Cues/moov) pieces that out-rank the playback head
+    pub(crate) metadata_pins: Arc<crate::metadata_pins::MetadataPinRegistry>,
     /// Torrent/file metadata inspections already scheduled for this backend lifetime
     pub(crate) metadata_inspections:
         Arc<tokio::sync::Mutex<std::collections::HashSet<(String, usize)>>>,
@@ -614,6 +616,7 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
                 stream_id,
                 playback_intent,
                 self.piece_waiter.clone(),
+                self.metadata_pins.clone(),
             )));
         }
 
@@ -1001,6 +1004,7 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
                     if !critical_ranges.is_empty() {
                         let session = this.session.read().await;
                         if let Ok(mut handle) = session.find_torrent(&this.info_hash) {
+                            let mut pinned: Vec<i32> = Vec::new();
                             for (offset, len) in &critical_ranges {
                                 let start_piece =
                                     ((file_offset as u64 + offset) / piece_length as u64) as i32;
@@ -1010,14 +1014,23 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
                                         as i32;
 
                                 for p in start_piece..=end_piece {
-                                    if p >= first_piece && p <= last_piece {
-                                        // Player needs Cues/moov to start; this runs once per file.
-                                        handle.set_piece_deadline(p, 150);
+                                    if p >= first_piece && p <= last_piece && !handle.have_piece(p) {
+                                        // Player needs Cues/moov to start; prefetch them at top
+                                        // priority with an immediate deadline.
+                                        handle.set_piece_priority(p, 7);
+                                        handle.set_piece_deadline(p, 0);
+                                        pinned.push(p);
                                     }
                                 }
                             }
+                            // Pin the still-missing metadata pieces so a concurrent head
+                            // stream keeps them ranked above its own read-ahead (its
+                            // set_file_priority would otherwise reset them) until they verify.
+                            this.metadata_pins
+                                .pin_pieces(&this.info_hash, pinned.iter().copied());
                             tracing::info!(
-                                "Background Metadata Inspection: Prioritized {} critical metadata ranges (Deadline 200ms)",
+                                pinned = pinned.len(),
+                                "Background Metadata Inspection: Prioritized {} critical metadata ranges",
                                 critical_ranges.len()
                             );
                         }
@@ -1322,6 +1335,7 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
                         auto_managed = status.is_auto_managed,
                         state = status.state,
                         finished = status.is_finished,
+                        error = %status.error,
                         verified_piece_count,
                         ready_pieces = ready,
                         target_pieces,
