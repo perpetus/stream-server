@@ -12,7 +12,7 @@ anyhow = "1.0"
 hex = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-sha2 = "0.10"
+sha2 = "0.11"
 sysinfo = "0.37"
 
 [build-dependencies]

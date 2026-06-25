@@ -48,7 +48,7 @@ lz-str = "0.2.1"
 tempfile = "3.23.0"
 mimalloc = { version = "0.1.48", default-features = false }
 rayon = "1.11.0"
-sha2 = "0.10"
+sha2 = "0.11"
 semver = "1.0"
 ratatui = "0.29.0"
 crossterm = "0.29.0"
