@@ -80,7 +80,7 @@ chrono = "0.4.42"
 sysinfo = "0.37"
 
 [target.'cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))'.dependencies]
-tao = "0.34.5"
+tao = "0.35.3"
 tray-icon = { version = "0.21.2", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
