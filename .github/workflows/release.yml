@@ -99,7 +99,7 @@ jobs:
           PKG_CONFIG_PATH: ${{ github.workspace }}\vcpkg_installed\x64-windows-static-release\lib\pkgconfig
 
       - name: Upload EXE
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: server-windows-amd64
           path: |
@@ -117,7 +117,7 @@ jobs:
 
 
       - name: Upload MSI
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: server-windows-msi
           path: target/wix/*.msi
@@ -201,19 +201,19 @@ jobs:
           ./linuxdeploy-x86_64.AppImage --appdir AppDir --output appimage || true
 
       - name: Upload Binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: server-linux-amd64
           path: target/release/server
 
       - name: Upload DEB
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: server-linux-deb
           path: target/debian/*.deb
 
       - name: Upload AppImage
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: server-linux-appimage
           path: "*.AppImage"
@@ -277,7 +277,7 @@ jobs:
           su builder -c "makepkg -sf --noconfirm"
 
       - name: Upload Arch Package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: server-arch-pkg
           path: pkg/*.pkg.tar.zst
