@@ -1,0 +1,30 @@
+version: 2
+updates:
+  # Rust crates across the whole Cargo workspace (enginefs, server, bindings, ...)
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "deps"
+    # Batch low-risk updates into a single PR to cut noise; majors stay separate.
+    groups:
+      cargo-minor-and-patch:
+        update-types:
+          - "minor"
+          - "patch"
+
+  # Actions used by the release workflow (.github/workflows/*.yml)
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "ci"
+    groups:
+      github-actions:
+        update-types:
+          - "minor"
+          - "patch"

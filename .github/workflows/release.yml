@@ -312,9 +312,39 @@ jobs:
           (cd release && sha256sum * > SHA256SUMS.txt)
           ls -la release/
 
+      - name: Generate release description
+        run: |
+          # Project description + per-platform download guide. action-gh-release
+          # pre-pends this to the auto-generated "What's Changed" notes. Written
+          # to the workspace root (NOT release/) so it is not uploaded as an asset.
+          echo "## Stream Server ${GITHUB_REF_NAME}" > "${GITHUB_WORKSPACE}/RELEASE_BODY.md"
+          cat >> "${GITHUB_WORKSPACE}/RELEASE_BODY.md" <<'EOF'
+
+          High-performance torrent streaming server with HLS transcoding and a
+          Stremio-compatible streaming API. Features disk-backed downloads,
+          hardware-accelerated transcoding, and an embedded HTTP server.
+
+          ### Downloads
+
+          | Platform | Asset |
+          | --- | --- |
+          | Windows (installer) | `*.msi` |
+          | Windows (portable) | `stream-server-windows-amd64.exe` |
+          | Debian / Ubuntu | `*.deb` |
+          | Linux (portable) | `stream-server-linux-amd64` |
+          | Linux (AppImage) | `*.AppImage` |
+          | Arch Linux | `*.pkg.tar.zst` |
+
+          Verify your download against `SHA256SUMS.txt`.
+
+          ---
+          EOF
+          cat "${GITHUB_WORKSPACE}/RELEASE_BODY.md"
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: release/*
+          body_path: ${{ github.workspace }}/RELEASE_BODY.md
           generate_release_notes: true
           prerelease: ${{ contains(github.ref, 'beta') || contains(github.ref, 'alpha') || contains(github.ref, 'rc') }}
