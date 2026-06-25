@@ -37,7 +37,7 @@ jobs:
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN);
 
       - name: Cache vcpkg installed packages
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: vcpkg_installed
           key: ${{ runner.os }}-vcpkg-static-release-${{ hashFiles('vcpkg.json') }}
@@ -66,7 +66,7 @@ jobs:
         run: cargo chef prepare --recipe-path recipe.json
 
       - name: Cargo Chef Cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: target
           key: ${{ runner.os }}-cargo-chef-${{ hashFiles('recipe.json') }}
@@ -152,7 +152,7 @@ jobs:
         run: cargo chef prepare --recipe-path recipe.json
 
       - name: Cargo Chef Cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: target
           key: ${{ runner.os }}-cargo-chef-${{ hashFiles('recipe.json') }}
@@ -232,7 +232,7 @@ jobs:
           pacman -S --noconfirm base-devel rust git openssl pkg-config libtorrent-rasterbar boost clang gtk3 libayatana-appindicator
 
       - name: Cargo Cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             target
