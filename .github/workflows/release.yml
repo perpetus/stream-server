@@ -342,7 +342,7 @@ jobs:
           cat "${GITHUB_WORKSPACE}/RELEASE_BODY.md"
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: release/*
           body_path: ${{ github.workspace }}/RELEASE_BODY.md
