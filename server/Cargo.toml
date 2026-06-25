@@ -50,7 +50,7 @@ mimalloc = { version = "0.1.48", default-features = false }
 rayon = "1.11.0"
 sha2 = "0.10"
 semver = "1.0"
-ratatui = "0.29.0"
+ratatui = "0.30.0"
 crossterm = "0.29.0"
 crossbeam-channel = "0.5.13"
 notify = { version = "8.2.0", default-features = false, features = [
