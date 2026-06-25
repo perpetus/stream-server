@@ -36,7 +36,7 @@ fn get_season_regex() -> &'static Regex {
 
 fn get_episode_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?i)(?<=\W|\d)E(\d{2})").unwrap())
+    RE.get_or_init(|| Regex::new(r"(?i)E(\d{2})").unwrap())
 }
 
 fn get_year_regex() -> &'static Regex {
@@ -47,6 +47,19 @@ fn get_year_regex() -> &'static Regex {
 fn get_sample_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"(?i)(sample|etrg)").unwrap())
+}
+
+fn has_episode_prefix(text: &str, episode_start: usize) -> bool {
+    text[..episode_start]
+        .chars()
+        .next_back()
+        .is_some_and(|ch| !ch.is_alphanumeric() || ch.is_numeric())
+}
+
+fn has_episode_marker(text: &str) -> bool {
+    get_episode_regex()
+        .captures_iter(text)
+        .any(|caps| caps.get(0).is_some_and(|m| has_episode_prefix(text, m.start())))
 }
 
 pub fn parse_filename(path: &Path) -> Option<VideoMetadata> {
@@ -77,6 +90,12 @@ pub fn parse_filename(path: &Path) -> Option<VideoMetadata> {
 
     let mut episodes = Vec::new();
     for caps in get_episode_regex().captures_iter(&clean_name) {
+        let Some(episode_match) = caps.get(0) else {
+            continue;
+        };
+        if !has_episode_prefix(&clean_name, episode_match.start()) {
+            continue;
+        }
         if let Some(e) = caps.get(1) {
             if let Ok(ep) = e.as_str().parse::<i32>() {
                 episodes.push(ep);
@@ -99,7 +118,7 @@ pub fn parse_filename(path: &Path) -> Option<VideoMetadata> {
     for part in parts {
         if get_year_regex().is_match(part)
             || get_season_regex().is_match(part)
-            || get_episode_regex().is_match(part)
+            || has_episode_marker(part)
             || get_movie_keywords().is_match(part)
         {
             break;
@@ -134,4 +153,27 @@ pub fn parse_filename(path: &Path) -> Option<VideoMetadata> {
     }
 
     Some(meta)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_filename;
+    use std::path::Path;
+
+    #[test]
+    fn parses_compact_season_episode() {
+        let meta = parse_filename(Path::new("Some.Show.S01E02.mkv")).unwrap();
+
+        assert_eq!(meta.name.as_deref(), Some("Some Show"));
+        assert_eq!(meta.season, Some(1));
+        assert_eq!(meta.episode, Some(vec![2]));
+        assert_eq!(meta.type_, "series");
+    }
+
+    #[test]
+    fn preserves_leading_episode_marker_behavior() {
+        let meta = parse_filename(Path::new("E02.Some.Show.mkv")).unwrap();
+
+        assert_eq!(meta.episode, None);
+    }
 }
