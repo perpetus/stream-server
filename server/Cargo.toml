@@ -31,7 +31,7 @@ anyhow = "1.0"
 tokio-util = { version = "0.7.17", features = ["io", "compat"] }
 hex = "0.4"
 librqbit = { version = "8.1.1", optional = true }
-if-addrs = "0.14.0"
+if-addrs = "0.15.0"
 urlencoding = "2.1"
 regex = "1.11"
 reqwest = { version = "0.12.26", features = ["blocking", "json", "stream"] }
