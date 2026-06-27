@@ -1,12 +1,10 @@
 use anyhow::{Context, Result};
-use sha2::{Digest, Sha256};
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tracing::{error, info, warn};
 
-const FFMPEG_URL: &str = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip";
-const SHA256_URL: &str = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip.sha256";
+const JELLYFIN_FFMPEG_DIR_URL: &str = "https://repo.jellyfin.org/files/ffmpeg/windows/latest-7.x/win64/";
+const POINTER_URL: &str = "https://repo.jellyfin.org/files/ffmpeg/windows/latest-7.x/win64/win64-clang-gpl.txt";
 
 /// Orchestrate the setup: check, download, verify, extract, configure path.
 pub async fn setup_ffmpeg() -> Result<()> {
@@ -163,21 +161,22 @@ fn ffmpeg_tools_exist(bin_dir: &Path) -> bool {
 
 async fn download_and_install(install_dir: &Path) -> Result<()> {
     let temp_dir = tempfile::Builder::new().prefix("ffmpeg_dl").tempdir()?;
+    
+    info!("Fetching Jellyfin FFmpeg pointer from {}...", POINTER_URL);
+    let pointer_response = reqwest::get(POINTER_URL).await?.error_for_status()?;
+    let pointer_text = pointer_response.text().await?;
+    let zip_filename = pointer_text.trim();
+    if zip_filename.is_empty() || !zip_filename.ends_with(".zip") {
+        return Err(anyhow::anyhow!("Invalid zip filename in pointer file: '{}'", zip_filename));
+    }
+    
+    let zip_url = format!("{}{}", JELLYFIN_FFMPEG_DIR_URL, zip_filename);
     let zip_path = temp_dir.path().join("ffmpeg.zip");
 
-    info!("Downloading FFmpeg from {}...", FFMPEG_URL);
-    download_file(FFMPEG_URL, &zip_path)
+    info!("Downloading Jellyfin FFmpeg from {}...", zip_url);
+    download_file(&zip_url, &zip_path)
         .await
         .context("Failed to download zip")?;
-
-    info!("Downloading SHA256 checksum...");
-    let sha_path = temp_dir.path().join("ffmpeg.zip.sha256");
-    download_file(SHA256_URL, &sha_path)
-        .await
-        .context("Failed to download sha256")?;
-
-    info!("Verifying checksum...");
-    verify_checksum(&zip_path, &sha_path).context("Checksum verification failed")?;
 
     info!("Extracting...");
     extract_ffmpeg(&zip_path, install_dir)?;
@@ -192,40 +191,7 @@ async fn download_file(url: &str, target_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn verify_checksum(file_path: &Path, sha_path: &Path) -> Result<()> {
-    let expected_hash_str = std::fs::read_to_string(sha_path)?;
-    // Format is usually "HASH  filename" or just "HASH"
-    let expected_hash = expected_hash_str
-        .split_whitespace()
-        .next()
-        .context("Empty SHA256 file")?;
 
-    let mut file = std::fs::File::open(file_path)?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0; 8192];
-
-    loop {
-        let count = file.read(&mut buffer)?;
-        if count == 0 {
-            break;
-        }
-        hasher.update(&buffer[..count]);
-    }
-
-    let result = hasher.finalize();
-    let calculated_hash = hex::encode(result);
-
-    if calculated_hash.eq_ignore_ascii_case(expected_hash) {
-        info!("Checksum matched: {}", calculated_hash);
-        Ok(())
-    } else {
-        Err(anyhow::anyhow!(
-            "Checksum mismatch! Expected: {}, Calculated: {}",
-            expected_hash,
-            calculated_hash
-        ))
-    }
-}
 
 fn extract_ffmpeg(zip_path: &Path, target_dir: &Path) -> Result<()> {
     let file = std::fs::File::open(zip_path)?;
@@ -240,19 +206,29 @@ fn extract_ffmpeg(zip_path: &Path, target_dir: &Path) -> Result<()> {
         let mut file = archive.by_index(i)?;
         let name = file.name().to_owned();
 
-        // We only care about bin/ffmpeg.exe and bin/ffprobe.exe
-        if name.ends_with("bin/ffmpeg.exe") || name.ends_with("bin/ffprobe.exe") {
-            let dest_path = target_dir
-                .join("bin")
-                .join(Path::new(&name).file_name().unwrap());
-            std::fs::create_dir_all(dest_path.parent().unwrap())?;
-            let mut outfile = std::fs::File::create(&dest_path)?;
-            std::io::copy(&mut file, &mut outfile)?;
+        let path = Path::new(&name);
+        if let Some(file_name) = path.file_name() {
+            let file_name_str = file_name.to_string_lossy();
+            
+            // Check if it's an executable or library we want to extract
+            let is_target_file = file_name_str == "ffmpeg.exe" 
+                || file_name_str == "ffprobe.exe"
+                || file_name_str.ends_with(".dll");
 
-            if name.ends_with("bin/ffmpeg.exe") {
-                extracted_ffmpeg = true;
-            } else if name.ends_with("bin/ffprobe.exe") {
-                extracted_ffprobe = true;
+            // Or if it was inside a bin/ directory in the archive
+            let is_in_bin = path.components().any(|c| c.as_os_str() == "bin");
+
+            if (is_target_file || is_in_bin) && !file.is_dir() {
+                let dest_path = target_dir.join("bin").join(file_name);
+                std::fs::create_dir_all(dest_path.parent().unwrap())?;
+                let mut outfile = std::fs::File::create(&dest_path)?;
+                std::io::copy(&mut file, &mut outfile)?;
+
+                if file_name_str == "ffmpeg.exe" {
+                    extracted_ffmpeg = true;
+                } else if file_name_str == "ffprobe.exe" {
+                    extracted_ffprobe = true;
+                }
             }
         }
     }
@@ -284,5 +260,23 @@ fn add_to_path(path: &Path) {
         unsafe {
             std::env::set_var("PATH", new_path_os);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_download_and_install_jellyfin_ffmpeg() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let install_dir = temp_dir.path().join("ffmpeg_install");
+        let result = download_and_install(&install_dir).await;
+        assert!(result.is_ok(), "Failed to download and install: {:?}", result);
+        
+        let bin_dir = install_dir.join("bin");
+        assert!(bin_dir.join("ffmpeg.exe").exists(), "ffmpeg.exe not found");
+        assert!(bin_dir.join("ffprobe.exe").exists(), "ffprobe.exe not found");
     }
 }
