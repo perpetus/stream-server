@@ -132,6 +132,14 @@ static void apply_network_settings(lt::settings_pack &pack,
                settings.num_outgoing_ports);
 }
 
+static void set_bool_setting_if_supported(lt::settings_pack &pack,
+                                          char const *name, bool value) {
+  int const setting = lt::setting_by_name(name);
+  if (setting >= 0) {
+    pack.set_bool(setting, value);
+  }
+}
+
 static void apply_proxy_settings(lt::settings_pack &pack,
                                  SessionSettings const &settings) {
   pack.set_int(lt::settings_pack::proxy_type, settings.proxy_type);
@@ -147,8 +155,8 @@ static void apply_proxy_settings(lt::settings_pack &pack,
                 settings.proxy_peer_connections);
   pack.set_bool(lt::settings_pack::proxy_tracker_connections,
                 settings.proxy_tracker_connections);
-  pack.set_bool(lt::settings_pack::proxy_send_host_in_connect,
-                settings.proxy_send_host_in_connect);
+  set_bool_setting_if_supported(pack, "proxy_send_host_in_connect",
+                                settings.proxy_send_host_in_connect);
 }
 
 static lt::session_params make_session_params(lt::settings_pack pack,
