@@ -8,8 +8,10 @@ use tao::event_loop::EventLoop;
 use tracing::{error, info};
 use tray_icon::{
     Icon, TrayIcon, TrayIconBuilder,
-    menu::{CheckMenuItem, Menu, MenuEvent, MenuItem},
+    menu::{CheckMenuItem, IconMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem},
 };
+
+
 
 pub enum UserEvent {
     OpenWeb,
@@ -173,41 +175,66 @@ pub struct TrayHandle {
 }
 
 pub fn create_system_tray(event_loop: &EventLoop<UserEvent>) -> anyhow::Result<TrayHandle> {
-    // Stats display (disabled - just for showing info)
+    let icon = load_icon()?;
+
+    // --- Header: app icon + "Stream Server" (disabled) ---
+    // Resize to 16x16 for menu item display
+    let icon_bytes = include_bytes!("../../icons/icon_48.png");
+    let img = image::load_from_memory(icon_bytes)
+        .context("Failed to decode header icon")?
+        .resize_exact(16, 16, image::imageops::FilterType::Lanczos3)
+        .into_rgba8();
+    let (w, h) = img.dimensions();
+    let header_icon = tray_icon::menu::Icon::from_rgba(img.into_raw(), w, h)
+        .context("Failed to create header menu icon")?;
+    let header_item = IconMenuItem::new("Stream Server", false, Some(header_icon), None);
+
+    // --- Stats display (disabled - just for showing info) ---
     let stats_item = MenuItem::new("↓ -- | ↑ -- | 0 peers", false, None);
 
+    // --- Action items ---
     let open_item = MenuItem::new("Open Stremio Web", true, None);
-    let settings_item = MenuItem::new("Settings...", true, None);
+    let settings_item = MenuItem::new("Open settings", true, None);
     let logs_item = MenuItem::new("Open Logs Folder", true, None);
     let restart_item = MenuItem::new("Restart Server", true, None);
     let seeding_item = CheckMenuItem::new("Seed After Download", true, true, None);
+
+    // --- Update section ---
     let update_item = MenuItem::new("Update: unknown", false, None);
     let auto_update_item = CheckMenuItem::new("Auto-check for Updates", true, true, None);
     let check_update_item = MenuItem::new("Check for Updates", true, None);
     let install_update_item = MenuItem::new("Install Update", false, None);
-    let quit_item = MenuItem::new("Quit", true, None);
 
+    // --- Footer ---
+    let quit_item = MenuItem::new("Quit", true, None);
     let version_label = format!("v{}", env!("CARGO_PKG_VERSION"));
     let version_item = MenuItem::new(version_label.as_str(), false, None);
 
+    // Build menu layout with Riot Vanguard-style grouping
     let menu = Menu::new();
     menu.append_items(&[
+        // Header group
+        &header_item,
+        &PredefinedMenuItem::separator(),
+        // Stats
         &stats_item,
+        &PredefinedMenuItem::separator(),
+        // Actions
         &open_item,
         &settings_item,
-        &logs_item,
         &restart_item,
-        &seeding_item,
+        &PredefinedMenuItem::separator(),
+        // Update section
         &update_item,
         &auto_update_item,
         &check_update_item,
         &install_update_item,
+        &PredefinedMenuItem::separator(),
+        // Footer
         &quit_item,
         &version_item,
     ])
     .context("Failed to append menu items")?;
-
-    let icon = load_icon()?;
 
     let tray_icon = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
