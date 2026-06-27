@@ -41,7 +41,8 @@ mod app {
         let args: Vec<String> = std::env::args().collect();
         let no_tray = args.iter().any(|a| a == "--no-tray");
         let use_tui = args.iter().any(|a| a == "--tui");
-        let silent_mode = !no_tray && (args.iter().any(|a| a == "--silent") || !attached_console);
+        let is_release = !cfg!(debug_assertions);
+        let silent_mode = !no_tray && (args.iter().any(|a| a == "--silent") || !attached_console || is_release);
 
         let result = if silent_mode {
             run_tray_mode(use_tui)

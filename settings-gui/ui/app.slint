@@ -1,3 +1,4 @@
+import "./fonts/plus_jakarta_sans.ttf";
 import { ScrollView } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { Icons } from "icons.slint";
@@ -45,6 +46,7 @@ export struct FilterOption {
 }
 
 export component AppWindow inherits Window {
+    default-font-family: "Plus Jakarta Sans";
     title: "Stream Server Settings";
     icon: Icons.logo;
     preferred-width: 1040px;
