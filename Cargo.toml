@@ -8,6 +8,7 @@ members = [
     "bindings/async-sevenz",
     "stremio-runtime-stub",
     "updater-helper",
+    "settings-gui",
 ]
 
 [profile.release]

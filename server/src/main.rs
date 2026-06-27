@@ -43,15 +43,25 @@ mod app {
         let use_tui = args.iter().any(|a| a == "--tui");
         let silent_mode = !no_tray && (args.iter().any(|a| a == "--silent") || !attached_console);
 
-        if silent_mode {
+        let result = if silent_mode {
             run_tray_mode(use_tui)
         } else {
             run_headless_mode(use_tui)
+        };
+
+        if let Err(err) = result {
+            if is_missing_ffmpeg_error(&err) {
+                show_desktop_error_and_exit(&err);
+            }
+            return Err(err);
         }
+
+        Ok(())
     }
 
     fn run_tray_mode(use_tui: bool) -> anyhow::Result<()> {
-        let event_loop = EventLoopBuilder::<stream_server::tray::UserEvent>::with_user_event().build();
+        let event_loop =
+            EventLoopBuilder::<stream_server::tray::UserEvent>::with_user_event().build();
         let tray_handle = match stream_server::tray::create_system_tray(&event_loop) {
             Ok(t) => t,
             Err(e) => {
@@ -101,6 +111,9 @@ mod app {
                         std::process::exit(0);
                     }
                     Ok(_) => {}
+                    Err(e) if is_missing_ffmpeg_error(&e) => {
+                        show_desktop_error_and_exit(&e);
+                    }
                     Err(e) => {
                         eprintln!("Server crashed: {}", e);
                         std::thread::sleep(std::time::Duration::from_secs(2));
@@ -138,6 +151,18 @@ mod app {
                 match e {
                     stream_server::tray::UserEvent::OpenWeb => {
                         stream_server::tray::open_stremio_web();
+                    }
+                    stream_server::tray::UserEvent::OpenSettings => {
+                        let url = format!("http://127.0.0.1:{}", stream_server::DEFAULT_HTTP_PORT);
+                        if let Err(err) = stream_server::tray::open_settings_gui(&url) {
+                            tracing::error!("Failed to open settings GUI: {}", err);
+                            show_error_dialog(
+                                "Stream Server Settings",
+                                &format!(
+                                    "Could not open the settings window.\n\n{err}\n\nBuild or install the settings GUI next to the server executable."
+                                ),
+                            );
+                        }
                     }
                     stream_server::tray::UserEvent::OpenLogs => {
                         stream_server::tray::open_log_folder();
@@ -180,7 +205,7 @@ mod app {
 
                         tray_icon.set_tooltip(Some(&tooltip)).ok();
                         stats_item.set_text(&stats_line);
-                        update_item.set_text(&tray_stats.format_update_line());
+                        update_item.set_text(tray_stats.format_update_line());
                         auto_update_item.set_checked(tray_stats.auto_update_enabled());
                         seeding_item.set_checked(tray_stats.seeding_enabled());
                         install_update_item.set_enabled(tray_stats.update_install_enabled());
@@ -197,6 +222,98 @@ mod app {
         cfg.use_tui = use_tui;
         let _ = rt.block_on(stream_server::run(cfg, rx, None))?;
         Ok(())
+    }
+
+    fn is_missing_ffmpeg_error(err: &anyhow::Error) -> bool {
+        err.downcast_ref::<stream_server::MissingFfmpegError>()
+            .is_some()
+    }
+
+    fn show_desktop_error_and_exit(err: &anyhow::Error) -> ! {
+        let details = err
+            .downcast_ref::<stream_server::MissingFfmpegError>()
+            .map(|err| err.details().to_string())
+            .unwrap_or_else(|| err.to_string());
+        let message = format!(
+            "{details}\n\nInstall FFmpeg, make sure both ffmpeg and ffprobe are available in PATH, then start Stream Server again."
+        );
+
+        show_error_dialog("Stream Server requires FFmpeg", &message);
+        std::process::exit(1);
+    }
+
+    #[cfg(windows)]
+    fn show_error_dialog(title: &str, message: &str) {
+        use windows::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
+        use windows::core::PCWSTR;
+
+        let title = title
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let message = message
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+
+        unsafe {
+            let _ = MessageBoxW(
+                None,
+                PCWSTR(message.as_ptr()),
+                PCWSTR(title.as_ptr()),
+                MB_OK | MB_ICONERROR,
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn show_error_dialog(title: &str, message: &str) {
+        let script = format!(
+            "display dialog \"{}\" with title \"{}\" buttons {{\"Quit\"}} default button \"Quit\" with icon stop",
+            escape_applescript(message),
+            escape_applescript(title)
+        );
+
+        if std::process::Command::new("osascript")
+            .arg("-e")
+            .arg(script)
+            .status()
+            .is_err()
+        {
+            eprintln!("{title}: {message}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn escape_applescript(value: &str) -> String {
+        value.replace('\\', "\\\\").replace('"', "\\\"")
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn show_error_dialog(title: &str, message: &str) {
+        let attempts = [
+            (
+                "zenity",
+                vec!["--error", "--title", title, "--text", message],
+            ),
+            ("kdialog", vec!["--title", title, "--error", message]),
+            ("xmessage", vec!["-center", "-title", title, message]),
+        ];
+
+        for (program, args) in attempts {
+            if let Ok(status) = std::process::Command::new(program).args(args).status() {
+                if status.success() {
+                    return;
+                }
+            }
+        }
+
+        eprintln!("{title}: {message}");
+    }
+
+    #[cfg(not(any(windows, unix)))]
+    fn show_error_dialog(title: &str, message: &str) {
+        eprintln!("{title}: {message}");
     }
 }
 

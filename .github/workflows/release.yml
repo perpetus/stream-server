@@ -52,7 +52,7 @@ jobs:
           cargo chef cook --recipe-path recipe.json --features libtorrent --no-default-features
 
       - name: Restore Source Code
-        run: git restore server enginefs bindings stremio-runtime-stub updater-helper
+        run: git restore server enginefs bindings stremio-runtime-stub updater-helper settings-gui
 
       - name: Run Clippy
         run: cargo clippy --workspace --features libtorrent --no-default-features
@@ -148,12 +148,13 @@ jobs:
           PKG_CONFIG_PATH: ${{ github.workspace }}\vcpkg_installed\x64-windows-static-release\lib\pkgconfig
 
       - name: Restore Source Code
-        run: git restore server enginefs bindings stremio-runtime-stub updater-helper
+        run: git restore server enginefs bindings stremio-runtime-stub updater-helper settings-gui
 
       - name: Build Release
         run: |
           cargo clean -p server --release
           cargo build --release --target x86_64-pc-windows-msvc --features libtorrent --no-default-features
+          cargo build --release --target x86_64-pc-windows-msvc -p settings-gui
           cargo build --release --target x86_64-pc-windows-msvc -p stremio-runtime-stub
           cargo build --release --target x86_64-pc-windows-msvc -p updater-helper
         env:
@@ -168,6 +169,7 @@ jobs:
           name: server-windows-amd64
           path: |
             target/x86_64-pc-windows-msvc/release/server.exe
+            target/x86_64-pc-windows-msvc/release/settings-gui.exe
             target/x86_64-pc-windows-msvc/release/stremio-runtime.exe
             target/x86_64-pc-windows-msvc/release/stream-server-updater.exe
 
@@ -229,7 +231,7 @@ jobs:
           cargo chef cook --release --recipe-path recipe.json --features libtorrent --no-default-features
 
       - name: Restore Source Code
-        run: git restore server enginefs bindings
+        run: git restore server enginefs bindings settings-gui
 
       - name: Build Release
         run: cargo build --release --features libtorrent --no-default-features
@@ -269,7 +271,9 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: server-linux-amd64
-          path: target/release/server
+          path: |
+            target/release/server
+            target/release/settings-gui
 
       - name: Upload DEB
         uses: actions/upload-artifact@v7
@@ -324,15 +328,17 @@ jobs:
           url="https://github.com/perpetus/stream-server"
           license=('MIT')
           depends=('openssl' 'libtorrent-rasterbar' 'boost-libs')
-          source=("stream-server")
-          sha256sums=('SKIP')
+          source=("stream-server" "settings-gui")
+          sha256sums=('SKIP' 'SKIP')
 
           package() {
               install -Dm755 "$srcdir/stream-server" "$pkgdir/usr/bin/stream-server"
+              install -Dm755 "$srcdir/settings-gui" "$pkgdir/usr/bin/settings-gui"
           }
           EOF
 
           cp target/release/server pkg/stream-server
+          cp target/release/settings-gui pkg/settings-gui
 
       - name: Build package
         run: |
@@ -364,17 +370,37 @@ jobs:
       - name: Prepare release files
         run: |
           mkdir -p release
+
+          copy_file() {
+            src="$1"
+            dest="$2"
+            [ -f "$src" ] || return 0
+            cp "$src" "release/${dest}"
+          }
+
+          copy_latest() {
+            source_dir="$1"
+            pattern="$2"
+            dest="$3"
+            [ -d "$source_dir" ] || return 0
+            src="$(find "$source_dir" -maxdepth 1 -type f -name "$pattern" | sort -V | tail -n 1)"
+            [ -n "$src" ] || return 0
+            cp "$src" "release/${dest}"
+          }
+
           # Windows
-          cp artifacts/server-windows-amd64/server.exe release/stream-server-windows-amd64.exe || true
-          cp artifacts/server-windows-amd64/stremio-runtime.exe release/stremio-runtime-windows-amd64.exe || true
-          cp artifacts/server-windows-amd64/stream-server-updater.exe release/stream-server-updater-windows-amd64.exe || true
-          cp artifacts/server-windows-msi/*.msi release/ || true
+          copy_file artifacts/server-windows-amd64/server.exe stream-server-windows-amd64.exe
+          copy_file artifacts/server-windows-amd64/settings-gui.exe stream-server-settings-windows-amd64.exe
+          copy_file artifacts/server-windows-amd64/stremio-runtime.exe stremio-runtime-windows-amd64.exe
+          copy_file artifacts/server-windows-amd64/stream-server-updater.exe stream-server-updater-windows-amd64.exe
+          copy_latest artifacts/server-windows-msi "*.msi" stream-server-windows-amd64.msi
           # Linux
-          cp artifacts/server-linux-amd64/server release/stream-server-linux-amd64 || true
-          cp artifacts/server-linux-deb/*.deb release/ || true
-          cp artifacts/server-linux-appimage/*.AppImage release/ || true
+          copy_file artifacts/server-linux-amd64/server stream-server-linux-amd64
+          copy_file artifacts/server-linux-amd64/settings-gui stream-server-settings-linux-amd64
+          copy_latest artifacts/server-linux-deb "*.deb" stream-server-linux-amd64.deb
+          copy_latest artifacts/server-linux-appimage "*.AppImage" stream-server-linux-amd64.AppImage
           # Arch
-          cp artifacts/server-arch-pkg/*.pkg.tar.zst release/ || true
+          copy_latest artifacts/server-arch-pkg "stream-server-[0-9]*.pkg.tar.zst" stream-server-arch-x86_64.pkg.tar.zst
           (cd release && sha256sum * > SHA256SUMS.txt)
           ls -la release/
 
@@ -415,13 +441,15 @@ jobs:
           } >> "${GITHUB_WORKSPACE}/RELEASE_BODY.md"
 
           asset_links "Windows (portable)" "stream-server-windows-amd64.exe"
-          asset_links "Windows installer" "*.msi"
+          asset_links "Windows settings GUI" "stream-server-settings-windows-amd64.exe"
+          asset_links "Windows installer" "stream-server-windows-amd64.msi"
           asset_links "Windows Stremio runtime" "stremio-runtime-windows-amd64.exe"
           asset_links "Windows updater" "stream-server-updater-windows-amd64.exe"
-          asset_links "Debian / Ubuntu" "*.deb"
+          asset_links "Debian / Ubuntu" "stream-server-linux-amd64.deb"
           asset_links "Linux (portable)" "stream-server-linux-amd64"
-          asset_links "Linux (AppImage)" "*.AppImage"
-          asset_links "Arch Linux" "*.pkg.tar.zst"
+          asset_links "Linux settings GUI" "stream-server-settings-linux-amd64"
+          asset_links "Linux (AppImage)" "stream-server-linux-amd64.AppImage"
+          asset_links "Arch Linux" "stream-server-arch-x86_64.pkg.tar.zst"
           asset_links "Checksums" "SHA256SUMS.txt"
 
           cat >> "${GITHUB_WORKSPACE}/RELEASE_BODY.md" <<'EOF'

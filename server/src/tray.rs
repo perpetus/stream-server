@@ -13,6 +13,7 @@ use tray_icon::{
 
 pub enum UserEvent {
     OpenWeb,
+    OpenSettings,
     OpenLogs,
     Restart,
     ToggleSeeding,
@@ -176,6 +177,7 @@ pub fn create_system_tray(event_loop: &EventLoop<UserEvent>) -> anyhow::Result<T
     let stats_item = MenuItem::new("↓ -- | ↑ -- | 0 peers", false, None);
 
     let open_item = MenuItem::new("Open Stremio Web", true, None);
+    let settings_item = MenuItem::new("Settings...", true, None);
     let logs_item = MenuItem::new("Open Logs Folder", true, None);
     let restart_item = MenuItem::new("Restart Server", true, None);
     let seeding_item = CheckMenuItem::new("Seed After Download", true, true, None);
@@ -192,6 +194,7 @@ pub fn create_system_tray(event_loop: &EventLoop<UserEvent>) -> anyhow::Result<T
     menu.append_items(&[
         &stats_item,
         &open_item,
+        &settings_item,
         &logs_item,
         &restart_item,
         &seeding_item,
@@ -215,6 +218,7 @@ pub fn create_system_tray(event_loop: &EventLoop<UserEvent>) -> anyhow::Result<T
 
     let proxy = event_loop.create_proxy();
     let open_id = open_item.id().0.clone();
+    let settings_id = settings_item.id().0.clone();
     let logs_id = logs_item.id().0.clone();
     let restart_id = restart_item.id().0.clone();
     let auto_update_id = auto_update_item.id().0.clone();
@@ -223,6 +227,7 @@ pub fn create_system_tray(event_loop: &EventLoop<UserEvent>) -> anyhow::Result<T
     let quit_id = quit_item.id().0.clone();
 
     let open_id_clone = open_id.clone();
+    let settings_id_clone = settings_id.clone();
     let logs_id_clone = logs_id.clone();
     let restart_id_clone = restart_id.clone();
     let seeding_id = seeding_item.id().0.clone();
@@ -236,6 +241,8 @@ pub fn create_system_tray(event_loop: &EventLoop<UserEvent>) -> anyhow::Result<T
         let id = event.id.0.as_str();
         if id == open_id_clone {
             proxy.send_event(UserEvent::OpenWeb).ok();
+        } else if id == settings_id_clone {
+            proxy.send_event(UserEvent::OpenSettings).ok();
         } else if id == logs_id_clone {
             proxy.send_event(UserEvent::OpenLogs).ok();
         } else if id == restart_id_clone {
@@ -328,6 +335,75 @@ pub fn open_stremio_web() {
         Ok(_) => info!("Opened Stremio Web in the browser"),
         Err(e) => error!("Failed to open Stremio Web: {}", e),
     }
+}
+
+struct DirectConnector {
+    state: crate::state::AppState,
+}
+
+#[async_trait::async_trait]
+impl settings_gui::ServerConnector for DirectConnector {
+    async fn get_settings(&self) -> anyhow::Result<settings_gui::SettingsPayload> {
+        let settings = self.state.settings.read().await;
+        let val = serde_json::to_value(&*settings)?;
+        Ok(serde_json::from_value(val)?)
+    }
+
+    async fn apply_settings(&self, payload: settings_gui::SettingsPayload) -> anyhow::Result<()> {
+        let val = serde_json::to_value(&payload)?;
+        crate::routes::system::update_settings(&self.state, &val).await
+    }
+
+    async fn get_logs(&self) -> anyhow::Result<settings_gui::LogsSnapshot> {
+        let state = self.state.clone();
+        tokio::task::spawn_blocking(move || {
+            let snap = crate::diagnostics::logs_snapshot(&state);
+            let val = serde_json::to_value(&snap)?;
+            Ok(serde_json::from_value(val)?)
+        })
+        .await?
+    }
+
+    async fn get_current_log(&self) -> anyhow::Result<settings_gui::CurrentLogTail> {
+        let state = self.state.clone();
+        tokio::task::spawn_blocking(move || {
+            let path = crate::diagnostics::latest_log_with_extension(&state.log_dir, "jsonl");
+            let Some(path) = path else {
+                return Ok(settings_gui::CurrentLogTail { path: None, content: String::new() });
+            };
+            let lines = crate::diagnostics::tail_lines(&path, 500)?;
+            let content = lines.join("\n");
+            Ok(settings_gui::CurrentLogTail {
+                path: Some(path.display().to_string()),
+                content,
+            })
+        })
+        .await?
+    }
+
+    async fn export_diagnostics(&self) -> anyhow::Result<Vec<u8>> {
+        let state = self.state.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::diagnostics::build_diagnostics_zip(&state)
+        })
+        .await?
+    }
+}
+
+pub fn open_settings_gui(_server_url: &str) -> anyhow::Result<()> {
+    let state = crate::GLOBAL_STATE.read().unwrap().clone().ok_or_else(|| {
+        anyhow::anyhow!("Server state is not initialized")
+    })?;
+
+    let connector = std::sync::Arc::new(DirectConnector { state });
+
+    std::thread::spawn(move || {
+        if let Err(err) = settings_gui::run(connector) {
+            error!("Failed to run settings GUI library: {}", err);
+        }
+    });
+
+    Ok(())
 }
 
 pub fn open_log_folder() {

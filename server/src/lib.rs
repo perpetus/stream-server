@@ -17,6 +17,10 @@ pub const DEFAULT_HTTP_PORT: u16 = 11470;
 pub const DEFAULT_HTTPS_PORT: u16 = 12470;
 
 #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+pub static GLOBAL_STATE: once_cell::sync::Lazy<std::sync::RwLock<Option<AppState>>> =
+    once_cell::sync::Lazy::new(|| std::sync::RwLock::new(None));
+
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 pub mod tray;
 
 #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
@@ -49,6 +53,8 @@ mod ssdp;
 mod state;
 mod tui;
 mod updater;
+
+pub use ffmpeg_setup::MissingFfmpegError;
 
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
@@ -330,10 +336,11 @@ async fn run_inner(
         }
     }
 
-    if cfg.setup_ffmpeg {
-        if let Err(e) = ffmpeg_setup::setup_ffmpeg().await {
-            tracing::warn!("FFmpeg setup failed: {}", e);
-        }
+    if cfg.setup_ffmpeg
+        && let Err(e) = ffmpeg_setup::setup_ffmpeg().await
+    {
+        tracing::error!("FFmpeg setup failed: {}", e);
+        return Err(e).context("FFmpeg setup failed");
     }
 
     tracing::info!("Config Dir: {:?}", config_dir);
@@ -443,6 +450,13 @@ async fn run_inner(
     state.base_url = base_url.clone();
     state.http_addr = public_http_addr;
     state.update_install_exit_enabled = cfg.enable_update_exit;
+
+    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+    {
+        if let Ok(mut guard) = GLOBAL_STATE.write() {
+            *guard = Some(state.clone());
+        }
+    }
 
     {
         let settings = settings_arc.read().await;
@@ -598,6 +612,9 @@ async fn run_inner(
         .route("/diagnostics/memory", get(diagnostics::memory))
         .route("/diagnostics/streams", get(diagnostics::streams))
         .route("/diagnostics/crashes", get(diagnostics::crashes))
+        .route("/diagnostics/logs", get(diagnostics::logs))
+        .route("/diagnostics/logs/current", get(diagnostics::current_log))
+        .route("/diagnostics/export", get(diagnostics::export))
         .route(
             "/settings",
             get(routes::system::get_settings).post(routes::system::set_settings),
@@ -822,6 +839,13 @@ async fn run_inner(
 
     for task in background_tasks {
         task.abort();
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+    {
+        if let Ok(mut guard) = GLOBAL_STATE.write() {
+            *guard = None;
+        }
     }
 
     Ok(shutdown_source)

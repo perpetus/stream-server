@@ -1,14 +1,22 @@
 pub mod logging;
 
-use std::{collections::HashSet, net::SocketAddr, time::Instant};
+use std::{
+    collections::{HashSet, VecDeque},
+    io::{BufRead, Write},
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    time::Instant,
+};
 
 use axum::{
     Json,
-    extract::{ConnectInfo, State},
-    http::StatusCode,
+    body::Body,
+    extract::{ConnectInfo, Query, State},
+    http::{StatusCode, header},
     response::{IntoResponse, Response},
 };
 use serde::Serialize;
+use serde_json::json;
 use sysinfo::{Pid, System};
 
 use crate::state::AppState;
@@ -42,6 +50,35 @@ pub struct CrashDumpInfo {
     pub path: String,
     pub bytes: u64,
     pub modified_unix_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LogFileInfo {
+    pub path: String,
+    pub name: String,
+    pub bytes: u64,
+    pub modified_unix_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LogsSnapshot {
+    pub log_dir: String,
+    pub current_human_log: Option<String>,
+    pub current_json_log: Option<String>,
+    pub recent_logs: Vec<LogFileInfo>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct CurrentLogQuery {
+    pub format: Option<String>,
+    pub lines: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CurrentLogTail {
+    pub path: Option<String>,
+    pub lines: Vec<String>,
+    pub content: String,
 }
 
 pub fn process_memory_snapshot() -> ProcessMemorySnapshot {
@@ -249,12 +286,236 @@ pub async fn crashes(
     Json(list_crashes(&state)).into_response()
 }
 
+pub async fn logs(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+) -> Response {
+    if let Err(response) = ensure_local(addr) {
+        return response;
+    }
+
+    Json(logs_snapshot(&state)).into_response()
+}
+
+pub async fn current_log(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Query(query): Query<CurrentLogQuery>,
+) -> Response {
+    if let Err(response) = ensure_local(addr) {
+        return response;
+    }
+
+    let lines = query.lines.unwrap_or(500).clamp(1, 5000);
+    let path = match query.format.as_deref() {
+        Some("json") | Some("jsonl") => latest_log_with_extension(&state.log_dir, "jsonl"),
+        _ => {
+            let current = state.log_dir.join("server_current.log");
+            if current.exists() {
+                Some(current)
+            } else {
+                latest_log_with_extension(&state.log_dir, "log")
+            }
+        }
+    };
+
+    let Some(path) = path else {
+        return Json(CurrentLogTail {
+            path: None,
+            lines: Vec::new(),
+            content: String::new(),
+        })
+        .into_response();
+    };
+
+    match tail_lines(&path, lines) {
+        Ok(lines) => {
+            let content = lines.join("\n");
+            Json(CurrentLogTail {
+                path: Some(path.display().to_string()),
+                lines,
+                content,
+            })
+            .into_response()
+        }
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to read log: {err}"),
+        )
+            .into_response(),
+    }
+}
+
+pub async fn export(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+) -> Response {
+    if let Err(response) = ensure_local(addr) {
+        return response;
+    }
+
+    match build_diagnostics_zip(&state) {
+        Ok(bytes) => (
+            [
+                (header::CONTENT_TYPE, "application/zip"),
+                (
+                    header::CONTENT_DISPOSITION,
+                    "attachment; filename=\"stream-server-diagnostics.zip\"",
+                ),
+            ],
+            Body::from(bytes),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to export diagnostics: {err}"),
+        )
+            .into_response(),
+    }
+}
+
 fn ensure_local(addr: SocketAddr) -> Result<(), Response> {
     if addr.ip().is_loopback() {
         Ok(())
     } else {
         Err((StatusCode::FORBIDDEN, "Diagnostics are local-only").into_response())
     }
+}
+
+pub(crate) fn logs_snapshot(state: &AppState) -> LogsSnapshot {
+    let current_human = state.log_dir.join("server_current.log");
+    let current_human_log = current_human
+        .exists()
+        .then(|| current_human.display().to_string());
+    let current_json_log =
+        latest_log_with_extension(&state.log_dir, "jsonl").map(|path| path.display().to_string());
+
+    LogsSnapshot {
+        log_dir: state.log_dir.display().to_string(),
+        current_human_log,
+        current_json_log,
+        recent_logs: recent_log_files(&state.log_dir, 30),
+    }
+}
+
+fn recent_log_files(log_dir: &Path, limit: usize) -> Vec<LogFileInfo> {
+    let Ok(entries) = std::fs::read_dir(log_dir) else {
+        return Vec::new();
+    };
+
+    let mut logs = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let extension = path.extension().and_then(|ext| ext.to_str())?;
+            if !matches!(extension, "log" | "jsonl" | "dmp") {
+                return None;
+            }
+
+            let metadata = entry.metadata().ok()?;
+            let modified_unix_secs = modified_unix_secs(&metadata);
+            Some(LogFileInfo {
+                name: path.file_name()?.to_string_lossy().to_string(),
+                path: path.display().to_string(),
+                bytes: metadata.len(),
+                modified_unix_secs,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    logs.sort_by(|a, b| b.modified_unix_secs.cmp(&a.modified_unix_secs));
+    logs.truncate(limit);
+    logs
+}
+
+pub(crate) fn latest_log_with_extension(log_dir: &Path, extension: &str) -> Option<PathBuf> {
+    recent_log_files(log_dir, usize::MAX)
+        .into_iter()
+        .find(|info| {
+            Path::new(&info.path)
+                .extension()
+                .and_then(|ext| ext.to_str())
+                == Some(extension)
+        })
+        .map(|info| PathBuf::from(info.path))
+}
+
+pub(crate) fn tail_lines(path: &Path, max_lines: usize) -> std::io::Result<Vec<String>> {
+    let file = std::fs::File::open(path)?;
+    let reader = std::io::BufReader::new(file);
+    let mut lines = VecDeque::with_capacity(max_lines.min(1024));
+
+    for line in reader.lines() {
+        if lines.len() == max_lines {
+            lines.pop_front();
+        }
+        lines.push_back(line?);
+    }
+
+    Ok(lines.into_iter().collect())
+}
+
+pub(crate) fn build_diagnostics_zip(state: &AppState) -> anyhow::Result<Vec<u8>> {
+    let cursor = std::io::Cursor::new(Vec::new());
+    let mut zip = zip::ZipWriter::new(cursor);
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+
+    for info in recent_log_files(&state.log_dir, 20) {
+        let path = PathBuf::from(&info.path);
+        if !path.is_file() {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| "log".to_string());
+        zip.start_file(format!("logs/{name}"), options)?;
+        let bytes = std::fs::read(&path)?;
+        zip.write_all(&bytes)?;
+    }
+
+    if let Ok(settings) = std::fs::read_to_string(&state.settings_path) {
+        zip.start_file("settings.redacted.json", options)?;
+        zip.write_all(redact_settings_json(&settings).as_bytes())?;
+    }
+
+    let manifest = json!({
+        "serverVersion": env!("CARGO_PKG_VERSION"),
+        "gitSha": option_env!("GIT_SHA").unwrap_or("unknown"),
+        "processId": std::process::id(),
+        "logDir": state.log_dir.display().to_string(),
+        "settingsPath": state.settings_path.display().to_string(),
+    });
+    zip.start_file("manifest.json", options)?;
+    zip.write_all(serde_json::to_string_pretty(&manifest)?.as_bytes())?;
+
+    let cursor = zip.finish()?;
+    Ok(cursor.into_inner())
+}
+
+fn redact_settings_json(raw: &str) -> String {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return "{}".to_string();
+    };
+
+    if let Some(obj) = value.as_object_mut() {
+        for key in [
+            "btProxyPassword",
+            "btProxyUsername",
+            "remoteHttps",
+            "cachedTrackers",
+        ] {
+            if obj.contains_key(key) {
+                obj.insert(
+                    key.to_string(),
+                    serde_json::Value::String("<redacted>".to_string()),
+                );
+            }
+        }
+    }
+
+    serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_string())
 }
 
 fn list_crashes(state: &AppState) -> Vec<CrashDumpInfo> {
@@ -272,17 +533,19 @@ fn list_crashes(state: &AppState) -> Vec<CrashDumpInfo> {
             }
 
             let metadata = entry.metadata().ok()?;
-            let modified_unix_secs = metadata
-                .modified()
-                .ok()
-                .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|duration| duration.as_secs());
-
             Some(CrashDumpInfo {
                 path: path.display().to_string(),
                 bytes: metadata.len(),
-                modified_unix_secs,
+                modified_unix_secs: modified_unix_secs(&metadata),
             })
         })
         .collect()
+}
+
+fn modified_unix_secs(metadata: &std::fs::Metadata) -> Option<u64> {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs())
 }

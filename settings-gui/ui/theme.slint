@@ -1,0 +1,57 @@
+// Design tokens for the settings UI.
+//
+// Toggle `Theme.dark` to switch palettes; every derived token below recomputes
+// reactively, so the whole window re-themes live. Components read these tokens
+// instead of hard-coding any colors or sizes.
+export global Theme {
+    in-out property <bool> dark: true;
+
+    // --- Surfaces ---
+    out property <brush> bg: dark ? #050505 : #f6f6f6;
+    out property <brush> surface: dark ? #0b0b0c : #ffffff;
+    out property <brush> surface-alt: dark ? #111214 : #f0f1f2;
+    out property <brush> surface-hover: dark ? #17181b : #e8e9eb;
+    out property <brush> border: dark ? #242528 : #d8dadd;
+    out property <brush> table-row: dark ? #0d0d0e : #fafafa;
+    out property <brush> table-row-alt: dark ? #101011 : #f4f5f6;
+    out property <brush> table-row-hover: dark ? #15171a : #eef3ff;
+
+    // --- Text ---
+    out property <brush> text: dark ? #ededed : #111111;
+    out property <brush> text-muted: dark ? #8a8a8a : #666666;
+    out property <brush> text-subtle: dark ? #5f5f5f : #848484;
+
+    // --- Accent ---
+    out property <brush> accent: dark ? #2383ff : #006adc;
+    out property <brush> accent-hover: dark ? #3291ff : #005fc7;
+    out property <brush> accent-text: #ffffff;
+    out property <brush> accent-soft: dark ? #006adc.with-alpha(0.24) : #006adc.with-alpha(0.10);
+
+    // --- Status ---
+    out property <brush> success: dark ? #3fb950 : #2da44e;
+    out property <brush> warning: dark ? #d29922 : #bf8700;
+    out property <brush> danger: dark ? #f85149 : #cf222e;
+
+    // --- Syntax Highlighting ---
+    out property <brush> syntax-key: dark ? #c586c0 : #af00db;
+    out property <brush> syntax-string: dark ? #ce9178 : #a31515;
+    out property <brush> syntax-number: dark ? #b5cea8 : #098658;
+    out property <brush> syntax-bool: dark ? #569cd6 : #0451a5;
+
+    // --- Geometry ---
+    out property <length> radius: 12px;
+    out property <length> radius-sm: 8px;
+    out property <length> gap: 10px;
+    out property <length> pad: 16px;
+
+    // --- Typography ---
+    out property <length> fs-title: 20px;
+    out property <length> fs-section: 16px;
+    out property <length> fs-label: 13px;
+    out property <length> fs-body: 13px;
+    out property <length> fs-small: 12px;
+    out property <length> fs-mono: 12px;
+
+    // Shadow tint for cards (stronger in dark mode).
+    out property <color> shadow: dark ? #000000cc : #00000018;
+}

@@ -1,4 +1,6 @@
 use anyhow::{Context, Result};
+use std::error::Error;
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tracing::{error, info, warn};
@@ -8,16 +10,43 @@ const JELLYFIN_FFMPEG_DIR_URL: &str =
 const POINTER_URL: &str =
     "https://repo.jellyfin.org/files/ffmpeg/windows/latest-7.x/win64/win64-clang-gpl.txt";
 
+#[derive(Debug)]
+pub struct MissingFfmpegError {
+    details: String,
+}
+
+impl MissingFfmpegError {
+    fn new(details: impl Into<String>) -> Self {
+        Self {
+            details: details.into(),
+        }
+    }
+
+    pub fn details(&self) -> &str {
+        &self.details
+    }
+}
+
+impl fmt::Display for MissingFfmpegError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.details)
+    }
+}
+
+impl Error for MissingFfmpegError {}
+
 /// Orchestrate the setup: check, download, verify, extract, configure path.
 pub async fn setup_ffmpeg() -> Result<()> {
-    if !cfg!(target_os = "windows") {
-        info!("Not on Windows, skipping automatic FFmpeg download.");
+    if ffmpeg_tools_available() {
+        info!("FFmpeg and FFprobe are already available in PATH.");
         return Ok(());
     }
 
-    if check_ffmpeg_tools_available() {
-        info!("FFmpeg and FFprobe are already available in PATH.");
-        return Ok(());
+    if !cfg!(target_os = "windows") {
+        return Err(MissingFfmpegError::new(
+            "FFmpeg and FFprobe were not found in PATH. Install FFmpeg and restart Stream Server.",
+        )
+        .into());
     }
 
     info!("FFmpeg not found. Attempting auto-download...");
@@ -37,7 +66,11 @@ pub async fn setup_ffmpeg() -> Result<()> {
         }
     }
 
-    let install_dir = select_writable_install_dir(&install_dirs)?;
+    let install_dir = select_writable_install_dir(&install_dirs).map_err(|err| {
+        MissingFfmpegError::new(format!(
+            "FFmpeg and FFprobe were not found, and Stream Server could not find a writable install directory for automatic setup: {err}"
+        ))
+    })?;
     let bin_dir = install_dir.join("bin");
 
     match download_and_install(&install_dir).await {
@@ -51,7 +84,10 @@ pub async fn setup_ffmpeg() -> Result<()> {
                 "Failed to auto-download FFmpeg: {}. Transcoding may fail.",
                 e
             );
-            Err(e)
+            Err(MissingFfmpegError::new(format!(
+                "FFmpeg and FFprobe were not found, and automatic FFmpeg setup failed: {e}"
+            ))
+            .into())
         }
     }
 }
@@ -145,7 +181,7 @@ fn ensure_writable_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn check_ffmpeg_tools_available() -> bool {
+pub fn ffmpeg_tools_available() -> bool {
     command_available("ffmpeg") && command_available("ffprobe")
 }
 

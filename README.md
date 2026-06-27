@@ -61,6 +61,7 @@ Stream Server is a **fully open-source** replacement for Stremio's proprietary `
 - **🌐 Network Info**: `/network-info` endpoint for interface discovery
 - **💓 Heartbeat**: `/heartbeat` for health checks
 - **⚙️ Settings**: Runtime-configurable via `/settings`
+- **🔒 BitTorrent Privacy Controls**: DHT, PeX, LSD, encryption, interface binding, ports, and proxy settings. See [BitTorrent Settings](docs/bittorrent-settings.md).
 
 ---
 
@@ -72,10 +73,15 @@ Download from [Releases](https://github.com/perpetus/stream-server/releases):
 
 | Platform | Download |
 |----------|----------|
-| Windows | `stream-server-windows-amd64.exe` / `.msi` |
-| Linux (Debian/Ubuntu) | `.deb` package |
-| Linux (Universal) | `.AppImage` |
-| Arch Linux | `.pkg.tar.zst` |
+| Windows (portable) | [Download EXE](https://github.com/perpetus/stream-server/releases/latest/download/stream-server-windows-amd64.exe) |
+| Windows settings GUI | [Download EXE](https://github.com/perpetus/stream-server/releases/latest/download/stream-server-settings-windows-amd64.exe) |
+| Windows installer | [Download MSI](https://github.com/perpetus/stream-server/releases/latest/download/stream-server-windows-amd64.msi) |
+| Debian / Ubuntu | [Download DEB](https://github.com/perpetus/stream-server/releases/latest/download/stream-server-linux-amd64.deb) |
+| Linux (portable) | [Download binary](https://github.com/perpetus/stream-server/releases/latest/download/stream-server-linux-amd64) |
+| Linux settings GUI | [Download binary](https://github.com/perpetus/stream-server/releases/latest/download/stream-server-settings-linux-amd64) |
+| Linux (AppImage) | [Download AppImage](https://github.com/perpetus/stream-server/releases/latest/download/stream-server-linux-amd64.AppImage) |
+| Arch Linux | [Download package](https://github.com/perpetus/stream-server/releases/latest/download/stream-server-arch-x86_64.pkg.tar.zst) |
+| Checksums and all assets | [View latest release](https://github.com/perpetus/stream-server/releases/latest) |
 
 ### Build from Source
 

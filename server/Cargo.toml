@@ -81,6 +81,7 @@ sysinfo = "0.39.5"
 
 [target.'cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))'.dependencies]
 tao = "0.35.3"
+settings-gui = { path = "../settings-gui" }
 
 [target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
 tray-icon = { version = "0.24.1", default-features = false }
@@ -98,6 +99,7 @@ windows = { version = "0.62.2", features = [
     "Win32_System_Kernel",
     "Win32_System_Memory",
     "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 
@@ -113,7 +115,10 @@ license-file = ["../LICENSE", "0"]
 extended-description = "High-performance torrent streaming server with HLS transcoding support"
 section = "net"
 priority = "optional"
-assets = [["target/release/server", "usr/bin/stream-server", "755"]]
+assets = [
+    ["target/release/server", "usr/bin/stream-server", "755"],
+    ["target/release/settings-gui", "usr/bin/settings-gui", "755"],
+]
 
 [package.metadata.wix]
 upgrade-guid = "A1B2C3D4-E5F6-7890-ABCD-EF1234567890"

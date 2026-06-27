@@ -436,11 +436,8 @@ pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
     }))
 }
 
-pub async fn set_settings(
-    State(state): State<AppState>,
-    Json(payload): Json<Value>,
-) -> impl IntoResponse {
-    tracing::debug!("set_settings: received payload: {:?}", payload);
+pub async fn update_settings(state: &AppState, payload: &Value) -> anyhow::Result<()> {
+    tracing::debug!("update_settings: received payload: {:?}", payload);
 
     // Merge with existing settings
     let mut settings = state.settings.write().await;
@@ -665,12 +662,22 @@ pub async fn set_settings(
     state.download_engine.set_seeding_enabled(seeding_enabled);
 
     // Save to disk
-    if let Err(e) = state.save_settings().await {
-        tracing::error!("Failed to save settings: {}", e);
-        return Json(json!({ "success": false, "error": e.to_string() }));
-    }
+    state.save_settings().await?;
 
-    Json(json!({ "success": true }))
+    Ok(())
+}
+
+pub async fn set_settings(
+    State(state): State<AppState>,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
+    match update_settings(&state, &payload).await {
+        Ok(_) => Json(json!({ "success": true })),
+        Err(e) => {
+            tracing::error!("Failed to save settings: {}", e);
+            Json(json!({ "success": false, "error": e.to_string() }))
+        }
+    }
 }
 pub async fn get_device_info() -> impl IntoResponse {
     let profiles = probe_hwaccel().await;

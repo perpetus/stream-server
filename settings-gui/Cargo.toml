@@ -1,0 +1,29 @@
+[package]
+name = "settings-gui"
+version = "0.1.7"
+edition = "2024"
+license = "MIT"
+description = "Stream Server desktop settings editor"
+authors = ["Perpetus <perpetus@example.com>"]
+
+[lib]
+name = "settings_gui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "settings-gui"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+dirs = "6.0"
+open = "5.3.3"
+reqwest = { version = "0.13", features = ["json"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+slint = { version = "1.17", default-features = false, features = ["std", "backend-winit", "renderer-femtovg", "compat-1-2"] }
+tokio = { version = "1.48", features = ["rt-multi-thread", "time"] }
+async-trait = "0.1"
+
+[build-dependencies]
+slint-build = "1.17"

@@ -1,0 +1,733 @@
+// Themed component library for the settings UI. Every component reads tokens from
+// `Theme` so it re-styles live when the light/dark toggle flips.
+import { Theme } from "theme.slint";
+import { Icons } from "icons.slint";
+
+// A rounded surface panel with a soft shadow. Children are stacked vertically.
+export component Card inherits Rectangle {
+    vertical-stretch: 0;
+    horizontal-stretch: 1;
+    background: Theme.surface;
+    border-color: Theme.border;
+    border-width: 1px;
+    border-radius: Theme.radius;
+    drop-shadow-blur: 18px;
+    drop-shadow-color: Theme.shadow;
+    drop-shadow-offset-y: 4px;
+
+    VerticalLayout {
+        padding: 18px;
+        spacing: 14px;
+        @children
+    }
+}
+
+// A single navigation entry in the sidebar: icon + label, highlighted when active.
+export component NavItem inherits Rectangle {
+    in property <string> label;
+    in property <image> icon;
+    in property <int> index;
+    in-out property <int> selected;
+
+    property <bool> active: selected == index;
+
+    height: 42px;
+    border-radius: Theme.radius-sm;
+    background: active ? Theme.accent-soft : (touch.has-hover ? Theme.surface-hover : transparent);
+    animate background { duration: 120ms; }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            root.selected = root.index;
+        }
+    }
+
+    HorizontalLayout {
+        padding-left: root.label == "" ? 0px : 12px;
+        padding-right: root.label == "" ? 0px : 12px;
+        spacing: root.label == "" ? 0px : 11px;
+        alignment: root.label == "" ? LayoutAlignment.center : LayoutAlignment.start;
+
+        Rectangle {
+            width: 22px;
+            height: root.height;
+
+            Image {
+                source: root.icon;
+                width: 18px;
+                height: 18px;
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                colorize: root.active ? Theme.accent : Theme.text-muted;
+            }
+        }
+
+        if root.label != "" : Text {
+            height: root.height;
+            text: root.label;
+            color: root.active ? Theme.text : Theme.text-muted;
+            font-size: Theme.fs-label;
+            font-weight: root.active ? 700 : 500;
+            vertical-alignment: center;
+        }
+    }
+}
+
+// A button with an icon and optional label. `primary` paints it in the accent color.
+export component IconButton inherits Rectangle {
+    in property <string> text;
+    in property <image> icon;
+    in property <bool> primary: false;
+    callback clicked;
+
+    property <bool> has-text: root.text != "";
+
+    height: 36px;
+    min-width: root.has-text ? 96px : 36px;
+    horizontal-stretch: 0;
+    border-radius: Theme.radius-sm;
+    border-width: root.primary ? 0px : 1px;
+    border-color: Theme.border;
+    background: root.primary
+        ? (touch.has-hover ? Theme.accent-hover : Theme.accent)
+        : (touch.has-hover ? Theme.surface-hover : Theme.surface);
+    animate background { duration: 120ms; }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            root.clicked();
+        }
+    }
+
+    HorizontalLayout {
+        padding-left: root.has-text ? 14px : 0px;
+        padding-right: root.has-text ? 16px : 0px;
+        spacing: 8px;
+        alignment: center;
+
+        Rectangle {
+            width: 16px;
+            height: root.height;
+
+            Image {
+                source: root.icon;
+                width: 16px;
+                height: 16px;
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                colorize: root.primary ? Theme.accent-text : Theme.text;
+            }
+        }
+
+        if root.has-text : Text {
+            height: root.height;
+            text: root.text;
+            color: root.primary ? Theme.accent-text : Theme.text;
+            font-size: Theme.fs-label;
+            font-weight: 600;
+            vertical-alignment: center;
+        }
+    }
+}
+
+// A custom on/off switch bound to a bool. Two-way bindable via `checked`.
+export component Toggle inherits Rectangle {
+    in-out property <bool> checked;
+
+    width: 42px;
+    height: 24px;
+    border-radius: 12px;
+    border-width: 1px;
+    border-color: root.checked ? Theme.accent : Theme.border;
+    background: root.checked ? Theme.accent : Theme.surface-alt;
+    animate background, border-color { duration: 140ms; }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            root.checked = !root.checked;
+        }
+    }
+
+    knob := Rectangle {
+        width: 18px;
+        height: 18px;
+        border-radius: 9px;
+        background: root.checked ? Theme.accent-text : Theme.text-muted;
+        y: (parent.height - self.height) / 2;
+        x: root.checked ? parent.width - self.width - 3px : 3px;
+        animate x, background { duration: 140ms; easing: ease-in-out; }
+    }
+}
+
+// A themed single-line text input. `password` masks the content.
+export component TextField inherits Rectangle {
+    in property <string> placeholder;
+    in-out property <string> text;
+    in property <bool> password: false;
+    in property <bool> enabled: true;
+    callback edited(string);
+
+    height: 36px;
+    border-radius: Theme.radius-sm;
+    border-width: 1px;
+    border-color: input.has-focus ? Theme.accent : Theme.border;
+    background: root.enabled ? Theme.surface : Theme.surface-alt;
+    animate border-color { duration: 120ms; }
+
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 12px;
+
+        Rectangle {
+            if root.text == "" : Text {
+                text: root.placeholder;
+                color: Theme.text-muted;
+                font-size: Theme.fs-label;
+                x: 0;
+                width: parent.width;
+                height: parent.height;
+                vertical-alignment: center;
+                horizontal-alignment: left;
+            }
+
+            input := TextInput {
+                text <=> root.text;
+                color: Theme.text;
+                font-size: Theme.fs-label;
+                vertical-alignment: center;
+                single-line: true;
+                enabled: root.enabled;
+                input-type: root.password ? InputType.password : InputType.text;
+                selection-background-color: Theme.accent;
+                selection-foreground-color: Theme.accent-text;
+                width: parent.width;
+                height: parent.height;
+                edited => {
+                    root.edited(root.text);
+                }
+            }
+        }
+    }
+}
+
+// A dropdown over a [{label, value}] model. Displays the friendly label but stores
+// the underlying value, so `value` can bind directly to the server's enum strings.
+export component Dropdown inherits Rectangle {
+    in property <[{label: string, value: string}]> model;
+    in-out property <string> value;
+
+    height: 36px;
+    min-width: 180px;
+    border-radius: Theme.radius-sm;
+    border-width: 1px;
+    border-color: touch.has-hover ? Theme.accent : Theme.border;
+    background: Theme.surface;
+    animate border-color { duration: 120ms; }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            popup.show();
+        }
+    }
+
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 10px;
+        spacing: 6px;
+
+        Rectangle {
+            horizontal-stretch: 1;
+            for opt in root.model : Text {
+                visible: opt.value == root.value;
+                text: opt.label;
+                x: 0;
+                width: parent.width;
+                height: parent.height;
+                color: Theme.text;
+                font-size: Theme.fs-label;
+                vertical-alignment: center;
+                horizontal-alignment: left;
+            }
+        }
+
+        Rectangle {
+            width: 14px;
+            height: parent.height;
+
+            Image {
+                source: Icons.chevron-down;
+                width: 12px;
+                height: 12px;
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                colorize: Theme.text-muted;
+            }
+        }
+    }
+
+    popup := PopupWindow {
+        x: 0;
+        y: root.height + 4px;
+        width: root.width;
+        height: root.model.length * 34px + 8px;
+
+        Rectangle {
+            width: 100%;
+            height: 100%;
+            background: Theme.surface;
+            border-color: Theme.border;
+            border-width: 1px;
+            border-radius: Theme.radius-sm;
+            drop-shadow-blur: 18px;
+            drop-shadow-color: Theme.shadow;
+            drop-shadow-offset-y: 4px;
+
+            VerticalLayout {
+                padding: 4px;
+                for opt in root.model : Rectangle {
+                    height: 34px;
+                    border-radius: 6px;
+                    background: opt-touch.has-hover ? Theme.surface-hover : transparent;
+
+                    opt-touch := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => {
+                            root.value = opt.value;
+                            popup.close();
+                        }
+                    }
+
+                    HorizontalLayout {
+                        padding-left: 10px;
+                        padding-right: 10px;
+                        Text {
+                            text: opt.label;
+                            color: opt.value == root.value ? Theme.accent : Theme.text;
+                            font-size: Theme.fs-label;
+                            font-weight: opt.value == root.value ? 700 : 400;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// A compact settings row: label (+ optional help text) on the left, control on
+// the right. The row has a fixed content height so short forms do not stretch
+// vertically to fill the card.
+export component FieldRow inherits HorizontalLayout {
+    in property <string> label;
+    in property <string> description;
+
+    height: root.description != "" ? 62px : 42px;
+    spacing: 18px;
+    horizontal-stretch: 1;
+    vertical-stretch: 0;
+    alignment: start;
+
+    VerticalLayout {
+        width: 250px;
+        horizontal-stretch: 0;
+        vertical-stretch: 0;
+        alignment: center;
+        spacing: 2px;
+
+        Text {
+            width: parent.width;
+            text: root.label;
+            color: Theme.text;
+            font-size: Theme.fs-label;
+            font-weight: 600;
+            horizontal-alignment: left;
+            wrap: word-wrap;
+        }
+
+        if root.description != "" : Text {
+            width: parent.width;
+            text: root.description;
+            color: Theme.text-muted;
+            font-size: Theme.fs-small;
+            horizontal-alignment: left;
+            wrap: word-wrap;
+        }
+    }
+
+    VerticalLayout {
+        min-width: 260px;
+        horizontal-stretch: 1;
+        vertical-stretch: 0;
+        alignment: center;
+        @children
+    }
+}
+
+// An inline row: label (+ optional help text) on the left, right-aligned Toggle.
+// `checked` is two-way bindable.
+export component ToggleRow inherits HorizontalLayout {
+    in property <string> label;
+    in property <string> description;
+    in-out property <bool> checked;
+
+    height: root.description != "" ? 56px : 40px;
+    spacing: 18px;
+    horizontal-stretch: 1;
+    vertical-stretch: 0;
+    alignment: start;
+
+    VerticalLayout {
+        width: 250px;
+        horizontal-stretch: 0;
+        vertical-stretch: 0;
+        alignment: center;
+        spacing: 2px;
+
+        Text {
+            width: parent.width;
+            text: root.label;
+            color: Theme.text;
+            font-size: Theme.fs-label;
+            font-weight: 600;
+            horizontal-alignment: left;
+            wrap: word-wrap;
+        }
+
+        if root.description != "" : Text {
+            width: parent.width;
+            text: root.description;
+            color: Theme.text-muted;
+            font-size: Theme.fs-small;
+            horizontal-alignment: left;
+            wrap: word-wrap;
+        }
+    }
+
+    Rectangle {
+        horizontal-stretch: 1;
+    }
+
+    VerticalLayout {
+        horizontal-stretch: 0;
+        vertical-stretch: 0;
+        alignment: center;
+        Toggle {
+            checked <=> root.checked;
+        }
+    }
+}
+
+// A small status pill: colored dot + text.
+export component StatusBadge inherits Rectangle {
+    in property <string> text;
+    in property <brush> dot-color: Theme.accent;
+
+    height: 28px;
+    border-radius: 14px;
+    background: Theme.surface-alt;
+    border-width: 1px;
+    border-color: Theme.border;
+
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 12px;
+        spacing: 8px;
+        alignment: start;
+
+        Rectangle {
+            width: 8px;
+            height: root.height;
+
+            Rectangle {
+                width: 8px;
+                height: 8px;
+                y: (parent.height - self.height) / 2;
+                border-radius: 4px;
+                background: root.dot-color;
+            }
+        }
+
+        Text {
+            height: root.height;
+            text: root.text;
+            color: Theme.text-muted;
+            font-size: Theme.fs-small;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+    }
+}
+
+export component FilterCheckbox inherits Rectangle {
+    in property <string> label;
+    in property <string> count;
+    in-out property <bool> checked;
+    callback toggled(bool);
+
+    height: 34px;
+    border-radius: 6px;
+    background: touch.has-hover ? Theme.surface-hover : transparent;
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            root.checked = !root.checked;
+            root.toggled(root.checked);
+        }
+    }
+
+    HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 8px;
+        spacing: 10px;
+        alignment: start;
+
+        Rectangle {
+            width: 16px;
+            height: root.height;
+
+            Rectangle {
+                width: 15px;
+                height: 15px;
+                y: (parent.height - self.height) / 2;
+                border-radius: 4px;
+                border-width: 1px;
+                border-color: root.checked ? Theme.accent : Theme.text-muted;
+                background: root.checked ? Theme.accent : transparent;
+
+                if root.checked : Text {
+                    text: "✓";
+                    color: Theme.accent-text;
+                    font-size: 10px;
+                    width: parent.width;
+                    height: parent.height;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+
+        Text {
+            height: root.height;
+            horizontal-stretch: 1;
+            text: root.label;
+            color: Theme.text-muted;
+            font-size: Theme.fs-label;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+
+        if root.count != "" : Rectangle {
+            height: 22px;
+            min-width: 30px;
+            border-radius: 11px;
+            background: Theme.surface-alt;
+            vertical-stretch: 0;
+
+            Text {
+                text: root.count;
+                color: Theme.text-muted;
+                font-size: Theme.fs-small;
+                width: parent.width;
+                height: parent.height;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+    }
+}
+
+export component FilterGroup inherits VerticalLayout {
+    in property <string> title;
+    in-out property <bool> expanded: true;
+
+    spacing: 8px;
+    vertical-stretch: 0;
+
+    Rectangle {
+        height: 24px;
+        background: transparent;
+
+        touch := TouchArea {
+            mouse-cursor: pointer;
+            clicked => {
+                root.expanded = !root.expanded;
+            }
+        }
+
+        HorizontalLayout {
+            spacing: 8px;
+            alignment: start;
+
+            Text {
+                height: parent.height;
+                text: root.expanded ? "v" : ">";
+                color: Theme.text;
+                font-size: 13px;
+                vertical-alignment: center;
+            }
+
+            Text {
+                height: parent.height;
+                text: root.title;
+                color: Theme.text;
+                font-size: Theme.fs-label;
+                font-weight: 700;
+                vertical-alignment: center;
+            }
+        }
+    }
+
+    VerticalLayout {
+        visible: root.expanded;
+        spacing: 4px;
+        @children
+    }
+}
+
+export component LogPill inherits Rectangle {
+    in property <string> text;
+    in property <brush> tone: Theme.accent;
+
+    height: 22px;
+    min-width: 48px;
+    border-radius: 11px;
+    background: Theme.surface-alt;
+    border-width: 1px;
+    border-color: root.tone;
+    horizontal-stretch: 0;
+
+    Text {
+        text: root.text;
+        color: root.tone;
+        font-size: Theme.fs-small;
+        font-weight: 700;
+        width: parent.width;
+        height: parent.height;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+export component TimelineHistogram inherits Rectangle {
+    in property <[int]> bins;
+
+    height: 42px;
+    background: transparent;
+    vertical-stretch: 0;
+
+    Rectangle {
+        y: 31px;
+        height: 1px;
+        width: parent.width;
+        background: Theme.border;
+    }
+
+    HorizontalLayout {
+        y: 8px;
+        height: 22px;
+        spacing: 4px;
+
+        for level in root.bins : Rectangle {
+            horizontal-stretch: 1;
+            Rectangle {
+                width: parent.width;
+                height: level * 1px;
+                y: parent.height - self.height;
+                background: Theme.text-subtle.with-alpha(0.55);
+            }
+        }
+    }
+
+    HorizontalLayout {
+        y: 30px;
+        height: 12px;
+
+        Text {
+            text: "oldest";
+            color: Theme.text-subtle;
+            font-size: 10px;
+            horizontal-stretch: 1;
+        }
+
+        Text {
+            text: "newest";
+            color: Theme.text-subtle;
+            font-size: 10px;
+            horizontal-alignment: right;
+        }
+    }
+}
+
+export component ObjectTreeRow inherits Rectangle {
+    in property <int> depth;
+    in property <string> key;
+    in property <string> value-preview;
+    in property <string> value-type;
+    in property <bool> expandable;
+    in property <bool> expanded;
+    callback toggled();
+
+    height: 24px;
+    background: touch.has-hover ? Theme.surface-hover : transparent;
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            root.toggled();
+        }
+    }
+
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 12px;
+        spacing: 6px;
+        alignment: start;
+
+        // Left indent: depth * 16px
+        Rectangle {
+            width: depth * 16px;
+        }
+
+        // Arrow icon or empty spacer
+        Rectangle {
+            width: 16px;
+            height: 16px;
+            y: (parent.height - self.height) / 2;
+            if expandable : Image {
+                source: expanded ? Icons.chevron-down : Icons.chevron-right;
+                width: 12px;
+                height: 12px;
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                colorize: Theme.text-muted;
+            }
+        }
+
+        // Key label
+        if key != "" : Text {
+            text: key + ": ";
+            color: Theme.syntax-key;
+            font-family: "Consolas";
+            font-size: Theme.fs-mono;
+            vertical-alignment: center;
+        }
+
+        // Value text
+        Text {
+            text: value-preview;
+            color: value-type == "string" ? Theme.syntax-string :
+                   value-type == "number" ? Theme.syntax-number :
+                   value-type == "bool"   ? Theme.syntax-bool :
+                   value-type == "null"   ? Theme.text-subtle :
+                   Theme.text-muted;                      // gray for {}/[]
+            font-family: "Consolas";
+            font-size: Theme.fs-mono;
+            vertical-alignment: center;
+        }
+    }
+}
