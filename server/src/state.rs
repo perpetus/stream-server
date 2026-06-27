@@ -27,6 +27,18 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// EngineFS that owns stream/HLS torrents: the disk-backed download engine when
+    /// available, otherwise the memory-only engine. Mirrors the selection in
+    /// `routes::stream` so HLS playback and the `/stream` loopback share one torrent
+    /// instead of spinning up a redundant memory-only copy that never evicts pieces.
+    pub fn stream_engine(&self) -> Arc<EngineFS> {
+        if self.download_engine_disk_backed {
+            self.download_engine.clone()
+        } else {
+            self.engine.clone()
+        }
+    }
+
     #[allow(unused)]
     pub fn new(engine: Arc<EngineFS>, settings: ServerSettings, config_dir: PathBuf) -> Self {
         let log_dir = config_dir.join("logs");

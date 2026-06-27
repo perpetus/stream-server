@@ -80,7 +80,7 @@ pub async fn probe_by_url(
         Err(err) => return (StatusCode::BAD_REQUEST, err).into_response(),
     };
 
-    let engine = match state.engine.get_or_add_engine(&info_hash).await {
+    let engine = match state.stream_engine().get_or_add_engine(&info_hash).await {
         Ok(e) => e,
         Err(e) => {
             return (
@@ -137,7 +137,7 @@ pub async fn master_playlist_by_url(
         Err(err) => return (StatusCode::BAD_REQUEST, err).into_response(),
     };
 
-    let engine = match state.engine.get_or_add_engine(&info_hash).await {
+    let engine = match state.stream_engine().get_or_add_engine(&info_hash).await {
         Ok(e) => e,
         Err(e) => {
             return (
@@ -194,7 +194,7 @@ pub async fn get_master_playlist(
     axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
 ) -> Response {
     let request_start = std::time::Instant::now();
-    let engine = match state.engine.get_or_add_engine(&info_hash).await {
+    let engine = match state.stream_engine().get_or_add_engine(&info_hash).await {
         Ok(e) => e,
         Err(e) => {
             return (
@@ -206,15 +206,15 @@ pub async fn get_master_playlist(
     };
 
     // --- Stream Lifecycle: Notify start and focus bandwidth for HLS ---
-    state.engine.on_stream_start(&info_hash, file_idx).await;
-    state.engine.focus_torrent(&info_hash).await;
+    state.stream_engine().on_stream_start(&info_hash, file_idx).await;
+    state.stream_engine().focus_torrent(&info_hash).await;
 
     let stream_url = hls_stream_url(&state.base_url, &info_hash, file_idx);
 
     let probe = match engine.get_probe_result(file_idx, &stream_url).await {
         Ok(p) => p,
         Err(e) => {
-            state.engine.on_stream_end(&info_hash, file_idx).await;
+            state.stream_engine().on_stream_end(&info_hash, file_idx).await;
             return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
         }
     };
@@ -238,7 +238,7 @@ pub async fn get_master_playlist(
         subtitle_tracks.len()
     );
 
-    state.engine.on_stream_end(&info_hash, file_idx).await;
+    state.stream_engine().on_stream_end(&info_hash, file_idx).await;
 
     (
         [
@@ -346,7 +346,7 @@ async fn get_stream_playlist(
     playlist_name: String,
     raw_query: Option<String>,
 ) -> Response {
-    let engine = match state.engine.get_or_add_engine(&info_hash).await {
+    let engine = match state.stream_engine().get_or_add_engine(&info_hash).await {
         Ok(e) => e,
         Err(e) => {
             return (
@@ -410,7 +410,7 @@ async fn get_segment(
     _raw_query: Option<String>,
 ) -> Response {
     let request_start = std::time::Instant::now();
-    let engine = match state.engine.get_or_add_engine(&info_hash).await {
+    let engine = match state.stream_engine().get_or_add_engine(&info_hash).await {
         Ok(e) => e,
         Err(e) => {
             return (
@@ -624,7 +624,7 @@ pub async fn get_probe(
     State(state): State<AppState>,
     Path((info_hash, file_idx)): Path<(String, usize)>,
 ) -> Response {
-    let engine = match state.engine.get_engine(&info_hash).await {
+    let engine = match state.stream_engine().get_engine(&info_hash).await {
         Some(e) => e,
         None => return (StatusCode::NOT_FOUND, "Engine not found").into_response(),
     };
@@ -673,7 +673,7 @@ pub async fn get_tracks_by_url(State(state): State<AppState>, Path(url): Path<St
         .unwrap_or(url);
 
     if let Some((info_hash, file_idx)) = parse_tracks_path(&decoded) {
-        let engine = match state.engine.get_engine(&info_hash).await {
+        let engine = match state.stream_engine().get_engine(&info_hash).await {
             Some(engine) => engine,
             None => return (StatusCode::NOT_FOUND, "Engine not found").into_response(),
         };
@@ -695,7 +695,7 @@ pub async fn get_tracks_by_url(State(state): State<AppState>, Path(url): Path<St
         }
     };
 
-    let engine = match state.engine.get_engine(&info_hash).await {
+    let engine = match state.stream_engine().get_engine(&info_hash).await {
         Some(engine) => engine,
         None => return Json(Vec::<serde_json::Value>::new()).into_response(),
     };
@@ -938,7 +938,7 @@ async fn resolve_legacy_file_idx(
     }
 
     let engine = state
-        .engine
+        .stream_engine()
         .get_or_add_engine(info_hash)
         .await
         .map_err(|e| {
