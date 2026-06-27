@@ -90,15 +90,17 @@ fn parse_nzb_server_url(url_str: &str) -> Option<NzbServerConfig> {
     let ssl = scheme == "newss";
     let host = parsed.host_str()?.to_string();
     let port = parsed.port().unwrap_or(if ssl { 563 } else { 119 });
-    
+
     let user = if parsed.username().is_empty() {
         None
     } else {
         Some(urlencoding::decode(parsed.username()).ok()?.into_owned())
     };
-    
-    let pass = parsed.password().and_then(|p| urlencoding::decode(p).ok().map(|d| d.into_owned()));
-    
+
+    let pass = parsed
+        .password()
+        .and_then(|p| urlencoding::decode(p).ok().map(|d| d.into_owned()));
+
     let path = parsed.path().trim_start_matches('/');
     let connections = path.parse::<u32>().unwrap_or(20);
 
@@ -122,31 +124,45 @@ async fn create_session_internal(
     let config = if let Some(lz) = query.lz {
         let utf16 = match lz_str::decompress_from_encoded_uri_component(&lz) {
             Some(u) => u,
-            None => return (StatusCode::BAD_REQUEST, "Failed to decompress lz payload").into_response(),
+            None => {
+                return (StatusCode::BAD_REQUEST, "Failed to decompress lz payload").into_response();
+            }
         };
         let json_str = match String::from_utf16(&utf16) {
             Ok(s) => s,
-            Err(_) => return (StatusCode::BAD_REQUEST, "Invalid UTF-16 in lz payload").into_response(),
+            Err(_) => {
+                return (StatusCode::BAD_REQUEST, "Invalid UTF-16 in lz payload").into_response();
+            }
         };
         let payload: NzbLzPayload = match serde_json::from_str(&json_str) {
             Ok(p) => p,
-            Err(e) => return (StatusCode::BAD_REQUEST, format!("Invalid LZ JSON payload: {}", e)).into_response(),
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("Invalid LZ JSON payload: {}", e),
+                )
+                    .into_response();
+            }
         };
-        
+
         let nzb_url = match payload.url.or_else(|| payload.urls.first().cloned()) {
             Some(url) => url,
             None => return (StatusCode::BAD_REQUEST, "No NZB URL provided").into_response(),
         };
-        
+
         let mut servers = Vec::new();
         for s_url in payload.servers {
             if let Some(cfg) = parse_nzb_server_url(&s_url) {
                 servers.push(cfg);
             } else {
-                return (StatusCode::BAD_REQUEST, format!("Invalid server URL: {}", s_url)).into_response();
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("Invalid server URL: {}", s_url),
+                )
+                    .into_response();
             }
         }
-        
+
         NzbConfig { nzb_url, servers }
     } else {
         if body.is_empty() {
@@ -154,9 +170,15 @@ async fn create_session_internal(
         }
         let payload: CreateNzbBody = match serde_json::from_slice(&body) {
             Ok(p) => p,
-            Err(e) => return (StatusCode::BAD_REQUEST, format!("Invalid JSON payload: {}", e)).into_response(),
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("Invalid JSON payload: {}", e),
+                )
+                    .into_response();
+            }
         };
-        
+
         NzbConfig {
             nzb_url: payload.nzb_url.clone(),
             servers: payload
@@ -178,19 +200,37 @@ async fn create_session_internal(
     let nzb_content = match reqwest::get(&config.nzb_url).await {
         Ok(resp) => match resp.text().await {
             Ok(text) => text,
-            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to read NZB content: {}", e)).into_response(),
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to read NZB content: {}", e),
+                )
+                    .into_response();
+            }
         },
-        Err(e) => return (StatusCode::BAD_REQUEST, format!("Failed to fetch NZB URL: {}", e)).into_response(),
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("Failed to fetch NZB URL: {}", e),
+            )
+                .into_response();
+        }
     };
 
     // 3. Create Session
     let session = match NzbSession::new(key.clone(), config, nzb_content).await {
         Ok(sess) => sess,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to parse NZB: {}", e)).into_response(),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to parse NZB: {}", e),
+            )
+                .into_response();
+        }
     };
 
     let first_file_subject = session.nzb.files.first().map(|f| f.subject.clone());
-    
+
     state.nzb_sessions.insert(key.clone(), session);
     tracing::info!("Created NZB session {}", key);
 

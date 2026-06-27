@@ -67,11 +67,19 @@ impl<H: TorrentHandle> Engine<H> {
 
         let cache = self.probe_cache.lock().await;
         if let Some(res) = cache.get(&file_idx) {
-            tracing::debug!(
-                "[HLS STREAMING] Using cached probe result for file {}",
-                file_idx
+            if res.is_hls_ready() {
+                tracing::debug!(
+                    "[HLS STREAMING] Using cached probe result for file {}",
+                    file_idx
+                );
+                return Ok(res.clone());
+            }
+            tracing::warn!(
+                file_idx,
+                streams = res.streams.len(),
+                duration = res.duration,
+                "Ignoring incomplete cached HLS probe result"
             );
-            return Ok(res.clone());
         }
         drop(cache); // Release lock before potentially slow operations
 
@@ -93,7 +101,7 @@ impl<H: TorrentHandle> Engine<H> {
             };
 
         let probe_start = Instant::now();
-        let res = crate::hls::HlsEngine::probe_video(&probe_path).await?;
+        let mut res = crate::hls::HlsEngine::probe_video(&probe_path).await?;
         tracing::info!(
             "startup: probe finished in {:?} via {} (streams={}, duration={:.2}s, total={:?})",
             probe_start.elapsed(),
@@ -103,9 +111,37 @@ impl<H: TorrentHandle> Engine<H> {
             startup.elapsed()
         );
 
-        // Re-acquire cache lock to store result
-        let mut cache = self.probe_cache.lock().await;
-        cache.insert(file_idx, res.clone());
+        if !res.is_hls_ready() && probe_source == "local-file" {
+            tracing::warn!(
+                file_idx,
+                streams = res.streams.len(),
+                duration = res.duration,
+                "Local file probe did not produce playable HLS metadata; retrying via stream URL"
+            );
+            let stream_probe_start = Instant::now();
+            let stream_res = crate::hls::HlsEngine::probe_video(fallback_url).await?;
+            tracing::info!(
+                "startup: fallback stream probe finished in {:?} (streams={}, duration={:.2}s, total={:?})",
+                stream_probe_start.elapsed(),
+                stream_res.streams.len(),
+                stream_res.duration,
+                startup.elapsed()
+            );
+            res = stream_res;
+        }
+
+        if res.is_hls_ready() {
+            // Re-acquire cache lock to store result.
+            let mut cache = self.probe_cache.lock().await;
+            cache.insert(file_idx, res.clone());
+        } else {
+            tracing::warn!(
+                file_idx,
+                streams = res.streams.len(),
+                duration = res.duration,
+                "HLS probe result is incomplete; leaving it uncached so a later request can recover"
+            );
+        }
         Ok(res)
     }
 

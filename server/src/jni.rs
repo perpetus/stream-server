@@ -1,3 +1,4 @@
+use crate::{ServerConfig, ServerHandle};
 use jni::EnvUnowned;
 use jni::objects::{JClass, JString};
 use jni::sys::jstring;
@@ -5,7 +6,6 @@ use once_cell::sync::Lazy;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Mutex;
-use crate::{ServerConfig, ServerHandle};
 
 static SERVER_HANDLE: Lazy<Mutex<Option<ServerHandle>>> = Lazy::new(|| Mutex::new(None));
 
@@ -63,12 +63,11 @@ pub unsafe extern "C" fn Java_com_stremio_mobile_server_JniStreamingServerContro
             Err(err) => {
                 let err_msg = format!("Failed to start server: {}", err);
                 let jni_err_msg = jni::strings::JNIString::try_from(err_msg).unwrap_or_else(|_| {
-                    jni::strings::JNIString::from(jni::jni_str!("Failed to start server due to encoding error"))
+                    jni::strings::JNIString::from(jni::jni_str!(
+                        "Failed to start server due to encoding error"
+                    ))
                 });
-                let _ = env.throw_new(
-                    jni::jni_str!("java/lang/RuntimeException"),
-                    jni_err_msg,
-                );
+                let _ = env.throw_new(jni::jni_str!("java/lang/RuntimeException"), jni_err_msg);
                 Ok(std::ptr::null_mut())
             }
         }

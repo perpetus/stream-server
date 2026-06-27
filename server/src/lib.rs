@@ -24,12 +24,16 @@ pub mod tray {
     #[derive(Default)]
     pub struct TrayStats;
     impl TrayStats {
-        pub fn new() -> Self { Self }
+        pub fn new() -> Self {
+            Self
+        }
         pub fn update(&self, _down: f64, _up: f64, _peers: u64, _active: usize) {}
         pub fn set_auto_update_enabled(&self, _enabled: bool) {}
         pub fn set_seeding_enabled(&self, _enabled: bool) {}
         pub fn update_update_status(&self, _label: String, _install_enabled: bool) {}
-        pub fn format_update_line(&self) -> String { String::new() }
+        pub fn format_update_line(&self) -> String {
+            String::new()
+        }
     }
 }
 
@@ -381,17 +385,10 @@ async fn run_inner(
         },
     };
 
-    let engine_fs = EngineFS::new_with_storage(
+    let (download_engine, download_engine_disk_backed) = match EngineFS::new_disk_backed(
         cache_dir.clone(),
         backend_config.clone(),
         Some(tracker_storage.clone()),
-    )
-    .await?;
-    let engine = Arc::new(engine_fs);
-    let (download_engine, download_engine_disk_backed) = match EngineFS::new_disk_backed(
-        cache_dir.clone(),
-        backend_config,
-        Some(tracker_storage),
     )
     .await
     {
@@ -401,9 +398,16 @@ async fn run_inner(
                 error = %err,
                 "Disk-backed download engine unavailable at startup; download=1 will use memory-only mode"
             );
-            (engine.clone(), false)
+            let engine_fs = EngineFS::new_with_storage(
+                cache_dir.clone(),
+                backend_config,
+                Some(tracker_storage),
+            )
+            .await?;
+            (Arc::new(engine_fs), false)
         }
     };
+    let engine = download_engine.clone();
 
     let mut state = AppState::new_with_shared_settings_log_dir_and_download_engine(
         engine,
@@ -534,9 +538,7 @@ async fn run_inner(
             .map(|info| info.0)
     }
 
-    async fn fallback_handler(
-        req: axum::extract::Request,
-    ) -> impl axum::response::IntoResponse {
+    async fn fallback_handler(req: axum::extract::Request) -> impl axum::response::IntoResponse {
         diagnostics::logging::log_unhandled(
             "no matching route (404)",
             StatusCode::NOT_FOUND.as_u16(),

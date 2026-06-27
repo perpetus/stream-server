@@ -1,6 +1,6 @@
 pub mod logging;
 
-use std::{net::SocketAddr, time::Instant};
+use std::{collections::HashSet, net::SocketAddr, time::Instant};
 
 use axum::{
     Json,
@@ -106,19 +106,25 @@ fn current_thread_count_impl() -> u64 {
 }
 
 async fn memory_snapshot_for_state(state: &AppState) -> MemorySnapshot {
+    let stream_engine = state.stream_engine();
+    let stream_engine_snapshot = stream_engine.diagnostics_snapshot().await;
     let download_engine = state.download_engine.diagnostics_snapshot().await;
     let (download_disk_cache_bytes, download_disk_cache_files) =
         disk_tree_stats(&state.download_engine.download_dir);
-    let active_disk_downloads = download_engine
-        .streams
-        .active_file_streams
-        .iter()
-        .map(|stream| stream.count as u64)
-        .sum();
+    let mut active_disk_files = HashSet::new();
+    for stream in &download_engine.streams.active_file_streams {
+        if stream.count > 0 {
+            active_disk_files.insert((stream.info_hash.clone(), stream.file_idx));
+        }
+    }
+    for lease in &download_engine.streams.active_playback_leases {
+        active_disk_files.insert((lease.info_hash.clone(), lease.file_idx));
+    }
+    let active_disk_downloads = active_disk_files.len() as u64;
 
     MemorySnapshot {
         process: process_memory_snapshot(),
-        engine: state.engine.diagnostics_snapshot().await,
+        engine: stream_engine_snapshot,
         download_engine,
         download_disk_cache_bytes,
         download_disk_cache_files,
@@ -229,7 +235,7 @@ pub async fn streams(
         return response;
     }
 
-    Json(state.engine.stream_activity_snapshot().await).into_response()
+    Json(state.stream_engine().stream_activity_snapshot().await).into_response()
 }
 
 pub async fn crashes(

@@ -125,6 +125,15 @@ impl ProbeResult {
             .iter()
             .any(VideoStream::is_high_bit_depth_video)
     }
+
+    pub fn is_hls_ready(&self) -> bool {
+        self.duration.is_finite()
+            && self.duration > 0.0
+            && self
+                .streams
+                .iter()
+                .any(|stream| stream.codec_type == "video" || stream.codec_type == "audio")
+    }
 }
 
 #[derive(Clone)]
@@ -466,6 +475,16 @@ impl HlsEngine {
         query_str: &str,
     ) -> String {
         let segments = Self::get_segments(probe.duration);
+
+        if segments.is_empty() {
+            // Keep the media playlist reloadable while torrent metadata is still
+            // arriving. An empty VOD playlist with ENDLIST makes clients stop.
+            let mut m3u = String::from("#EXTM3U\n");
+            m3u.push_str("#EXT-X-VERSION:3\n");
+            m3u.push_str("#EXT-X-TARGETDURATION:2\n");
+            m3u.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
+            return m3u;
+        }
 
         // Calculate max duration for target duration
         let max_duration = segments

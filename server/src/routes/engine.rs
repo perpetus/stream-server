@@ -49,7 +49,11 @@ pub async fn create_engine(
     let file_must_include = payload.file_must_include;
     let should_guess = guess_file_idx_requested(payload.guess_file_idx.as_ref());
 
-    match state.engine.add_torrent(source, Some(trackers)).await {
+    match state
+        .stream_engine()
+        .add_torrent(source, Some(trackers))
+        .await
+    {
         Ok(engine) => {
             let stats = stats_with_guess(&engine, &file_must_include, should_guess).await;
             Json(stats)
@@ -58,7 +62,7 @@ pub async fn create_engine(
     }
 }
 pub async fn list_engines(State(state): State<AppState>) -> impl IntoResponse {
-    let engines = state.engine.list_engines().await;
+    let engines = state.stream_engine().list_engines().await;
     Json(json!(engines))
 }
 
@@ -66,14 +70,18 @@ pub async fn remove_engine(
     State(state): State<AppState>,
     axum::extract::Path(info_hash): axum::extract::Path<String>,
 ) -> impl IntoResponse {
-    state.engine.remove_engine(&info_hash.to_lowercase()).await;
+    state
+        .stream_engine()
+        .remove_engine(&info_hash.to_lowercase())
+        .await;
     Json(json!({}))
 }
 
 pub async fn remove_all_engines(State(state): State<AppState>) -> impl IntoResponse {
-    let engines = state.engine.list_engines().await;
+    let engine_fs = state.stream_engine();
+    let engines = engine_fs.list_engines().await;
     for ih in engines {
-        state.engine.remove_engine(&ih).await;
+        engine_fs.remove_engine(&ih).await;
     }
     Json(json!({}))
 }
@@ -117,7 +125,11 @@ pub async fn create_magnet(
     let file_must_include = payload.file_must_include;
     let should_guess = guess_file_idx_requested(payload.guess_file_idx.as_ref());
 
-    match state.engine.add_torrent(source, Some(trackers)).await {
+    match state
+        .stream_engine()
+        .add_torrent(source, Some(trackers))
+        .await
+    {
         Ok(engine) => {
             let stats = stats_with_guess(&engine, &file_must_include, should_guess).await;
             Json(stats)
@@ -133,7 +145,7 @@ pub async fn create_magnet_get(
     let magnet = format!("magnet:?xt=urn:btih:{}", info_hash);
     let source = enginefs::backend::TorrentSource::Url(magnet);
 
-    match state.engine.add_torrent(source, None).await {
+    match state.stream_engine().add_torrent(source, None).await {
         Ok(engine) => {
             let stats = stats_with_guess(&engine, &[], false).await;
             Json(stats)

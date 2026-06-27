@@ -60,7 +60,8 @@ pub async fn proxy_handler(
                 "r" => {
                     // Response header format "Name:Value"
                     if let Some((name, value)) = val.split_once(':') {
-                        custom_response_headers.insert(name.trim().to_string(), value.trim().to_string());
+                        custom_response_headers
+                            .insert(name.trim().to_string(), value.trim().to_string());
                     }
                 }
                 _ => {}

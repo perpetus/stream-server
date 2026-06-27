@@ -69,6 +69,11 @@ pub trait TorrentHandle: Send + Sync + Clone {
     async fn set_upload_throttled(&self, _throttled: bool) -> Result<()> {
         Ok(())
     }
+    /// Keep a file minimally wanted so it continues downloading in the
+    /// background while higher-priority playback windows serve the current read.
+    async fn keep_file_downloading(&self, _file_idx: usize) -> Result<()> {
+        Ok(())
+    }
     async fn get_file_reader(
         &self,
         file_idx: usize,

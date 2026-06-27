@@ -12,7 +12,7 @@ pub async fn get_peers(
 ) -> impl IntoResponse {
     let info_hash = info_hash.to_lowercase();
 
-    if let Some(engine) = state.engine.get_engine(&info_hash).await {
+    if let Some(engine) = state.stream_engine().get_engine(&info_hash).await {
         let peers = engine.get_peer_stats().await;
         (StatusCode::OK, Json(peers)).into_response()
     } else {

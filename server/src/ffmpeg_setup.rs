@@ -3,8 +3,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use tracing::{error, info, warn};
 
-const JELLYFIN_FFMPEG_DIR_URL: &str = "https://repo.jellyfin.org/files/ffmpeg/windows/latest-7.x/win64/";
-const POINTER_URL: &str = "https://repo.jellyfin.org/files/ffmpeg/windows/latest-7.x/win64/win64-clang-gpl.txt";
+const JELLYFIN_FFMPEG_DIR_URL: &str =
+    "https://repo.jellyfin.org/files/ffmpeg/windows/latest-7.x/win64/";
+const POINTER_URL: &str =
+    "https://repo.jellyfin.org/files/ffmpeg/windows/latest-7.x/win64/win64-clang-gpl.txt";
 
 /// Orchestrate the setup: check, download, verify, extract, configure path.
 pub async fn setup_ffmpeg() -> Result<()> {
@@ -161,15 +163,18 @@ fn ffmpeg_tools_exist(bin_dir: &Path) -> bool {
 
 async fn download_and_install(install_dir: &Path) -> Result<()> {
     let temp_dir = tempfile::Builder::new().prefix("ffmpeg_dl").tempdir()?;
-    
+
     info!("Fetching Jellyfin FFmpeg pointer from {}...", POINTER_URL);
     let pointer_response = reqwest::get(POINTER_URL).await?.error_for_status()?;
     let pointer_text = pointer_response.text().await?;
     let zip_filename = pointer_text.trim();
     if zip_filename.is_empty() || !zip_filename.ends_with(".zip") {
-        return Err(anyhow::anyhow!("Invalid zip filename in pointer file: '{}'", zip_filename));
+        return Err(anyhow::anyhow!(
+            "Invalid zip filename in pointer file: '{}'",
+            zip_filename
+        ));
     }
-    
+
     let zip_url = format!("{}{}", JELLYFIN_FFMPEG_DIR_URL, zip_filename);
     let zip_path = temp_dir.path().join("ffmpeg.zip");
 
@@ -191,8 +196,6 @@ async fn download_file(url: &str, target_path: &Path) -> Result<()> {
     Ok(())
 }
 
-
-
 fn extract_ffmpeg(zip_path: &Path, target_dir: &Path) -> Result<()> {
     let file = std::fs::File::open(zip_path)?;
     let mut archive = zip::ZipArchive::new(file)?;
@@ -209,9 +212,9 @@ fn extract_ffmpeg(zip_path: &Path, target_dir: &Path) -> Result<()> {
         let path = Path::new(&name);
         if let Some(file_name) = path.file_name() {
             let file_name_str = file_name.to_string_lossy();
-            
+
             // Check if it's an executable or library we want to extract
-            let is_target_file = file_name_str == "ffmpeg.exe" 
+            let is_target_file = file_name_str == "ffmpeg.exe"
                 || file_name_str == "ffprobe.exe"
                 || file_name_str.ends_with(".dll");
 
@@ -273,10 +276,17 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let install_dir = temp_dir.path().join("ffmpeg_install");
         let result = download_and_install(&install_dir).await;
-        assert!(result.is_ok(), "Failed to download and install: {:?}", result);
-        
+        assert!(
+            result.is_ok(),
+            "Failed to download and install: {:?}",
+            result
+        );
+
         let bin_dir = install_dir.join("bin");
         assert!(bin_dir.join("ffmpeg.exe").exists(), "ffmpeg.exe not found");
-        assert!(bin_dir.join("ffprobe.exe").exists(), "ffprobe.exe not found");
+        assert!(
+            bin_dir.join("ffprobe.exe").exists(),
+            "ffprobe.exe not found"
+        );
     }
 }

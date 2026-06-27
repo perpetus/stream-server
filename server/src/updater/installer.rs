@@ -175,8 +175,5 @@ fn stremio_dirs() -> Vec<PathBuf> {
         local.join("Programs").join("Stremio"),
         local.join("Programs").join("LNV").join("Stremio-5"),
     ];
-    candidates
-        .into_iter()
-        .filter(|dir| dir.exists())
-        .collect()
+    candidates.into_iter().filter(|dir| dir.exists()).collect()
 }

@@ -193,7 +193,8 @@ static DISK_SPACE_CACHE: std::sync::OnceLock<
 const DISK_SPACE_CACHE_TTL: Duration = Duration::from_secs(3);
 
 fn available_space_for_path(path: &FsPath) -> Option<u64> {
-    let cache = DISK_SPACE_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let cache =
+        DISK_SPACE_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     if let Ok(map) = cache.lock() {
         if let Some((at, value)) = map.get(path) {
             if at.elapsed() < DISK_SPACE_CACHE_TTL {
@@ -679,6 +680,11 @@ pub async fn stream_video(
 
     // --- Stream Lifecycle: Notify start only after validation has succeeded. ---
     engine_fs.on_stream_start(&info_hash, idx).await;
+    if query_has_hls_intent(query_str.as_deref()) {
+        engine_fs
+            .refresh_hls_playback(&info_hash, idx, "hls-loopback")
+            .await;
+    }
     let lifecycle = StreamLifecycleGuard::new(engine_fs.clone(), info_hash.clone(), idx, stream_id);
     engine_fs.focus_torrent(&info_hash).await;
 
@@ -742,11 +748,9 @@ pub async fn stream_video(
             // (still non-fatal) so the route doesn't return a 206 whose body then
             // hangs and drives the player into a ~60s retry loop.
             (_, true, PlaybackIntent::ContainerMetadata) => Some(Duration::from_secs(4)),
-            (
-                _,
-                true,
-                PlaybackIntent::DirectSeek | PlaybackIntent::HlsSeek,
-            ) => Some(Duration::from_millis(750)),
+            (_, true, PlaybackIntent::DirectSeek | PlaybackIntent::HlsSeek) => {
+                Some(Duration::from_millis(750))
+            }
             (_, true, _) => None,
             (_, false, PlaybackIntent::DirectInitial) => Some(Duration::from_secs(5)),
             (_, false, PlaybackIntent::DirectSeek) => Some(Duration::from_secs(1)),

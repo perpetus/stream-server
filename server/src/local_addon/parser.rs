@@ -57,9 +57,10 @@ fn has_episode_prefix(text: &str, episode_start: usize) -> bool {
 }
 
 fn has_episode_marker(text: &str) -> bool {
-    get_episode_regex()
-        .captures_iter(text)
-        .any(|caps| caps.get(0).is_some_and(|m| has_episode_prefix(text, m.start())))
+    get_episode_regex().captures_iter(text).any(|caps| {
+        caps.get(0)
+            .is_some_and(|m| has_episode_prefix(text, m.start()))
+    })
 }
 
 pub fn parse_filename(path: &Path) -> Option<VideoMetadata> {

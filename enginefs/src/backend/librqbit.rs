@@ -306,6 +306,10 @@ impl TorrentHandle for LibrqbitHandle {
         Ok(())
     }
 
+    async fn keep_file_downloading(&self, _file_idx: usize) -> Result<()> {
+        Ok(())
+    }
+
     async fn clear_file_streaming(&self, _file_idx: usize) -> Result<()> {
         Ok(())
     }

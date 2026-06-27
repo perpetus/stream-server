@@ -1014,7 +1014,8 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
                                         as i32;
 
                                 for p in start_piece..=end_piece {
-                                    if p >= first_piece && p <= last_piece && !handle.have_piece(p) {
+                                    if p >= first_piece && p <= last_piece && !handle.have_piece(p)
+                                    {
                                         // Player needs Cues/moov to start; prefetch them at top
                                         // priority with an immediate deadline.
                                         handle.set_piece_priority(p, 7);
@@ -1050,6 +1051,23 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
             "prepare_file_for_streaming: Ready for playback (non-blocking) - Total setup time: {:?}",
             overall_start.elapsed()
         );
+        Ok(())
+    }
+
+    async fn keep_file_downloading(&self, file_idx: usize) -> anyhow::Result<()> {
+        let session = self.session.read().await;
+        let mut handle = session
+            .find_torrent(&self.info_hash)
+            .map_err(|e| anyhow!("Torrent not found: {}", e))?;
+
+        handle.set_file_priority(file_idx as i32, 1);
+
+        tracing::debug!(
+            "keep_file_downloading: Kept file {} wanted in {}",
+            file_idx,
+            self.info_hash
+        );
+
         Ok(())
     }
 

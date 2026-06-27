@@ -152,6 +152,12 @@ pub async fn master_playlist_by_url(
         Err(err) => return (StatusCode::NOT_FOUND, err).into_response(),
     };
 
+    state
+        .stream_engine()
+        .refresh_hls_playback(&info_hash, file_idx, "hls-master-url")
+        .await;
+    state.stream_engine().focus_torrent(&info_hash).await;
+
     let probe = match engine.get_probe_result(file_idx, &media_url).await {
         Ok(p) => p,
         Err(e) => {
@@ -205,18 +211,17 @@ pub async fn get_master_playlist(
         }
     };
 
-    // --- Stream Lifecycle: Notify start and focus bandwidth for HLS ---
-    state.stream_engine().on_stream_start(&info_hash, file_idx).await;
+    state
+        .stream_engine()
+        .refresh_hls_playback(&info_hash, file_idx, "hls-master")
+        .await;
     state.stream_engine().focus_torrent(&info_hash).await;
 
     let stream_url = hls_stream_url(&state.base_url, &info_hash, file_idx);
 
     let probe = match engine.get_probe_result(file_idx, &stream_url).await {
         Ok(p) => p,
-        Err(e) => {
-            state.stream_engine().on_stream_end(&info_hash, file_idx).await;
-            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-        }
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
 
     let query_str = raw_query.as_deref().unwrap_or("");
@@ -237,8 +242,6 @@ pub async fn get_master_playlist(
         probe.streams.len(),
         subtitle_tracks.len()
     );
-
-    state.stream_engine().on_stream_end(&info_hash, file_idx).await;
 
     (
         [
@@ -357,6 +360,11 @@ async fn get_stream_playlist(
         }
     };
 
+    state
+        .stream_engine()
+        .refresh_hls_playback(&info_hash, file_idx, "hls-stream-playlist")
+        .await;
+
     let stream_url = hls_stream_url(&state.base_url, &info_hash, file_idx);
     let probe = match engine.get_probe_result(file_idx, &stream_url).await {
         Ok(p) => p,
@@ -384,6 +392,16 @@ async fn get_stream_playlist(
         audio_track_idx,
         raw_query.as_deref().unwrap_or(""),
     );
+    if !probe.is_hls_ready() {
+        tracing::warn!(
+            info_hash = %info_hash,
+            file_idx,
+            playlist = %playlist_name,
+            streams = probe.streams.len(),
+            duration = probe.duration,
+            "HLS media playlist returned reloadable empty playlist while probe metadata is incomplete"
+        );
+    }
 
     (
         [
@@ -440,6 +458,11 @@ async fn get_segment(
             Err(_) => return (StatusCode::BAD_REQUEST, "Invalid segment").into_response(),
         }
     };
+
+    state
+        .stream_engine()
+        .refresh_hls_playback(&info_hash, file_idx, "hls-segment")
+        .await;
 
     let stream_url = hls_stream_url(&state.base_url, &info_hash, file_idx);
 
@@ -734,7 +757,13 @@ pub async fn hls_status() -> Response {
     Json(serde_json::json!({})).into_response()
 }
 
-pub async fn hls_destroy(Path(id): Path<String>) -> Response {
+pub async fn hls_destroy(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    if let Some((info_hash, file_idx)) = compat::parse_hls_id(&id) {
+        state
+            .stream_engine()
+            .end_hls_playback(&info_hash, file_idx, "hls-destroy")
+            .await;
+    }
     tracing::info!(id = %id, "hls converter destroy requested; no persistent converter is used");
     compat::empty_ok()
 }
@@ -809,7 +838,11 @@ pub async fn legacy_hls_resource(
             None,
             &headers,
         );
-        return (StatusCode::NOT_FOUND, "legacy file/url HLS resource not found").into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            "legacy file/url HLS resource not found",
+        )
+            .into_response();
     };
     let file_idx = match resolve_legacy_file_idx(&state, &info_hash, &requested_idx).await {
         Ok(idx) => idx,
@@ -899,7 +932,11 @@ pub async fn legacy_hls_segment(
             None,
             &headers,
         );
-        return (StatusCode::NOT_FOUND, "legacy file/url HLS segment not found").into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            "legacy file/url HLS segment not found",
+        )
+            .into_response();
     };
     let file_idx = match resolve_legacy_file_idx(&state, &info_hash, &requested_idx).await {
         Ok(idx) => idx,

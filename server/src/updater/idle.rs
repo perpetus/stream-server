@@ -1,4 +1,5 @@
 use crate::{diagnostics, state::AppState};
+use std::collections::HashSet;
 
 pub async fn install_blockers(state: &AppState) -> Vec<String> {
     let mut blockers = Vec::new();
@@ -13,12 +14,16 @@ pub async fn install_blockers(state: &AppState) -> Vec<String> {
     }
 
     let download_engine = state.download_engine.diagnostics_snapshot().await;
-    let active_disk_downloads = download_engine
-        .streams
-        .active_file_streams
-        .iter()
-        .map(|stream| stream.count)
-        .sum::<usize>();
+    let mut active_disk_files = HashSet::new();
+    for stream in &download_engine.streams.active_file_streams {
+        if stream.count > 0 {
+            active_disk_files.insert((stream.info_hash.clone(), stream.file_idx));
+        }
+    }
+    for lease in &download_engine.streams.active_playback_leases {
+        active_disk_files.insert((lease.info_hash.clone(), lease.file_idx));
+    }
+    let active_disk_downloads = active_disk_files.len();
     if active_disk_downloads > 0 {
         blockers.push("activeDownloads".to_string());
     }

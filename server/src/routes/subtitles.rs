@@ -41,7 +41,7 @@ pub async fn opensub_hash(
     }
 
     if let (Some(info_hash), Some(file_idx)) = (info_hash, file_idx) {
-        if let Some(engine) = state.engine.get_engine(&info_hash).await {
+        if let Some(engine) = state.stream_engine().get_engine(&info_hash).await {
             match engine.get_opensub_hash(file_idx).await {
                 Ok(hash) => {
                     let size = engine
@@ -68,7 +68,7 @@ pub async fn opensub_hash_path(
     Path((info_hash, file_idx)): Path<(String, usize)>,
 ) -> impl IntoResponse {
     let info_hash = info_hash.to_lowercase();
-    if let Some(engine) = state.engine.get_engine(&info_hash).await {
+    if let Some(engine) = state.stream_engine().get_engine(&info_hash).await {
         match engine.get_opensub_hash(file_idx).await {
             Ok(hash) => {
                 let size = engine
@@ -107,7 +107,7 @@ pub async fn subtitles_tracks(
     }
 
     if let Some(info_hash) = info_hash {
-        if let Some(engine) = state.engine.get_engine(&info_hash).await {
+        if let Some(engine) = state.stream_engine().get_engine(&info_hash).await {
             let tracks: Vec<SubtitleTrack> = engine.find_subtitle_tracks().await;
 
             let result: Vec<serde_json::Value> = tracks
@@ -133,7 +133,7 @@ pub async fn get_subtitles_vtt(
     State(state): State<AppState>,
     Path((info_hash, file_idx)): Path<(String, usize)>,
 ) -> Response {
-    if let Some(engine) = state.engine.get_engine(&info_hash).await {
+    if let Some(engine) = state.stream_engine().get_engine(&info_hash).await {
         // Check if this is an embedded subtitle track ID (>= 1000)
         // For embedded subs, file_idx is actually the ID from find_subtitle_tracks
         // We need to find the main video file index for extraction

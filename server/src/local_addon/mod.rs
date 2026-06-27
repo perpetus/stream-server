@@ -89,7 +89,7 @@ async fn handle_meta(
     // Handle bt: prefix - query engine directly
     if id.starts_with("bt:") {
         let info_hash = id.strip_prefix("bt:").unwrap_or(&id).to_lowercase();
-        if let Some(engine) = state.engine.get_engine(&info_hash).await {
+        if let Some(engine) = state.stream_engine().get_engine(&info_hash).await {
             let stats = engine.get_statistics().await;
             let videos: Vec<Value> = stats
                 .files
@@ -165,7 +165,7 @@ async fn handle_stream(
         let info_hash = parts[1].to_lowercase();
         let file_idx: usize = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
 
-        if let Some(engine) = state.engine.get_engine(&info_hash).await {
+        if let Some(engine) = state.stream_engine().get_engine(&info_hash).await {
             let stats = engine.get_statistics().await;
             let file_name = stats
                 .files

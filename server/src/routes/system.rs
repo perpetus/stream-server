@@ -656,6 +656,10 @@ pub async fn get_file_stats(
             return (axum::http::StatusCode::NOT_FOUND, err).into_response();
         }
     };
+    state
+        .stream_engine()
+        .refresh_existing_hls_playback(&info_hash, idx, "stats-json")
+        .await;
 
     let mut stats = engine.get_statistics().await;
     if idx >= stats.files.len() {
