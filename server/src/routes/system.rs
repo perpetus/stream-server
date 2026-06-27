@@ -7,7 +7,9 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use enginefs::backend::TorrentHandle;
+use enginefs::backend::{
+    TorrentEncryptionMode, TorrentHandle, TorrentPrivacyConfig, TorrentProxyType,
+};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 
@@ -108,6 +110,66 @@ pub struct ServerSettings {
     pub bt_download_speed_hard_limit: f64,
     #[serde(rename = "btMinPeersForStable")]
     pub bt_min_peers_for_stable: u64,
+    #[serde(rename = "btEnableDht", default = "default_bt_enable_dht")]
+    pub bt_enable_dht: bool,
+    #[serde(rename = "btEnablePex", default = "default_bt_enable_pex")]
+    pub bt_enable_pex: bool,
+    #[serde(rename = "btEnableLsd", default = "default_bt_enable_lsd")]
+    pub bt_enable_lsd: bool,
+    #[serde(rename = "btEncryptionMode", default)]
+    pub bt_encryption_mode: TorrentEncryptionMode,
+    #[serde(rename = "btAnonymousMode", default = "default_bt_anonymous_mode")]
+    pub bt_anonymous_mode: bool,
+    #[serde(
+        rename = "btAllowMultipleConnectionsPerIp",
+        default = "default_bt_allow_multiple_connections_per_ip"
+    )]
+    pub bt_allow_multiple_connections_per_ip: bool,
+    #[serde(
+        rename = "btListenInterfaces",
+        default = "default_bt_listen_interfaces"
+    )]
+    pub bt_listen_interfaces: String,
+    #[serde(rename = "btOutgoingInterfaces", default)]
+    pub bt_outgoing_interfaces: String,
+    #[serde(rename = "btOutgoingPort", default)]
+    pub bt_outgoing_port: u16,
+    #[serde(rename = "btNumOutgoingPorts", default)]
+    pub bt_num_outgoing_ports: u16,
+    #[serde(rename = "btProxyType", default)]
+    pub bt_proxy_type: TorrentProxyType,
+    #[serde(rename = "btProxyHost", default)]
+    pub bt_proxy_host: String,
+    #[serde(rename = "btProxyPort", default)]
+    pub bt_proxy_port: u16,
+    #[serde(rename = "btProxyUsername", default)]
+    pub bt_proxy_username: String,
+    #[serde(rename = "btProxyPassword", default)]
+    pub bt_proxy_password: String,
+    #[serde(rename = "btProxyHostnames", default = "default_bt_proxy_hostnames")]
+    pub bt_proxy_hostnames: bool,
+    #[serde(
+        rename = "btProxyPeerConnections",
+        default = "default_bt_proxy_peer_connections"
+    )]
+    pub bt_proxy_peer_connections: bool,
+    #[serde(
+        rename = "btProxyTrackerConnections",
+        default = "default_bt_proxy_tracker_connections"
+    )]
+    pub bt_proxy_tracker_connections: bool,
+    #[serde(
+        rename = "btProxySendHostInConnect",
+        default = "default_bt_proxy_send_host_in_connect"
+    )]
+    pub bt_proxy_send_host_in_connect: bool,
+    #[serde(
+        rename = "btValidateHttpsTrackers",
+        default = "default_bt_validate_https_trackers"
+    )]
+    pub bt_validate_https_trackers: bool,
+    #[serde(rename = "btSsrfMitigation", default = "default_bt_ssrf_mitigation")]
+    pub bt_ssrf_mitigation: bool,
     #[serde(rename = "remoteHttps")]
     pub remote_https: Option<String>,
     #[serde(rename = "transcodeProfile")]
@@ -157,6 +219,153 @@ pub fn default_update_check_interval_hours() -> u64 {
     6
 }
 
+pub fn default_bt_enable_dht() -> bool {
+    true
+}
+
+pub fn default_bt_enable_pex() -> bool {
+    true
+}
+
+pub fn default_bt_enable_lsd() -> bool {
+    true
+}
+
+pub fn default_bt_anonymous_mode() -> bool {
+    false
+}
+
+pub fn default_bt_allow_multiple_connections_per_ip() -> bool {
+    false
+}
+
+pub fn default_bt_listen_interfaces() -> String {
+    enginefs::backend::TorrentPrivacyConfig::default().bt_listen_interfaces
+}
+
+pub fn default_bt_proxy_hostnames() -> bool {
+    true
+}
+
+pub fn default_bt_proxy_peer_connections() -> bool {
+    false
+}
+
+pub fn default_bt_proxy_tracker_connections() -> bool {
+    true
+}
+
+pub fn default_bt_proxy_send_host_in_connect() -> bool {
+    false
+}
+
+pub fn default_bt_validate_https_trackers() -> bool {
+    true
+}
+
+pub fn default_bt_ssrf_mitigation() -> bool {
+    true
+}
+
+fn parse_torrent_encryption_mode(value: &Value) -> Option<TorrentEncryptionMode> {
+    if let Some(code) = value.as_u64() {
+        return match code {
+            0 => Some(TorrentEncryptionMode::Allow),
+            1 => Some(TorrentEncryptionMode::Require),
+            2 => Some(TorrentEncryptionMode::Disable),
+            _ => None,
+        };
+    }
+
+    let raw = value.as_str()?.trim();
+    if raw.eq_ignore_ascii_case("allow")
+        || raw.eq_ignore_ascii_case("allowEncryption")
+        || raw.eq_ignore_ascii_case("enabled")
+    {
+        Some(TorrentEncryptionMode::Allow)
+    } else if raw.eq_ignore_ascii_case("require")
+        || raw.eq_ignore_ascii_case("requireEncryption")
+        || raw.eq_ignore_ascii_case("forced")
+    {
+        Some(TorrentEncryptionMode::Require)
+    } else if raw.eq_ignore_ascii_case("disable")
+        || raw.eq_ignore_ascii_case("disableEncryption")
+        || raw.eq_ignore_ascii_case("disabled")
+    {
+        Some(TorrentEncryptionMode::Disable)
+    } else {
+        None
+    }
+}
+
+fn parse_torrent_proxy_type(value: &Value) -> Option<TorrentProxyType> {
+    if let Some(code) = value.as_u64() {
+        return match code {
+            0 => Some(TorrentProxyType::None),
+            1 => Some(TorrentProxyType::Socks4),
+            2 => Some(TorrentProxyType::Socks5),
+            3 => Some(TorrentProxyType::Socks5Password),
+            4 => Some(TorrentProxyType::Http),
+            5 => Some(TorrentProxyType::HttpPassword),
+            _ => None,
+        };
+    }
+
+    let raw = value.as_str()?.trim();
+    if raw.eq_ignore_ascii_case("none") || raw.eq_ignore_ascii_case("disabled") {
+        Some(TorrentProxyType::None)
+    } else if raw.eq_ignore_ascii_case("socks4") {
+        Some(TorrentProxyType::Socks4)
+    } else if raw.eq_ignore_ascii_case("socks5") {
+        Some(TorrentProxyType::Socks5)
+    } else if raw.eq_ignore_ascii_case("socks5Password")
+        || raw.eq_ignore_ascii_case("socks5_password")
+        || raw.eq_ignore_ascii_case("socks5_pw")
+    {
+        Some(TorrentProxyType::Socks5Password)
+    } else if raw.eq_ignore_ascii_case("http") {
+        Some(TorrentProxyType::Http)
+    } else if raw.eq_ignore_ascii_case("httpPassword")
+        || raw.eq_ignore_ascii_case("http_password")
+        || raw.eq_ignore_ascii_case("http_pw")
+    {
+        Some(TorrentProxyType::HttpPassword)
+    } else {
+        None
+    }
+}
+
+fn value_as_u16(value: &Value) -> Option<u16> {
+    value.as_u64().and_then(|n| u16::try_from(n).ok())
+}
+
+fn update_bool_setting(obj: &serde_json::Map<String, Value>, key: &str, target: &mut bool) {
+    if let Some(value) = obj.get(key).and_then(Value::as_bool) {
+        *target = value;
+    }
+}
+
+fn update_u16_setting(obj: &serde_json::Map<String, Value>, key: &str, target: &mut u16) {
+    if let Some(value) = obj.get(key).and_then(value_as_u16) {
+        *target = value;
+    }
+}
+
+fn update_string_setting(
+    obj: &serde_json::Map<String, Value>,
+    key: &str,
+    target: &mut String,
+    trim: bool,
+    allow_empty: bool,
+) {
+    if let Some(value) = obj.get(key).and_then(Value::as_str) {
+        let value = if trim { value.trim() } else { value };
+        if allow_empty || !value.is_empty() {
+            *target = value.to_string();
+        }
+    }
+}
+
 impl Default for ServerSettings {
     fn default() -> Self {
         let cache_root = std::env::var("STREMIO_CACHE_ROOT")
@@ -182,6 +391,27 @@ impl Default for ServerSettings {
             bt_download_speed_soft_limit: 0.0,
             bt_download_speed_hard_limit: 0.0,
             bt_min_peers_for_stable: 5,
+            bt_enable_dht: default_bt_enable_dht(),
+            bt_enable_pex: default_bt_enable_pex(),
+            bt_enable_lsd: default_bt_enable_lsd(),
+            bt_encryption_mode: TorrentEncryptionMode::default(),
+            bt_anonymous_mode: default_bt_anonymous_mode(),
+            bt_allow_multiple_connections_per_ip: default_bt_allow_multiple_connections_per_ip(),
+            bt_listen_interfaces: default_bt_listen_interfaces(),
+            bt_outgoing_interfaces: String::new(),
+            bt_outgoing_port: 0,
+            bt_num_outgoing_ports: 0,
+            bt_proxy_type: TorrentProxyType::default(),
+            bt_proxy_host: String::new(),
+            bt_proxy_port: 0,
+            bt_proxy_username: String::new(),
+            bt_proxy_password: String::new(),
+            bt_proxy_hostnames: default_bt_proxy_hostnames(),
+            bt_proxy_peer_connections: default_bt_proxy_peer_connections(),
+            bt_proxy_tracker_connections: default_bt_proxy_tracker_connections(),
+            bt_proxy_send_host_in_connect: default_bt_proxy_send_host_in_connect(),
+            bt_validate_https_trackers: default_bt_validate_https_trackers(),
+            bt_ssrf_mitigation: default_bt_ssrf_mitigation(),
             remote_https: None,
             transcode_profile: None,
             auto_update_enabled: default_auto_update_enabled(),
@@ -276,6 +506,82 @@ pub async fn set_settings(
                 settings.bt_min_peers_for_stable = n;
             }
         }
+        update_bool_setting(obj, "btEnableDht", &mut settings.bt_enable_dht);
+        update_bool_setting(obj, "btEnablePex", &mut settings.bt_enable_pex);
+        update_bool_setting(obj, "btEnableLsd", &mut settings.bt_enable_lsd);
+        if let Some(mode) = obj
+            .get("btEncryptionMode")
+            .and_then(parse_torrent_encryption_mode)
+        {
+            settings.bt_encryption_mode = mode;
+        }
+        update_bool_setting(obj, "btAnonymousMode", &mut settings.bt_anonymous_mode);
+        update_bool_setting(
+            obj,
+            "btAllowMultipleConnectionsPerIp",
+            &mut settings.bt_allow_multiple_connections_per_ip,
+        );
+        update_string_setting(
+            obj,
+            "btListenInterfaces",
+            &mut settings.bt_listen_interfaces,
+            true,
+            false,
+        );
+        update_string_setting(
+            obj,
+            "btOutgoingInterfaces",
+            &mut settings.bt_outgoing_interfaces,
+            true,
+            true,
+        );
+        update_u16_setting(obj, "btOutgoingPort", &mut settings.bt_outgoing_port);
+        update_u16_setting(
+            obj,
+            "btNumOutgoingPorts",
+            &mut settings.bt_num_outgoing_ports,
+        );
+        if let Some(proxy_type) = obj.get("btProxyType").and_then(parse_torrent_proxy_type) {
+            settings.bt_proxy_type = proxy_type;
+        }
+        update_string_setting(obj, "btProxyHost", &mut settings.bt_proxy_host, true, true);
+        update_u16_setting(obj, "btProxyPort", &mut settings.bt_proxy_port);
+        update_string_setting(
+            obj,
+            "btProxyUsername",
+            &mut settings.bt_proxy_username,
+            false,
+            true,
+        );
+        update_string_setting(
+            obj,
+            "btProxyPassword",
+            &mut settings.bt_proxy_password,
+            false,
+            true,
+        );
+        update_bool_setting(obj, "btProxyHostnames", &mut settings.bt_proxy_hostnames);
+        update_bool_setting(
+            obj,
+            "btProxyPeerConnections",
+            &mut settings.bt_proxy_peer_connections,
+        );
+        update_bool_setting(
+            obj,
+            "btProxyTrackerConnections",
+            &mut settings.bt_proxy_tracker_connections,
+        );
+        update_bool_setting(
+            obj,
+            "btProxySendHostInConnect",
+            &mut settings.bt_proxy_send_host_in_connect,
+        );
+        update_bool_setting(
+            obj,
+            "btValidateHttpsTrackers",
+            &mut settings.bt_validate_https_trackers,
+        );
+        update_bool_setting(obj, "btSsrfMitigation", &mut settings.bt_ssrf_mitigation);
         if let Some(v) = obj.get("remoteHttps") {
             if v.is_null() {
                 settings.remote_https = None;
@@ -318,15 +624,41 @@ pub async fn set_settings(
         bt_min_peers_for_stable: settings.bt_min_peers_for_stable,
         bt_request_timeout: settings.bt_request_timeout,
     };
+    let new_privacy = TorrentPrivacyConfig {
+        bt_enable_dht: settings.bt_enable_dht,
+        bt_enable_pex: settings.bt_enable_pex,
+        bt_enable_lsd: settings.bt_enable_lsd,
+        bt_encryption_mode: settings.bt_encryption_mode,
+        bt_anonymous_mode: settings.bt_anonymous_mode,
+        bt_allow_multiple_connections_per_ip: settings.bt_allow_multiple_connections_per_ip,
+        bt_listen_interfaces: settings.bt_listen_interfaces.clone(),
+        bt_outgoing_interfaces: settings.bt_outgoing_interfaces.clone(),
+        bt_outgoing_port: settings.bt_outgoing_port,
+        bt_num_outgoing_ports: settings.bt_num_outgoing_ports,
+        bt_proxy_type: settings.bt_proxy_type,
+        bt_proxy_host: settings.bt_proxy_host.clone(),
+        bt_proxy_port: settings.bt_proxy_port,
+        bt_proxy_username: settings.bt_proxy_username.clone(),
+        bt_proxy_password: settings.bt_proxy_password.clone(),
+        bt_proxy_hostnames: settings.bt_proxy_hostnames,
+        bt_proxy_peer_connections: settings.bt_proxy_peer_connections,
+        bt_proxy_tracker_connections: settings.bt_proxy_tracker_connections,
+        bt_proxy_send_host_in_connect: settings.bt_proxy_send_host_in_connect,
+        bt_validate_https_trackers: settings.bt_validate_https_trackers,
+        bt_ssrf_mitigation: settings.bt_ssrf_mitigation,
+    };
 
     // Release the write lock before saving
     drop(settings);
 
-    // Apply new speed profile to libtorrent session dynamically
-    state.engine.update_speed_profile(&new_profile).await;
+    // Apply updated torrent session settings dynamically.
+    state
+        .engine
+        .update_torrent_settings(&new_profile, &new_privacy)
+        .await;
     state
         .download_engine
-        .update_speed_profile(&new_profile)
+        .update_torrent_settings(&new_profile, &new_privacy)
         .await;
 
     state.engine.set_seeding_enabled(seeding_enabled);

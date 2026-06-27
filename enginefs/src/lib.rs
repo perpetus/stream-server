@@ -1348,7 +1348,18 @@ impl BackendEngineFS<LibtorrentBackend> {
 
     /// Update session settings dynamically (called when user changes torrent profile)
     pub async fn update_speed_profile(&self, profile: &crate::backend::TorrentSpeedProfile) {
-        self.backend.update_session_settings(profile).await;
+        self.backend
+            .update_session_settings(profile, &crate::backend::TorrentPrivacyConfig::default())
+            .await;
+    }
+
+    /// Update session settings dynamically (called when user changes torrent settings)
+    pub async fn update_torrent_settings(
+        &self,
+        profile: &crate::backend::TorrentSpeedProfile,
+        privacy: &crate::backend::TorrentPrivacyConfig,
+    ) {
+        self.backend.update_session_settings(profile, privacy).await;
     }
 
     pub fn set_seeding_enabled(&self, enabled: bool) {

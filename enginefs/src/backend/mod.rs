@@ -276,6 +276,114 @@ impl Default for TorrentSpeedProfile {
     }
 }
 
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum TorrentEncryptionMode {
+    Allow,
+    Require,
+    Disable,
+}
+
+impl Default for TorrentEncryptionMode {
+    fn default() -> Self {
+        Self::Allow
+    }
+}
+
+impl TorrentEncryptionMode {
+    pub fn as_libtorrent_code(self) -> i32 {
+        match self {
+            Self::Allow => 0,
+            Self::Require => 1,
+            Self::Disable => 2,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum TorrentProxyType {
+    None,
+    Socks4,
+    Socks5,
+    Socks5Password,
+    Http,
+    HttpPassword,
+}
+
+impl Default for TorrentProxyType {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+impl TorrentProxyType {
+    pub fn as_libtorrent_code(self) -> i32 {
+        match self {
+            Self::None => 0,
+            Self::Socks4 => 1,
+            Self::Socks5 => 2,
+            Self::Socks5Password => 3,
+            Self::Http => 4,
+            Self::HttpPassword => 5,
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TorrentPrivacyConfig {
+    pub bt_enable_dht: bool,
+    pub bt_enable_pex: bool,
+    pub bt_enable_lsd: bool,
+    pub bt_encryption_mode: TorrentEncryptionMode,
+    pub bt_anonymous_mode: bool,
+    pub bt_allow_multiple_connections_per_ip: bool,
+    pub bt_listen_interfaces: String,
+    pub bt_outgoing_interfaces: String,
+    pub bt_outgoing_port: u16,
+    pub bt_num_outgoing_ports: u16,
+    pub bt_proxy_type: TorrentProxyType,
+    pub bt_proxy_host: String,
+    pub bt_proxy_port: u16,
+    pub bt_proxy_username: String,
+    pub bt_proxy_password: String,
+    pub bt_proxy_hostnames: bool,
+    pub bt_proxy_peer_connections: bool,
+    pub bt_proxy_tracker_connections: bool,
+    pub bt_proxy_send_host_in_connect: bool,
+    pub bt_validate_https_trackers: bool,
+    pub bt_ssrf_mitigation: bool,
+}
+
+impl Default for TorrentPrivacyConfig {
+    fn default() -> Self {
+        Self {
+            bt_enable_dht: true,
+            bt_enable_pex: true,
+            bt_enable_lsd: true,
+            bt_encryption_mode: TorrentEncryptionMode::default(),
+            bt_anonymous_mode: false,
+            bt_allow_multiple_connections_per_ip: false,
+            bt_listen_interfaces: "0.0.0.0:42000-42010,[::]:42000-42010".to_string(),
+            bt_outgoing_interfaces: String::new(),
+            bt_outgoing_port: 0,
+            bt_num_outgoing_ports: 0,
+            bt_proxy_type: TorrentProxyType::default(),
+            bt_proxy_host: String::new(),
+            bt_proxy_port: 0,
+            bt_proxy_username: String::new(),
+            bt_proxy_password: String::new(),
+            bt_proxy_hostnames: true,
+            bt_proxy_peer_connections: false,
+            bt_proxy_tracker_connections: true,
+            bt_proxy_send_host_in_connect: false,
+            bt_validate_https_trackers: true,
+            bt_ssrf_mitigation: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BackendConfig {
     pub cache: priorities::EngineCacheConfig,
@@ -283,6 +391,7 @@ pub struct BackendConfig {
     pub peer_search: PeerSearch,
     pub swarm_cap: SwarmCap,
     pub speed_profile: TorrentSpeedProfile,
+    pub privacy: TorrentPrivacyConfig,
 }
 
 impl Default for BackendConfig {
@@ -293,6 +402,7 @@ impl Default for BackendConfig {
             peer_search: PeerSearch::default(),
             swarm_cap: SwarmCap::default(),
             speed_profile: TorrentSpeedProfile::default(),
+            privacy: TorrentPrivacyConfig::default(),
         }
     }
 }

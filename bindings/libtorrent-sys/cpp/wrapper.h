@@ -34,7 +34,9 @@ struct MemoryStorageStats;
 class Session {
 public:
   lt::session session;
-  Session(lt::session_params params) : session(std::move(params)) {}
+  bool pex_extension_enabled;
+  Session(lt::session_params params, bool pex_enabled)
+      : session(std::move(params)), pex_extension_enabled(pex_enabled) {}
 };
 
 class TorrentHandle {

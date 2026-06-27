@@ -92,12 +92,15 @@ impl LibtorrentBackend {
         }
 
         SessionSettings {
-            listen_interfaces: "0.0.0.0:42000-42010,[::]:42000-42010".to_string(),
+            listen_interfaces: config.privacy.bt_listen_interfaces.clone(),
+            outgoing_interfaces: config.privacy.bt_outgoing_interfaces.clone(),
             user_agent: "stream-server/1.0".to_string(),
-            enable_dht: true,
-            enable_lsd: true,
+            enable_dht: config.privacy.bt_enable_dht,
+            enable_pex: config.privacy.bt_enable_pex,
+            enable_lsd: config.privacy.bt_enable_lsd,
             enable_upnp: true,
             enable_natpmp: true,
+            encryption_mode: config.privacy.bt_encryption_mode.as_libtorrent_code(),
             max_connections,
             max_connections_per_torrent,
             download_rate_limit,
@@ -105,10 +108,21 @@ impl LibtorrentBackend {
             active_downloads: 8,
             active_seeds: 16,
             active_limit: 24,
-            anonymous_mode: false,
-            proxy_host: String::new(),
-            proxy_port: 0,
-            proxy_type: 0,
+            anonymous_mode: config.privacy.bt_anonymous_mode,
+            allow_multiple_connections_per_ip: config.privacy.bt_allow_multiple_connections_per_ip,
+            outgoing_port: config.privacy.bt_outgoing_port as i32,
+            num_outgoing_ports: config.privacy.bt_num_outgoing_ports as i32,
+            proxy_host: config.privacy.bt_proxy_host.clone(),
+            proxy_port: config.privacy.bt_proxy_port as i32,
+            proxy_type: config.privacy.bt_proxy_type.as_libtorrent_code(),
+            proxy_username: config.privacy.bt_proxy_username.clone(),
+            proxy_password: config.privacy.bt_proxy_password.clone(),
+            proxy_hostnames: config.privacy.bt_proxy_hostnames,
+            proxy_peer_connections: config.privacy.bt_proxy_peer_connections,
+            proxy_tracker_connections: config.privacy.bt_proxy_tracker_connections,
+            proxy_send_host_in_connect: config.privacy.bt_proxy_send_host_in_connect,
+            validate_https_trackers: config.privacy.bt_validate_https_trackers,
+            ssrf_mitigation: config.privacy.bt_ssrf_mitigation,
             announce_to_all_trackers: true,
             announce_to_all_tiers: true,
         }
@@ -122,9 +136,14 @@ impl LibtorrentBackend {
         let settings = Self::default_session_settings(&config);
 
         tracing::info!(
-            "LibtorrentBackend: max_connections={}, download_limit={} B/s",
+            "LibtorrentBackend: max_connections={}, download_limit={} B/s, dht={}, pex={}, lsd={}, anonymous={}, encryption={}",
             settings.max_connections,
-            settings.download_rate_limit
+            settings.download_rate_limit,
+            settings.enable_dht,
+            settings.enable_pex,
+            settings.enable_lsd,
+            settings.anonymous_mode,
+            settings.encryption_mode
         );
 
         let session = match storage_mode {
@@ -264,7 +283,11 @@ impl LibtorrentBackend {
     }
 
     /// Update session settings dynamically (called when user changes settings)
-    pub async fn update_session_settings(&self, profile: &crate::backend::TorrentSpeedProfile) {
+    pub async fn update_session_settings(
+        &self,
+        profile: &crate::backend::TorrentSpeedProfile,
+        privacy: &crate::backend::TorrentPrivacyConfig,
+    ) {
         let mut session = self.session.write().await;
 
         // Update download rate limit (0 = unlimited)
@@ -286,12 +309,15 @@ impl LibtorrentBackend {
 
         // Apply new settings via full settings pack
         let new_settings = libtorrent_sys::SessionSettings {
-            listen_interfaces: "0.0.0.0:6881,[::]:6881".to_string(),
+            listen_interfaces: privacy.bt_listen_interfaces.clone(),
+            outgoing_interfaces: privacy.bt_outgoing_interfaces.clone(),
             user_agent: "stream-server/1.0".to_string(),
-            enable_dht: true,
-            enable_lsd: true,
+            enable_dht: privacy.bt_enable_dht,
+            enable_pex: privacy.bt_enable_pex,
+            enable_lsd: privacy.bt_enable_lsd,
             enable_upnp: true,
             enable_natpmp: true,
+            encryption_mode: privacy.bt_encryption_mode.as_libtorrent_code(),
             max_connections,
             max_connections_per_torrent,
             download_rate_limit: download_limit,
@@ -299,10 +325,21 @@ impl LibtorrentBackend {
             active_downloads: 8,
             active_seeds: 16,
             active_limit: 24,
-            anonymous_mode: false,
-            proxy_host: String::new(),
-            proxy_port: 0,
-            proxy_type: 0,
+            anonymous_mode: privacy.bt_anonymous_mode,
+            allow_multiple_connections_per_ip: privacy.bt_allow_multiple_connections_per_ip,
+            outgoing_port: privacy.bt_outgoing_port as i32,
+            num_outgoing_ports: privacy.bt_num_outgoing_ports as i32,
+            proxy_host: privacy.bt_proxy_host.clone(),
+            proxy_port: privacy.bt_proxy_port as i32,
+            proxy_type: privacy.bt_proxy_type.as_libtorrent_code(),
+            proxy_username: privacy.bt_proxy_username.clone(),
+            proxy_password: privacy.bt_proxy_password.clone(),
+            proxy_hostnames: privacy.bt_proxy_hostnames,
+            proxy_peer_connections: privacy.bt_proxy_peer_connections,
+            proxy_tracker_connections: privacy.bt_proxy_tracker_connections,
+            proxy_send_host_in_connect: privacy.bt_proxy_send_host_in_connect,
+            validate_https_trackers: privacy.bt_validate_https_trackers,
+            ssrf_mitigation: privacy.bt_ssrf_mitigation,
             announce_to_all_trackers: true,
             announce_to_all_tiers: true,
         };
@@ -311,10 +348,15 @@ impl LibtorrentBackend {
             tracing::error!("Failed to apply session settings: {}", e);
         } else {
             tracing::info!(
-                "Updated libtorrent settings: max_connections={} per_torrent={} download_limit={} B/s",
+                "Updated libtorrent settings: max_connections={} per_torrent={} download_limit={} B/s dht={} pex={} lsd={} anonymous={} encryption={}",
                 max_connections,
                 max_connections_per_torrent,
                 download_limit,
+                privacy.bt_enable_dht,
+                privacy.bt_enable_pex,
+                privacy.bt_enable_lsd,
+                privacy.bt_anonymous_mode,
+                privacy.bt_encryption_mode.as_libtorrent_code(),
             );
         }
     }

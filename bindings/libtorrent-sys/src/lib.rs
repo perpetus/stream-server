@@ -13,10 +13,14 @@ mod ffi {
     struct SessionSettings {
         /// Listen interfaces (e.g., "0.0.0.0:6881,[::]:6881")
         listen_interfaces: String,
+        /// Outgoing interfaces (comma-separated IP addresses or device names)
+        outgoing_interfaces: String,
         /// User agent string
         user_agent: String,
         /// Enable DHT
         enable_dht: bool,
+        /// Enable Peer Exchange (PeX)
+        enable_pex: bool,
         /// Enable LSD (Local Service Discovery)
         enable_lsd: bool,
         /// Enable UPnP
@@ -37,14 +41,38 @@ mod ffi {
         active_seeds: i32,
         /// Active limit (downloads + seeds)
         active_limit: i32,
+        /// Encryption mode: 0=allow, 1=require, 2=disable
+        encryption_mode: i32,
         /// Enable anonymous mode
         anonymous_mode: bool,
+        /// Allow multiple peer connections from the same IP address
+        allow_multiple_connections_per_ip: bool,
+        /// First local outgoing port (0 = OS chooses)
+        outgoing_port: i32,
+        /// Number of outgoing ports in the local bind range
+        num_outgoing_ports: i32,
         /// Proxy host (empty = no proxy)
         proxy_host: String,
         /// Proxy port
         proxy_port: i32,
-        /// Proxy type (0=none, 1=socks4, 2=socks5, 3=http, 4=i2p)
+        /// Proxy type (0=none, 1=socks4, 2=socks5, 3=socks5_pw, 4=http, 5=http_pw)
         proxy_type: i32,
+        /// Proxy username
+        proxy_username: String,
+        /// Proxy password
+        proxy_password: String,
+        /// Resolve hostnames through the proxy when supported
+        proxy_hostnames: bool,
+        /// Proxy BitTorrent peer payload connections
+        proxy_peer_connections: bool,
+        /// Proxy tracker connections
+        proxy_tracker_connections: bool,
+        /// Send target hostname in HTTP CONNECT requests
+        proxy_send_host_in_connect: bool,
+        /// Validate HTTPS tracker certificates
+        validate_https_trackers: bool,
+        /// Apply SSRF mitigation to tracker and web seed requests
+        ssrf_mitigation: bool,
         /// Announce to all trackers in a tier
         announce_to_all_trackers: bool,
         /// Announce to all tiers

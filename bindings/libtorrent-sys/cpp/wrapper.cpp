@@ -8,8 +8,13 @@
 #include <libtorrent/add_torrent_params.hpp>
 #include <libtorrent/alert_types.hpp>
 #include <libtorrent/announce_entry.hpp>
+#include <libtorrent/aux_/session_impl.hpp>
 #include <libtorrent/bencode.hpp>
 #include <libtorrent/create_torrent.hpp>
+#include <libtorrent/extensions.hpp>
+#include <libtorrent/extensions/smart_ban.hpp>
+#include <libtorrent/extensions/ut_metadata.hpp>
+#include <libtorrent/extensions/ut_pex.hpp>
 #include <libtorrent/hex.hpp>
 #include <libtorrent/magnet_uri.hpp>
 #include <libtorrent/peer_info.hpp>
@@ -23,6 +28,7 @@
 #include <chrono>
 #include <iterator>
 #include <sstream>
+#include <utility>
 
 namespace libtorrent_wrapper {
 
@@ -51,6 +57,104 @@ static lt::sha1_hash hex_to_sha1(rust::Str hex) {
 
 static std::string rust_str_to_std(rust::Str s) {
   return std::string(s.data(), s.size());
+}
+
+static std::vector<std::shared_ptr<lt::plugin>>
+session_plugins(bool enable_pex) {
+#ifndef TORRENT_DISABLE_EXTENSIONS
+  using wrapper = lt::aux::session_impl::session_plugin_wrapper;
+  std::vector<std::shared_ptr<lt::plugin>> plugins;
+  if (enable_pex) {
+    plugins.push_back(std::make_shared<wrapper>(lt::create_ut_pex_plugin));
+  }
+  plugins.push_back(std::make_shared<wrapper>(lt::create_ut_metadata_plugin));
+  plugins.push_back(std::make_shared<wrapper>(lt::create_smart_ban_plugin));
+  return plugins;
+#else
+  (void)enable_pex;
+  return {};
+#endif
+}
+
+static void apply_privacy_settings(lt::settings_pack &pack,
+                                   SessionSettings const &settings) {
+  pack.set_bool(lt::settings_pack::enable_dht, settings.enable_dht);
+  pack.set_bool(lt::settings_pack::enable_lsd, settings.enable_lsd);
+  pack.set_bool(lt::settings_pack::anonymous_mode, settings.anonymous_mode);
+  pack.set_bool(lt::settings_pack::allow_multiple_connections_per_ip,
+                settings.allow_multiple_connections_per_ip);
+  pack.set_bool(lt::settings_pack::validate_https_trackers,
+                settings.validate_https_trackers);
+  pack.set_bool(lt::settings_pack::ssrf_mitigation, settings.ssrf_mitigation);
+
+  switch (settings.encryption_mode) {
+  case 1:
+    pack.set_int(lt::settings_pack::out_enc_policy,
+                 lt::settings_pack::pe_forced);
+    pack.set_int(lt::settings_pack::in_enc_policy,
+                 lt::settings_pack::pe_forced);
+    pack.set_int(lt::settings_pack::allowed_enc_level,
+                 lt::settings_pack::pe_both);
+    break;
+  case 2:
+    pack.set_int(lt::settings_pack::out_enc_policy,
+                 lt::settings_pack::pe_disabled);
+    pack.set_int(lt::settings_pack::in_enc_policy,
+                 lt::settings_pack::pe_disabled);
+    pack.set_int(lt::settings_pack::allowed_enc_level,
+                 lt::settings_pack::pe_plaintext);
+    break;
+  default:
+    pack.set_int(lt::settings_pack::out_enc_policy,
+                 lt::settings_pack::pe_enabled);
+    pack.set_int(lt::settings_pack::in_enc_policy,
+                 lt::settings_pack::pe_enabled);
+    pack.set_int(lt::settings_pack::allowed_enc_level,
+                 lt::settings_pack::pe_both);
+    break;
+  }
+}
+
+static void apply_network_settings(lt::settings_pack &pack,
+                                   SessionSettings const &settings) {
+  if (!settings.listen_interfaces.empty()) {
+    pack.set_str(lt::settings_pack::listen_interfaces,
+                 rust_str_to_std(settings.listen_interfaces));
+  } else {
+    pack.set_str(lt::settings_pack::listen_interfaces,
+                 "0.0.0.0:42000-42010,[::]:42000-42010");
+  }
+
+  pack.set_str(lt::settings_pack::outgoing_interfaces,
+               rust_str_to_std(settings.outgoing_interfaces));
+  pack.set_int(lt::settings_pack::outgoing_port, settings.outgoing_port);
+  pack.set_int(lt::settings_pack::num_outgoing_ports,
+               settings.num_outgoing_ports);
+}
+
+static void apply_proxy_settings(lt::settings_pack &pack,
+                                 SessionSettings const &settings) {
+  pack.set_int(lt::settings_pack::proxy_type, settings.proxy_type);
+  pack.set_str(lt::settings_pack::proxy_hostname,
+               rust_str_to_std(settings.proxy_host));
+  pack.set_int(lt::settings_pack::proxy_port, settings.proxy_port);
+  pack.set_str(lt::settings_pack::proxy_username,
+               rust_str_to_std(settings.proxy_username));
+  pack.set_str(lt::settings_pack::proxy_password,
+               rust_str_to_std(settings.proxy_password));
+  pack.set_bool(lt::settings_pack::proxy_hostnames, settings.proxy_hostnames);
+  pack.set_bool(lt::settings_pack::proxy_peer_connections,
+                settings.proxy_peer_connections);
+  pack.set_bool(lt::settings_pack::proxy_tracker_connections,
+                settings.proxy_tracker_connections);
+  pack.set_bool(lt::settings_pack::proxy_send_host_in_connect,
+                settings.proxy_send_host_in_connect);
+}
+
+static lt::session_params make_session_params(lt::settings_pack pack,
+                                              SessionSettings const &settings) {
+  return lt::session_params(std::move(pack),
+                            session_plugins(settings.enable_pex));
 }
 
 static TorrentStatus make_torrent_status(const lt::torrent_status &ts) {
@@ -108,24 +212,16 @@ static TorrentStatus make_torrent_status(const lt::torrent_status &ts) {
 std::unique_ptr<Session> create_session(SessionSettings const &settings) {
   lt::settings_pack pack;
 
-  if (!settings.listen_interfaces.empty()) {
-    pack.set_str(lt::settings_pack::listen_interfaces,
-                 rust_str_to_std(settings.listen_interfaces));
-  } else {
-    pack.set_str(lt::settings_pack::listen_interfaces,
-                 "0.0.0.0:6881,[::]:6881");
-  }
+  apply_network_settings(pack, settings);
 
   if (!settings.user_agent.empty()) {
     pack.set_str(lt::settings_pack::user_agent,
                  rust_str_to_std(settings.user_agent));
   }
 
-  pack.set_bool(lt::settings_pack::enable_dht, settings.enable_dht);
-  pack.set_bool(lt::settings_pack::enable_lsd, settings.enable_lsd);
+  apply_privacy_settings(pack, settings);
   pack.set_bool(lt::settings_pack::enable_upnp, settings.enable_upnp);
   pack.set_bool(lt::settings_pack::enable_natpmp, settings.enable_natpmp);
-  pack.set_bool(lt::settings_pack::anonymous_mode, settings.anonymous_mode);
   pack.set_bool(lt::settings_pack::announce_to_all_trackers,
                 settings.announce_to_all_trackers);
   pack.set_bool(lt::settings_pack::announce_to_all_tiers,
@@ -226,16 +322,10 @@ std::unique_ptr<Session> create_session(SessionSettings const &settings) {
                lt::alert_category::error | lt::alert_category::peer |
                    lt::alert_category::status | lt::alert_category::storage);
 
-  // Proxy settings
-  if (!settings.proxy_host.empty()) {
-    pack.set_str(lt::settings_pack::proxy_hostname,
-                 rust_str_to_std(settings.proxy_host));
-    pack.set_int(lt::settings_pack::proxy_port, settings.proxy_port);
-    pack.set_int(lt::settings_pack::proxy_type, settings.proxy_type);
-  }
+  apply_proxy_settings(pack, settings);
 
-  lt::session_params params(pack);
-  return std::make_unique<Session>(std::move(params));
+  lt::session_params params = make_session_params(std::move(pack), settings);
+  return std::make_unique<Session>(std::move(params), settings.enable_pex);
 }
 
 std::unique_ptr<Session>
@@ -247,24 +337,16 @@ std::unique_ptr<Session>
 create_session_memory_only(SessionSettings const &settings) {
   lt::settings_pack pack;
 
-  if (!settings.listen_interfaces.empty()) {
-    pack.set_str(lt::settings_pack::listen_interfaces,
-                 rust_str_to_std(settings.listen_interfaces));
-  } else {
-    pack.set_str(lt::settings_pack::listen_interfaces,
-                 "0.0.0.0:6881,[::]:6881");
-  }
+  apply_network_settings(pack, settings);
 
   if (!settings.user_agent.empty()) {
     pack.set_str(lt::settings_pack::user_agent,
                  rust_str_to_std(settings.user_agent));
   }
 
-  pack.set_bool(lt::settings_pack::enable_dht, settings.enable_dht);
-  pack.set_bool(lt::settings_pack::enable_lsd, settings.enable_lsd);
+  apply_privacy_settings(pack, settings);
   pack.set_bool(lt::settings_pack::enable_upnp, settings.enable_upnp);
   pack.set_bool(lt::settings_pack::enable_natpmp, settings.enable_natpmp);
-  pack.set_bool(lt::settings_pack::anonymous_mode, settings.anonymous_mode);
   pack.set_bool(lt::settings_pack::announce_to_all_trackers,
                 settings.announce_to_all_trackers);
   pack.set_bool(lt::settings_pack::announce_to_all_tiers,
@@ -320,19 +402,14 @@ create_session_memory_only(SessionSettings const &settings) {
                lt::alert_category::error | lt::alert_category::peer |
                    lt::alert_category::status | lt::alert_category::storage);
 
-  if (!settings.proxy_host.empty()) {
-    pack.set_str(lt::settings_pack::proxy_hostname,
-                 rust_str_to_std(settings.proxy_host));
-    pack.set_int(lt::settings_pack::proxy_port, settings.proxy_port);
-    pack.set_int(lt::settings_pack::proxy_type, settings.proxy_type);
-  }
+  apply_proxy_settings(pack, settings);
 
-  lt::session_params params(pack);
+  lt::session_params params = make_session_params(std::move(pack), settings);
 
   // CRITICAL: Use memory-only disk I/O constructor - no files written to disk
   params.disk_io_constructor = memory_disk_io_constructor;
 
-  return std::make_unique<Session>(std::move(params));
+  return std::make_unique<Session>(std::move(params), settings.enable_pex);
 }
 
 void session_abort(Session &session) { session.session.abort(); }
@@ -351,17 +428,15 @@ bool session_is_paused(Session const &session) {
 
 void session_apply_settings(Session &session, SessionSettings const &settings) {
   lt::settings_pack pack;
-  if (!settings.listen_interfaces.empty())
-    pack.set_str(lt::settings_pack::listen_interfaces,
-                 rust_str_to_std(settings.listen_interfaces));
-  pack.set_bool(lt::settings_pack::enable_dht, settings.enable_dht);
-  pack.set_bool(lt::settings_pack::enable_lsd, settings.enable_lsd);
+  apply_network_settings(pack, settings);
+  apply_privacy_settings(pack, settings);
   pack.set_bool(lt::settings_pack::enable_upnp, settings.enable_upnp);
   pack.set_bool(lt::settings_pack::enable_natpmp, settings.enable_natpmp);
   pack.set_bool(lt::settings_pack::announce_to_all_trackers,
                 settings.announce_to_all_trackers);
   pack.set_bool(lt::settings_pack::announce_to_all_tiers,
                 settings.announce_to_all_tiers);
+  apply_proxy_settings(pack, settings);
   if (settings.download_rate_limit >= 0)
     pack.set_int(lt::settings_pack::download_rate_limit,
                  settings.download_rate_limit);
@@ -369,6 +444,15 @@ void session_apply_settings(Session &session, SessionSettings const &settings) {
     pack.set_int(lt::settings_pack::upload_rate_limit,
                  settings.upload_rate_limit);
   session.session.apply_settings(pack);
+
+#ifndef TORRENT_DISABLE_EXTENSIONS
+  if (settings.enable_pex && !session.pex_extension_enabled) {
+    session.session.add_extension(&lt::create_ut_pex_plugin);
+    session.pex_extension_enabled = true;
+  }
+#else
+  (void)settings;
+#endif
 }
 
 int32_t session_get_download_rate_limit(Session const &session) {
