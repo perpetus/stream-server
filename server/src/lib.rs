@@ -721,7 +721,7 @@ async fn run_inner(
         let _ = ready_tx.send(bound_http_addr);
     }
 
-    let (shutdown_started_tx, shutdown_started_rx) =
+    let (shutdown_started_tx, mut shutdown_started_rx) =
         tokio::sync::oneshot::channel::<ShutdownSource>();
     let listen_for_ctrl_c = cfg.listen_for_ctrl_c;
     let shutdown = async move {
@@ -788,9 +788,13 @@ async fn run_inner(
     let shutdown_source = tokio::select! {
         result = &mut server => {
             result?;
-            None
+            match shutdown_started_rx.try_recv() {
+                Ok(source) => Some(source),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => None,
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => None,
+            }
         }
-        Ok(source) = shutdown_started_rx => {
+        Ok(source) = &mut shutdown_started_rx => {
             match tokio::time::timeout(cfg.graceful_shutdown_timeout, &mut server).await {
                 Ok(result) => {
                     result?;
