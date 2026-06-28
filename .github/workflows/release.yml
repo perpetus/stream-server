@@ -460,9 +460,14 @@ jobs:
           EOF
 
           changelog="$(mktemp)"
+          extra_args=()
+          if [ "${tag}" = "v0.1.8" ]; then
+            extra_args+=("-f" "previous_tag_name=v0.1.7.1")
+          fi
           if gh api "repos/${repo}/releases/generate-notes" \
             -f tag_name="${tag}" \
             -f target_commitish="${GITHUB_SHA}" \
+            "${extra_args[@]}" \
             --jq '.body' > "${changelog}" && [ -s "${changelog}" ]; then
             cat >> "${GITHUB_WORKSPACE}/RELEASE_BODY.md" <<'EOF'
 

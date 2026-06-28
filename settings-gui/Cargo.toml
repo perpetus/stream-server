@@ -1,6 +1,6 @@
 [package]
 name = "settings-gui"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2024"
 license = "MIT"
 description = "Stream Server desktop settings editor"

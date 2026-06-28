@@ -9,7 +9,7 @@ use std::{
     hash::{Hash, Hasher},
     path::PathBuf,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -245,7 +245,40 @@ impl Default for LogState {
 
 static SETTINGS_GUI_OPEN: AtomicBool = AtomicBool::new(false);
 
+struct PersistentGuiState {
+    weak: Weak<AppWindow>,
+    async_handle: Handle,
+    connector: Arc<dyn ServerConnector>,
+}
+
+static PERSISTENT_GUI: OnceLock<Mutex<PersistentGuiState>> = OnceLock::new();
+
 pub fn run(connector: Arc<dyn ServerConnector>) -> Result<()> {
+    // If the event loop is already running from a previous call, just
+    // re-show the existing (hidden) window instead of creating a new one.
+    if let Some(state_mutex) = PERSISTENT_GUI.get() {
+        if SETTINGS_GUI_OPEN.swap(true, Ordering::SeqCst) {
+            eprintln!("Settings GUI is already open.");
+            return Ok(());
+        }
+
+        let state = state_mutex.lock().expect("persistent GUI state poisoned");
+        let weak = state.weak.clone();
+        let handle = state.async_handle.clone();
+        let conn = state.connector.clone();
+        drop(state);
+
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(ui) = weak.upgrade() {
+                let _ = ui.show();
+                refresh_settings(handle, conn, ui.as_weak());
+            }
+        });
+        return Ok(());
+    }
+
+    // First-time initialisation — set up the UI, start the event loop,
+    // and keep it alive permanently so subsequent opens can reuse it.
     if std::env::var("SLINT_BACKEND").is_err() {
         unsafe {
             std::env::set_var("SLINT_BACKEND", "winit");
@@ -256,14 +289,6 @@ pub fn run(connector: Arc<dyn ServerConnector>) -> Result<()> {
         eprintln!("Settings GUI is already open.");
         return Ok(());
     }
-
-    struct OpenGuard;
-    impl Drop for OpenGuard {
-        fn drop(&mut self) {
-            SETTINGS_GUI_OPEN.store(false, Ordering::SeqCst);
-        }
-    }
-    let _guard = OpenGuard;
 
     let async_runtime = RuntimeBuilder::new_multi_thread()
         .worker_threads(2)
@@ -280,6 +305,13 @@ pub fn run(connector: Arc<dyn ServerConnector>) -> Result<()> {
     ui.set_log_entries(ModelRc::new(VecModel::from(Vec::<LogEntry>::new())));
     ui.set_log_timeline_bins(ModelRc::new(VecModel::from(vec![1; 32])));
     ui.set_log_target_options(ModelRc::new(VecModel::from(Vec::<FilterOption>::new())));
+
+    // Hide (don't destroy) the window when the user clicks close so
+    // the event loop stays alive and the window can be re-shown later.
+    ui.window().on_close_requested(|| {
+        SETTINGS_GUI_OPEN.store(false, Ordering::SeqCst);
+        slint::CloseRequestResponse::HideWindow
+    });
 
     let weak = ui.as_weak();
     ui.on_refresh_settings({
@@ -522,13 +554,26 @@ pub fn run(connector: Arc<dyn ServerConnector>) -> Result<()> {
         }
     });
 
+    // Store persistent state so subsequent calls can reuse the window.
+    PERSISTENT_GUI.get_or_init(|| Mutex::new(PersistentGuiState {
+        weak: ui.as_weak(),
+        connector: connector.clone(),
+        async_handle: async_handle.clone(),
+    }));
+
     refresh_settings(
         async_handle.clone(),
         connector.clone(),
         weak.clone(),
     );
 
-    ui.run().context("settings window failed")?;
+    // Keep the async runtime alive for the lifetime of the event loop.
+    // run_event_loop_until_quit blocks forever (even when the window is
+    // hidden) so the runtime on the stack is never dropped.
+    let _keep_runtime = async_runtime;
+
+    ui.show().context("failed to show settings window")?;
+    slint::run_event_loop_until_quit().context("settings window event loop failed")?;
     Ok(())
 }
 

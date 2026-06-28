@@ -12,7 +12,7 @@ use self::{
     github::{fetch_releases, make_client, select_latest_candidate},
     staging::stage_update,
     state::{UpdateInner, UpdateOperationState, UpdateStatus},
-    version::{UpdateChannel, current_version},
+    version::{UpdateChannel, normalize_current_version},
 };
 use crate::{routes::system::ServerSettings, state::AppState};
 use std::{path::PathBuf, sync::Arc, time::Duration};
@@ -77,7 +77,7 @@ impl UpdateManager {
         };
 
         let selected =
-            match select_latest_candidate(&releases, settings.update_channel, &current_version()) {
+            match select_latest_candidate(&releases, settings.update_channel, &normalize_current_version()) {
                 Ok(selected) => selected,
                 Err(err) => {
                     self.fail(&err.to_string()).await;
