@@ -11,8 +11,6 @@ use tray_icon::{
     menu::{CheckMenuItem, IconMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem},
 };
 
-
-
 pub enum UserEvent {
     OpenWeb,
     OpenSettings,
@@ -396,7 +394,10 @@ impl settings_gui::ServerConnector for DirectConnector {
         tokio::task::spawn_blocking(move || {
             let path = crate::diagnostics::latest_log_with_extension(&state.log_dir, "jsonl");
             let Some(path) = path else {
-                return Ok(settings_gui::CurrentLogTail { path: None, content: String::new() });
+                return Ok(settings_gui::CurrentLogTail {
+                    path: None,
+                    content: String::new(),
+                });
             };
             let lines = crate::diagnostics::tail_lines(&path, 500)?;
             let content = lines.join("\n");
@@ -408,19 +409,26 @@ impl settings_gui::ServerConnector for DirectConnector {
         .await?
     }
 
+    async fn get_changelog(&self, force: bool) -> anyhow::Result<settings_gui::ChangelogPayload> {
+        let channel = self.state.settings.read().await.update_channel;
+        let response = crate::updater::changelog::latest_changelog(channel, force).await;
+        let val = serde_json::to_value(response)?;
+        Ok(serde_json::from_value(val)?)
+    }
+
     async fn export_diagnostics(&self) -> anyhow::Result<Vec<u8>> {
         let state = self.state.clone();
-        tokio::task::spawn_blocking(move || {
-            crate::diagnostics::build_diagnostics_zip(&state)
-        })
-        .await?
+        tokio::task::spawn_blocking(move || crate::diagnostics::build_diagnostics_zip(&state))
+            .await?
     }
 }
 
 pub fn open_settings_gui(_server_url: &str) -> anyhow::Result<()> {
-    let state = crate::GLOBAL_STATE.read().unwrap().clone().ok_or_else(|| {
-        anyhow::anyhow!("Server state is not initialized")
-    })?;
+    let state = crate::GLOBAL_STATE
+        .read()
+        .unwrap()
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("Server state is not initialized"))?;
 
     let connector = std::sync::Arc::new(DirectConnector { state });
 

@@ -1,4 +1,5 @@
 pub mod assets;
+pub mod changelog;
 pub mod error;
 pub mod github;
 pub mod idle;
@@ -76,14 +77,17 @@ impl UpdateManager {
             }
         };
 
-        let selected =
-            match select_latest_candidate(&releases, settings.update_channel, &normalize_current_version()) {
-                Ok(selected) => selected,
-                Err(err) => {
-                    self.fail(&err.to_string()).await;
-                    return Err(err);
-                }
-            };
+        let selected = match select_latest_candidate(
+            &releases,
+            settings.update_channel,
+            &normalize_current_version(),
+        ) {
+            Ok(selected) => selected,
+            Err(err) => {
+                self.fail(&err.to_string()).await;
+                return Err(err);
+            }
+        };
 
         let mut inner = self.inner.write().await;
         inner.status.channel = settings.update_channel;

@@ -33,11 +33,6 @@ pub fn current_version() -> Version {
 pub fn parse_release_tag(tag: &str) -> Option<Version> {
     let tag = tag.strip_prefix('v').unwrap_or(tag);
 
-    // Try strict semver first (covers "x.x.x" and "x.x.x-pre").
-    if let Ok(v) = Version::parse(tag) {
-        return Some(v);
-    }
-
     // Split off an optional pre-release / build-metadata suffix that
     // starts at the first '-' or '+' after the version numbers.
     let (numeric, suffix) = split_suffix(tag);
@@ -49,6 +44,16 @@ pub fn parse_release_tag(tag: &str) -> Option<Version> {
             let major: u64 = parts[0].parse().ok()?;
             let minor: u64 = parts[1].parse().ok()?;
             let mut v = Version::new(major, minor, 0);
+            apply_suffix(&mut v, suffix);
+            Some(v)
+        }
+        // "x.x.y" → "x.x.(y*10000)" so it compares correctly with
+        // four-component tags like "x.x.y.z".
+        3 => {
+            let major: u64 = parts[0].parse().ok()?;
+            let minor: u64 = parts[1].parse().ok()?;
+            let patch: u64 = parts[2].parse().ok()?;
+            let mut v = Version::new(major, minor, patch * 10000);
             apply_suffix(&mut v, suffix);
             Some(v)
         }
@@ -106,7 +111,7 @@ mod tests {
     #[test]
     fn three_component_tag() {
         let parsed = parse_release_tag("v0.1.3").unwrap();
-        assert_eq!(parsed, Version::parse("0.1.3").unwrap());
+        assert_eq!(parsed, Version::new(0, 1, 30000));
     }
 
     #[test]
@@ -131,8 +136,9 @@ mod tests {
         let current = Version::new(0, 1, 7 * 10000);
         assert!(v72 > v71);
         assert!(v71 > current);
-        // Raw 3-component 0.1.7 is smaller than the 4-comp encoding:
+        assert_eq!(v7, current);
         assert!(v7 < v71);
+        assert!(parse_release_tag("v0.1.8").unwrap() > v72);
     }
 
     #[test]
@@ -159,4 +165,3 @@ mod tests {
         assert!(is_newer(&Version::new(0, 1, 70001), &current));
     }
 }
-

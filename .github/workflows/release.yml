@@ -409,135 +409,15 @@ jobs:
           ls -la release/
 
       - name: Generate release description
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
-          # Project description, per-platform download links, and generated
-          # changelog. Written to the workspace root (NOT release/) so it is not
-          # uploaded as an asset.
-          echo "## Stream Server ${GITHUB_REF_NAME}" > "${GITHUB_WORKSPACE}/RELEASE_BODY.md"
-          cat >> "${GITHUB_WORKSPACE}/RELEASE_BODY.md" <<'EOF'
+          prev_tag=$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null || true)
 
-          High-performance torrent streaming server with HLS transcoding and a
-          Stremio-compatible streaming API. Features disk-backed downloads,
-          hardware-accelerated transcoding, and an embedded HTTP server.
-
-          ### Downloads
-
-          EOF
-          repo="${GITHUB_REPOSITORY}"
-          tag="${GITHUB_REF_NAME}"
-
-          asset_links() {
-            label="$1"
-            pattern="$2"
-
-            for asset in release/${pattern}; do
-              [ -f "$asset" ] || continue
-              name="$(basename "$asset")"
-              echo "| ${label} | [Download](https://github.com/${repo}/releases/download/${tag}/${name}) |" >> "${GITHUB_WORKSPACE}/RELEASE_BODY.md"
-            done
-          }
-
-          {
-            echo "| Platform | Download |"
-            echo "| --- | --- |"
-          } >> "${GITHUB_WORKSPACE}/RELEASE_BODY.md"
-
-          asset_links "Windows (portable)" "stream-server-windows-amd64.exe"
-          asset_links "Windows settings GUI" "stream-server-settings-windows-amd64.exe"
-          asset_links "Windows installer" "stream-server-windows-amd64.msi"
-          asset_links "Windows Stremio runtime" "stremio-runtime-windows-amd64.exe"
-          asset_links "Windows updater" "stream-server-updater-windows-amd64.exe"
-          asset_links "Debian / Ubuntu" "stream-server-linux-amd64.deb"
-          asset_links "Linux (portable)" "stream-server-linux-amd64"
-          asset_links "Linux settings GUI" "stream-server-settings-linux-amd64"
-          asset_links "Linux (AppImage)" "stream-server-linux-amd64.AppImage"
-          asset_links "Arch Linux" "stream-server-arch-x86_64.pkg.tar.zst"
-          asset_links "Checksums" "SHA256SUMS.txt"
-
-          cat >> "${GITHUB_WORKSPACE}/RELEASE_BODY.md" <<'EOF'
-
-          Verify your download against `SHA256SUMS.txt`.
-
-          ---
-          EOF
-
-          # Determine the baseline tag for the comparison
-          prev_tag=$(git describe --tags --abbrev=0 "${tag}^" 2>/dev/null || true)
-          
-          # If we have a previous tag, generate a categorized commit changelog
-          if [ -n "$prev_tag" ]; then
-            feats=$(mktemp)
-            fixes=$(mktemp)
-            improvements=$(mktemp)
-            cibuild=$(mktemp)
-            others=$(mktemp)
-
-            git log "${prev_tag}..${tag}" --oneline | while read -r sha message; do
-              # Clean commit prefix for display
-              clean_msg=$(echo "$message" | sed -E 's/^(feat|fix|style|refactor|perf|ci|build|chore)(\([^)]+\))?:[[:space:]]*//I')
-              category=$(echo "$message" | grep -o -E '^[a-zA-Z]+' | tr '[:upper:]' '[:lower:]' || true)
-
-              case "$category" in
-                feat)
-                  echo "* ${clean_msg} (${sha})" >> "$feats"
-                  ;;
-                fix)
-                  echo "* ${clean_msg} (${sha})" >> "$fixes"
-                  ;;
-                style|refactor|perf)
-                  echo "* ${clean_msg} (${sha})" >> "$improvements"
-                  ;;
-                ci|build)
-                  echo "* ${clean_msg} (${sha})" >> "$cibuild"
-                  ;;
-                *)
-                  echo "* ${message} (${sha})" >> "$others"
-                  ;;
-              esac
-            done
-
-            {
-              echo "### Changelog (since ${prev_tag})"
-              echo ""
-              if [ -s "$feats" ]; then
-                echo "#### Features & Enhancements"
-                cat "$feats"
-                echo ""
-              fi
-              if [ -s "$fixes" ]; then
-                echo "#### Bug Fixes"
-                cat "$fixes"
-                echo ""
-              fi
-              if [ -s "$improvements" ]; then
-                echo "#### Code Improvements"
-                cat "$improvements"
-                echo ""
-              fi
-              if [ -s "$cibuild" ]; then
-                echo "#### CI & Build"
-                cat "$cibuild"
-                echo ""
-              fi
-              if [ -s "$others" ]; then
-                echo "#### Other Changes"
-                cat "$others"
-                echo ""
-              fi
-              echo "**Full Comparison**: https://github.com/${repo}/compare/${prev_tag}...${tag}"
-            } >> "${GITHUB_WORKSPACE}/RELEASE_BODY.md"
-
-            rm -f "$feats" "$fixes" "$improvements" "$cibuild" "$others"
-          else
-            cat >> "${GITHUB_WORKSPACE}/RELEASE_BODY.md" <<'EOF'
-
-          ### Changelog
-
-          Initial release.
-          EOF
-          fi
+          python scripts/generate_release_notes.py \
+            --repo "${GITHUB_REPOSITORY}" \
+            --tag "${GITHUB_REF_NAME}" \
+            --previous-tag "${prev_tag}" \
+            --asset-dir release \
+            --output "${GITHUB_WORKSPACE}/RELEASE_BODY.md"
 
           cat "${GITHUB_WORKSPACE}/RELEASE_BODY.md"
 

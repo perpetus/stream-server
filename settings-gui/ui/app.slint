@@ -45,6 +45,15 @@ export struct FilterOption {
     checked: bool,
 }
 
+export struct ChangelogItem {
+    text: string,
+}
+
+export struct ChangelogSection {
+    title: string,
+    items: [ChangelogItem],
+}
+
 export component AppWindow inherits Window {
     default-font-family: "Plus Jakarta Sans";
     title: "Stream Server Settings";
@@ -114,6 +123,12 @@ export component AppWindow inherits Window {
     in-out property <string> update-channel;
     in-out property <string> update-check-interval-hours;
     in-out property <bool> seeding-enabled;
+    in-out property <string> changelog-status;
+    in-out property <string> changelog-current-version;
+    in-out property <string> changelog-latest-version;
+    in-out property <string> changelog-release-url;
+    in-out property <string> changelog-published-at;
+    in-out property <[ChangelogSection]> changelog-sections;
 
     // ---- New: which sidebar section is shown ----
     in-out property <int> selected-section: 0;
@@ -129,6 +144,8 @@ export component AppWindow inherits Window {
     callback refresh-logs();
     callback open-logs-folder();
     callback export-diagnostics();
+    callback refresh-changelog(bool);
+    callback open-changelog-release();
     callback log-search-edited(string);
     callback toggle-log-row(int);
     callback toggle-log-live(bool);
@@ -451,6 +468,127 @@ export component AppWindow inherits Window {
                             TextField { text <=> root.update-check-interval-hours; horizontal-stretch: 1; }
                         }
                         ToggleRow { label: "Seed after download"; checked <=> root.seeding-enabled; }
+                    }
+
+                    if root.selected-section == 5 : Card {
+                        HorizontalLayout {
+                            height: 36px;
+                            vertical-stretch: 0;
+                            spacing: 10px;
+
+                            Text {
+                                text: "Latest Changelog";
+                                color: Theme.text;
+                                font-size: Theme.fs-section;
+                                font-weight: 700;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                            }
+
+                            IconButton {
+                                text: "Refresh";
+                                icon: Icons.refresh;
+                                clicked => { root.refresh-changelog(true); }
+                            }
+
+                            if root.changelog-release-url != "" : IconButton {
+                                text: "Open release";
+                                icon: Icons.export;
+                                clicked => { root.open-changelog-release(); }
+                            }
+                        }
+
+                        HorizontalLayout {
+                            spacing: 10px;
+                            height: 30px;
+                            vertical-stretch: 0;
+
+                            StatusBadge {
+                                text: root.changelog-current-version != "" ? "Current " + root.changelog-current-version : "Current unknown";
+                                dot-color: Theme.text-subtle;
+                                horizontal-stretch: 1;
+                            }
+                            StatusBadge {
+                                text: root.changelog-latest-version != "" ? "Latest " + root.changelog-latest-version : "Latest unknown";
+                                dot-color: Theme.accent;
+                                horizontal-stretch: 1;
+                            }
+                            StatusBadge {
+                                text: root.changelog-status;
+                                dot-color: Theme.success;
+                                horizontal-stretch: 2;
+                            }
+                        }
+
+                        if root.changelog-published-at != "" : Text {
+                            text: "Published " + root.changelog-published-at;
+                            color: Theme.text-muted;
+                            font-size: Theme.fs-small;
+                            vertical-stretch: 0;
+                        }
+
+                        if root.changelog-sections.length == 0 : Rectangle {
+                            height: 56px;
+                            vertical-stretch: 0;
+                            border-radius: Theme.radius-sm;
+                            border-width: 1px;
+                            border-color: Theme.border;
+                            background: Theme.surface-alt;
+
+                            Text {
+                                text: root.changelog-status;
+                                color: Theme.text-muted;
+                                font-size: Theme.fs-body;
+                                width: parent.width - 24px;
+                                x: 12px;
+                                height: parent.height;
+                                vertical-alignment: center;
+                                wrap: word-wrap;
+                            }
+                        }
+
+                        for section in root.changelog-sections : VerticalLayout {
+                            spacing: 8px;
+                            vertical-stretch: 0;
+
+                            Text {
+                                text: section.title;
+                                color: Theme.text;
+                                font-size: Theme.fs-label;
+                                font-weight: 700;
+                                vertical-stretch: 0;
+                            }
+
+                            for item in section.items : HorizontalLayout {
+                                spacing: 8px;
+                                min-height: 22px;
+                                vertical-stretch: 0;
+
+                                Rectangle {
+                                    width: 10px;
+                                    height: 22px;
+                                    vertical-stretch: 0;
+
+                                    Rectangle {
+                                        width: 4px;
+                                        height: 4px;
+                                        border-radius: 2px;
+                                        background: Theme.accent;
+                                        x: 3px;
+                                        y: 8px;
+                                    }
+                                }
+
+                                Text {
+                                    text: item.text;
+                                    color: Theme.text-muted;
+                                    font-size: Theme.fs-body;
+                                    wrap: word-wrap;
+                                    horizontal-stretch: 1;
+                                    vertical-stretch: 0;
+                                }
+                            }
+                        }
                     }
 
                 }

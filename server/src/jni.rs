@@ -1,6 +1,7 @@
 use crate::{ServerConfig, ServerHandle};
+use jni::Env;
 use jni::EnvUnowned;
-use jni::objects::{JClass, JString};
+use jni::objects::{JClass, JObject, JString};
 use jni::sys::jstring;
 use once_cell::sync::Lazy;
 use std::net::SocketAddr;
@@ -9,15 +10,28 @@ use std::sync::Mutex;
 
 static SERVER_HANDLE: Lazy<Mutex<Option<ServerHandle>>> = Lazy::new(|| Mutex::new(None));
 
+#[cfg(target_os = "android")]
+fn init_android_tls_verifier(env: &mut Env, context: JObject) -> jni::errors::Result<()> {
+    rustls_platform_verifier::android::init_with_env(env, context)
+}
+
+#[cfg(not(target_os = "android"))]
+fn init_android_tls_verifier(_env: &mut Env, _context: JObject) -> jni::errors::Result<()> {
+    Ok(())
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn Java_com_stremio_mobile_server_JniStreamingServerController_startServerNative(
     mut env: EnvUnowned,
     _class: JClass,
+    context: JObject,
     config_dir: JString,
     cache_dir: JString,
     port: jni::sys::jint,
 ) -> jstring {
     env.with_env(|env| -> jni::errors::Result<jstring> {
+        init_android_tls_verifier(env, context)?;
+
         let config_dir_str: String = match config_dir.try_to_string(env) {
             Ok(s) => s,
             Err(_) => {

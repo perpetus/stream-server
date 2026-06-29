@@ -13,6 +13,13 @@ pub struct GitHubRelease {
     pub html_url: String,
     pub draft: bool,
     pub prerelease: bool,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub body: Option<String>,
+    #[serde(default)]
+    pub published_at: Option<String>,
     pub assets: Vec<GitHubAsset>,
 }
 
@@ -67,7 +74,7 @@ pub fn select_latest_candidate(
         };
 
         let candidate = UpdateCandidate {
-            version: version.to_string(),
+            version: release.tag_name.trim_start_matches('v').to_string(),
             tag: release.tag_name.clone(),
             release_url: release.html_url.clone(),
             prerelease: release.prerelease,
@@ -130,6 +137,9 @@ mod tests {
             html_url: format!("https://example.test/releases/{tag}"),
             draft: false,
             prerelease,
+            name: None,
+            body: None,
+            published_at: None,
             assets: vec![
                 asset(SERVER_WINDOWS_ASSET_NAME),
                 asset(STREMIO_RUNTIME_WINDOWS_ASSET_NAME),

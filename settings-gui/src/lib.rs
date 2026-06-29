@@ -108,12 +108,34 @@ pub struct CurrentLogTail {
     pub content: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChangelogPayload {
+    pub current_version: String,
+    pub latest_version: Option<String>,
+    pub tag: Option<String>,
+    pub release_url: Option<String>,
+    pub published_at: Option<String>,
+    pub channel: String,
+    pub state: String,
+    pub sections: Vec<ChangelogSectionPayload>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChangelogSectionPayload {
+    pub title: String,
+    pub items: Vec<String>,
+}
+
 #[async_trait::async_trait]
 pub trait ServerConnector: Send + Sync + 'static {
     async fn get_settings(&self) -> Result<SettingsPayload>;
     async fn apply_settings(&self, settings: SettingsPayload) -> Result<()>;
     async fn get_logs(&self) -> Result<LogsSnapshot>;
     async fn get_current_log(&self) -> Result<CurrentLogTail>;
+    async fn get_changelog(&self, force: bool) -> Result<ChangelogPayload>;
     async fn export_diagnostics(&self) -> Result<Vec<u8>>;
 }
 
@@ -131,14 +153,15 @@ impl HttpConnector {
 #[async_trait::async_trait]
 impl ServerConnector for HttpConnector {
     async fn get_settings(&self) -> Result<SettingsPayload> {
-        let res = self.client
+        let res = self
+            .client
             .get(format!("{}/settings", self.server_url))
             .send()
             .await?
             .error_for_status()?
             .json::<serde_json::Value>()
             .await?;
-        
+
         let settings_value = res.get("values").cloned().unwrap_or(res);
         let payload: SettingsPayload = serde_json::from_value(settings_value)?;
         Ok(payload)
@@ -156,7 +179,8 @@ impl ServerConnector for HttpConnector {
     }
 
     async fn get_logs(&self) -> Result<LogsSnapshot> {
-        Ok(self.client
+        Ok(self
+            .client
             .get(format!("{}/diagnostics/logs", self.server_url))
             .send()
             .await?
@@ -166,20 +190,44 @@ impl ServerConnector for HttpConnector {
     }
 
     async fn get_current_log(&self) -> Result<CurrentLogTail> {
-        let res = self.client
-            .get(format!("{}/diagnostics/logs/current?format=json&lines=500", self.server_url))
+        let res = self
+            .client
+            .get(format!(
+                "{}/diagnostics/logs/current?format=json&lines=500",
+                self.server_url
+            ))
             .send()
             .await?
             .error_for_status()?
             .json::<serde_json::Value>()
             .await?;
         let path = res.get("path").and_then(|p| p.as_str()).map(String::from);
-        let content = res.get("content").and_then(|c| c.as_str()).unwrap_or("").to_string();
+        let content = res
+            .get("content")
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .to_string();
         Ok(CurrentLogTail { path, content })
     }
 
+    async fn get_changelog(&self, force: bool) -> Result<ChangelogPayload> {
+        Ok(self
+            .client
+            .get(format!(
+                "{}/update/changelog?force={force}",
+                self.server_url
+            ))
+            .timeout(Duration::from_secs(15))
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<ChangelogPayload>()
+            .await?)
+    }
+
     async fn export_diagnostics(&self) -> Result<Vec<u8>> {
-        let bytes = self.client
+        let bytes = self
+            .client
             .get(format!("{}/diagnostics/export", self.server_url))
             .timeout(Duration::from_secs(30))
             .send()
@@ -299,9 +347,12 @@ pub fn run(connector: Arc<dyn ServerConnector>) -> Result<()> {
     let async_handle = async_runtime.handle().clone();
     let log_state = Arc::new(Mutex::new(LogState::default()));
     let log_refresh_in_flight = Arc::new(AtomicBool::new(false));
+    let changelog_loaded = Arc::new(AtomicBool::new(false));
     let ui = AppWindow::new().context("failed to create settings window")?;
     ui.set_server_url("embedded".into());
     ui.set_status_text("Not connected".into());
+    ui.set_changelog_status("Changelog not loaded".into());
+    ui.set_changelog_sections(ModelRc::new(VecModel::from(Vec::<ChangelogSection>::new())));
     ui.set_log_entries(ModelRc::new(VecModel::from(Vec::<LogEntry>::new())));
     ui.set_log_timeline_bins(ModelRc::new(VecModel::from(vec![1; 32])));
     ui.set_log_target_options(ModelRc::new(VecModel::from(Vec::<FilterOption>::new())));
@@ -318,26 +369,14 @@ pub fn run(connector: Arc<dyn ServerConnector>) -> Result<()> {
         let weak = weak.clone();
         let handle = async_handle.clone();
         let connector = connector.clone();
-        move || {
-            refresh_settings(
-                handle.clone(),
-                connector.clone(),
-                weak.clone(),
-            )
-        }
+        move || refresh_settings(handle.clone(), connector.clone(), weak.clone())
     });
 
     ui.on_apply_settings({
         let weak = weak.clone();
         let handle = async_handle.clone();
         let connector = connector.clone();
-        move || {
-            apply_settings(
-                handle.clone(),
-                connector.clone(),
-                weak.clone(),
-            )
-        }
+        move || apply_settings(handle.clone(), connector.clone(), weak.clone())
     });
 
     ui.on_refresh_logs({
@@ -362,25 +401,37 @@ pub fn run(connector: Arc<dyn ServerConnector>) -> Result<()> {
         let weak = weak.clone();
         let handle = async_handle.clone();
         let connector = connector.clone();
-        move || {
-            open_logs_folder(
-                handle.clone(),
-                connector.clone(),
-                weak.clone(),
-            )
-        }
+        move || open_logs_folder(handle.clone(), connector.clone(), weak.clone())
     });
 
     ui.on_export_diagnostics({
         let weak = weak.clone();
         let handle = async_handle.clone();
         let connector = connector.clone();
-        move || {
-            export_diagnostics(
+        move || export_diagnostics(handle.clone(), connector.clone(), weak.clone())
+    });
+
+    ui.on_refresh_changelog({
+        let weak = weak.clone();
+        let handle = async_handle.clone();
+        let connector = connector.clone();
+        let changelog_loaded = Arc::clone(&changelog_loaded);
+        move |force| {
+            refresh_changelog(
                 handle.clone(),
                 connector.clone(),
                 weak.clone(),
+                Arc::clone(&changelog_loaded),
+                force,
             )
+        }
+    });
+
+    ui.on_open_changelog_release({
+        let weak = weak.clone();
+        let handle = async_handle.clone();
+        move || {
+            open_changelog_release(handle.clone(), weak.clone());
         }
     });
 
@@ -521,10 +572,22 @@ pub fn run(connector: Arc<dyn ServerConnector>) -> Result<()> {
         let weak = weak.clone();
         let log_state = Arc::clone(&log_state);
         let in_flight = Arc::clone(&log_refresh_in_flight);
+        let changelog_loaded = Arc::clone(&changelog_loaded);
         let handle = async_handle.clone();
         let connector = connector.clone();
         move |index| {
-            if index == 6 { // Logs tab
+            if index == 5 && !changelog_loaded.load(Ordering::Acquire) {
+                refresh_changelog(
+                    handle.clone(),
+                    connector.clone(),
+                    weak.clone(),
+                    Arc::clone(&changelog_loaded),
+                    false,
+                );
+            }
+
+            if index == 6 {
+                // Logs tab
                 let already_loaded = {
                     let mut state = log_state.lock().expect("log state poisoned");
                     let loaded = state.lazy_loaded;
@@ -555,16 +618,21 @@ pub fn run(connector: Arc<dyn ServerConnector>) -> Result<()> {
     });
 
     // Store persistent state so subsequent calls can reuse the window.
-    PERSISTENT_GUI.get_or_init(|| Mutex::new(PersistentGuiState {
-        weak: ui.as_weak(),
-        connector: connector.clone(),
-        async_handle: async_handle.clone(),
-    }));
+    PERSISTENT_GUI.get_or_init(|| {
+        Mutex::new(PersistentGuiState {
+            weak: ui.as_weak(),
+            connector: connector.clone(),
+            async_handle: async_handle.clone(),
+        })
+    });
 
-    refresh_settings(
+    refresh_settings(async_handle.clone(), connector.clone(), weak.clone());
+    refresh_changelog(
         async_handle.clone(),
         connector.clone(),
         weak.clone(),
+        Arc::clone(&changelog_loaded),
+        false,
     );
 
     // Keep the async runtime alive for the lifetime of the event loop.
@@ -944,7 +1012,14 @@ fn flatten_json(
         match value {
             Value::Array(arr) => {
                 for (i, val) in arr.iter().enumerate() {
-                    flatten_json(val, depth + 1, i.to_string(), expanded_nodes, node_counter, output);
+                    flatten_json(
+                        val,
+                        depth + 1,
+                        i.to_string(),
+                        expanded_nodes,
+                        node_counter,
+                        output,
+                    );
                 }
             }
             Value::Object(obj) => {
@@ -952,7 +1027,14 @@ fn flatten_json(
                 sorted_keys.sort();
                 for k in sorted_keys {
                     if let Some(val) = obj.get(k) {
-                        flatten_json(val, depth + 1, k.clone(), expanded_nodes, node_counter, output);
+                        flatten_json(
+                            val,
+                            depth + 1,
+                            k.clone(),
+                            expanded_nodes,
+                            node_counter,
+                            output,
+                        );
                     }
                 }
             }
@@ -1044,7 +1126,14 @@ fn build_log_view_snapshot(state: &LogState) -> LogViewSnapshot {
     let is_truncated = visible_count > 200;
 
     let display_entries: Vec<_> = if is_truncated {
-        visible.into_iter().rev().take(200).collect::<Vec<_>>().into_iter().rev().collect()
+        visible
+            .into_iter()
+            .rev()
+            .take(200)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect()
     } else {
         visible
     };
@@ -1059,7 +1148,14 @@ fn build_log_view_snapshot(state: &LogState) -> LogViewSnapshot {
                     let empty_set = HashSet::new();
                     let expanded_nodes = expanded_set.unwrap_or(&empty_set);
                     let mut node_counter = 0;
-                    flatten_json(val, 0, String::new(), expanded_nodes, &mut node_counter, &mut nodes);
+                    flatten_json(
+                        val,
+                        0,
+                        String::new(),
+                        expanded_nodes,
+                        &mut node_counter,
+                        &mut nodes,
+                    );
                 }
                 nodes
             } else {
@@ -1179,6 +1275,101 @@ fn entry_matches_query(entry: &LogEntryData, query: &str) -> bool {
         || entry.raw.to_ascii_lowercase().contains(query)
 }
 
+fn refresh_changelog(
+    handle: Handle,
+    connector: Arc<dyn ServerConnector>,
+    weak: Weak<AppWindow>,
+    loaded: Arc<AtomicBool>,
+    force: bool,
+) {
+    if !force && loaded.load(Ordering::Acquire) {
+        return;
+    }
+
+    set_changelog_status(&weak, "Loading changelog...");
+    handle.spawn(async move {
+        let result = connector.get_changelog(force).await;
+        match result {
+            Ok(payload) => {
+                loaded.store(true, Ordering::Release);
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = weak.upgrade() {
+                        apply_changelog_to_ui(&ui, payload);
+                    }
+                });
+            }
+            Err(err) => set_changelog_status(&weak, format!("Failed to load changelog: {err}")),
+        }
+    });
+}
+
+fn apply_changelog_to_ui(ui: &AppWindow, payload: ChangelogPayload) {
+    let status = changelog_status_text(&payload);
+    let sections = payload
+        .sections
+        .into_iter()
+        .map(|section| {
+            let items = section
+                .items
+                .into_iter()
+                .map(|text| ChangelogItem { text: text.into() })
+                .collect::<Vec<_>>();
+            ChangelogSection {
+                title: section.title.into(),
+                items: ModelRc::new(VecModel::from(items)),
+            }
+        })
+        .collect::<Vec<_>>();
+
+    ui.set_changelog_current_version(payload.current_version.into());
+    ui.set_changelog_latest_version(payload.latest_version.unwrap_or_default().into());
+    ui.set_changelog_release_url(payload.release_url.unwrap_or_default().into());
+    ui.set_changelog_published_at(payload.published_at.unwrap_or_default().into());
+    ui.set_changelog_status(status.into());
+    ui.set_changelog_sections(ModelRc::new(VecModel::from(sections)));
+}
+
+fn changelog_status_text(payload: &ChangelogPayload) -> String {
+    let base = match payload.state.as_str() {
+        "loaded" => "Latest release changelog loaded",
+        "upToDate" => "Latest release changelog loaded",
+        "offline" => "GitHub is offline or unreachable",
+        "notFound" => "No eligible release changelog found",
+        "error" => "Could not load release changelog",
+        other => other,
+    };
+
+    match payload.error.as_deref() {
+        Some(error) if !error.is_empty() => format!("{base}: {error}"),
+        _ => base.to_string(),
+    }
+}
+
+fn open_changelog_release(handle: Handle, weak: Weak<AppWindow>) {
+    let Some(ui) = weak.upgrade() else {
+        return;
+    };
+    let url = ui.get_changelog_release_url().to_string();
+    if url.trim().is_empty() {
+        ui.set_changelog_status("No release link is available".into());
+        return;
+    }
+
+    set_changelog_status(&weak, "Opening release...");
+    handle.spawn(async move {
+        let result =
+            tokio::task::spawn_blocking(move || open::that(url).context("failed to open release"))
+                .await
+                .context("failed to join open-release task")
+                .and_then(|result| result);
+
+        match result {
+            Ok(_) => set_changelog_status(&weak, "Opened release"),
+            Err(err) => set_changelog_status(&weak, format!("Failed to open release: {err}")),
+        }
+    });
+}
+
 fn open_logs_folder(handle: Handle, connector: Arc<dyn ServerConnector>, weak: Weak<AppWindow>) {
     set_log_status(&weak, "Opening logs folder...");
     handle.spawn(async move {
@@ -1242,6 +1433,16 @@ fn set_log_status(weak: &Weak<AppWindow>, text: impl Into<String>) {
     let _ = slint::invoke_from_event_loop(move || {
         if let Some(ui) = weak.upgrade() {
             ui.set_log_status(SharedString::from(text));
+        }
+    });
+}
+
+fn set_changelog_status(weak: &Weak<AppWindow>, text: impl Into<String>) {
+    let text = text.into();
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(ui) = weak.upgrade() {
+            ui.set_changelog_status(SharedString::from(text));
         }
     });
 }

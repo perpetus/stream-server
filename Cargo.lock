@@ -8285,6 +8285,7 @@ dependencies = [
  "rayon",
  "regex",
  "reqwest 0.13.4",
+ "rustls-platform-verifier",
  "rusty_ytdl",
  "semver",
  "serde",

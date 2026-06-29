@@ -89,6 +89,9 @@ tray-icon = { version = "0.24.1", default-features = false }
 [target.'cfg(target_os = "linux")'.dependencies]
 tray-icon = { version = "0.24.1", default-features = false, features = ["gtk"] }
 
+[target.'cfg(target_os = "android")'.dependencies]
+rustls-platform-verifier = "0.7.0"
+
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",

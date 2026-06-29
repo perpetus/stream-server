@@ -1,10 +1,12 @@
 use crate::{
     state::AppState,
-    updater::{http_status_for_error, schedule_process_exit_for_update},
+    updater::{
+        changelog::latest_changelog, http_status_for_error, schedule_process_exit_for_update,
+    },
 };
 use axum::{
     Json, Router,
-    extract::{ConnectInfo, State},
+    extract::{ConnectInfo, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -27,9 +29,17 @@ pub struct InstallRequest {
     pub force: bool,
 }
 
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct ChangelogQuery {
+    #[serde(default)]
+    force: bool,
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/status", get(status))
+        .route("/changelog", get(changelog))
         .route("/check", post(check))
         .route("/download", post(download))
         .route("/install", post(install))
@@ -48,6 +58,19 @@ async fn status(
     let mut status = state.updater.status(settings.update_channel).await;
     status.install_blocked_by = crate::updater::idle::install_blockers(&state).await;
     Json(status).into_response()
+}
+
+async fn changelog(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Query(query): Query<ChangelogQuery>,
+) -> Response {
+    if let Err(response) = ensure_local(addr) {
+        return response;
+    }
+
+    let settings = state.settings.read().await.clone();
+    Json(latest_changelog(settings.update_channel, query.force).await).into_response()
 }
 
 async fn check(
